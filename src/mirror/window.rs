@@ -99,9 +99,6 @@ impl Mirror for MirrorWindow {
                 end
             })
         };
-        while shown.load(Ordering::Acquire) == 0 && !thread.is_finished() {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
         self.running = Some(Running {
             thread,
             shown,
@@ -111,7 +108,9 @@ impl Mirror for MirrorWindow {
     }
 
     fn stop(&mut self) {
-        self.running.take();
+        if let Some(running) = self.running.take() {
+            let _ = crate::guard::quit_and_join(running.thread);
+        }
     }
 
     fn is_running(&self) -> bool {

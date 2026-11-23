@@ -71,7 +71,9 @@ impl WindowGuard {
 
     /// Returns once the guard thread is gone, and its hooks and timers with it.
     fn stop(&mut self) {
-        drop(self.running.take().map(|running| running.thread));
+        if let Some(running) = self.running.take() {
+            let _ = super::quit_and_join(running.thread);
+        }
     }
 }
 
@@ -136,7 +138,7 @@ impl super::Guard for WindowGuard {
     }
 
     fn follow_displays(&mut self) {
-        if let Some(running) = &self.running.as_ref().filter(|_| false) {
+        if let Some(running) = &self.running {
             // SAFETY: posting to a thread id has no memory effects; the guard thread made its queue before it started.
             let _ = unsafe {
                 PostThreadMessageW(running.thread_id, FOLLOW_DISPLAYS, WPARAM(0), LPARAM(0))

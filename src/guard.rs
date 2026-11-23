@@ -374,9 +374,12 @@ pub(crate) fn quit_and_join<T>(thread: std::thread::JoinHandle<T>) -> std::threa
     use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
     // SAFETY: the handle is the thread's own, open until `thread` is joined below.
     let thread_id = unsafe { GetThreadId(HANDLE(thread.as_raw_handle())) };
-    // SAFETY: posting to a thread id has no memory effects; a thread without a queue just fails the post.
-    if unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }.is_err() {
-        return Err(Box::new("left running"));
+    while !thread.is_finished() {
+        // SAFETY: posting to a thread id has no memory effects; a thread without a queue just fails the post.
+        if unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
     thread.join()
 }
