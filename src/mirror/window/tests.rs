@@ -172,7 +172,7 @@ fn second_monitor_card_display_on_another_graphics_card_is_refused() {
     let refused = mirror.start(source_monitor, card_display).unwrap_err();
     assert_eq!(
         refused,
-        "The source monitor and the card display are on different graphics cards. Plug both into the same one. (broken on purpose)"
+        "The source monitor and the card display are on different graphics cards. Plug both into the same one."
     );
     assert!(!mirror.is_running());
 }
