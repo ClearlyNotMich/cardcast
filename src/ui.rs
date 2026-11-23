@@ -4,7 +4,7 @@ mod settings;
 
 use crate::audio::{self, AudioDevice};
 use crate::guard::{self, Guard, Monitor};
-use crate::mirror::{Mirror, StandInMirror};
+use crate::mirror::{self, Mirror};
 use eframe::egui;
 use settings::{Settings, Status};
 
@@ -50,7 +50,7 @@ impl SettingsWindow {
             monitors,
             playback_devices,
             status,
-            mirror: Box::new(StandInMirror::default()),
+            mirror: mirror::new_mirror(),
             guard,
         }
     }

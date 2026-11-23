@@ -157,6 +157,7 @@ mod tests {
     fn monitor(device_path: &str, primary: bool) -> Monitor {
         Monitor {
             device_path: device_path.into(),
+            gdi_name: String::new(),
             name: device_path.into(),
             width: 1920,
             height: 1080,

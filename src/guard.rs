@@ -30,6 +30,8 @@ mod window_guard;
 pub struct Monitor {
     /// Display-configuration device path; the stable key saved in settings.
     pub device_path: String,
+    /// GDI name of the source the monitor shows (`\\.\DISPLAYn`); changes between boots, so never saved.
+    pub gdi_name: String,
     pub name: String,
     pub width: u32,
     pub height: u32,
@@ -83,6 +85,7 @@ impl Guard for StandInGuard {
 pub fn monitors() -> Result<Vec<Monitor>, String> {
     let monitor = |device_path: &str, name: &str, width, height, refresh_hz, primary| Monitor {
         device_path: device_path.into(),
+        gdi_name: String::new(),
         name: name.into(),
         width,
         height,
@@ -123,9 +126,10 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
 #[cfg(windows)]
 pub fn monitors() -> Result<Vec<Monitor>, String> {
     use windows::Win32::Devices::Display::{
-        DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_MODE_INFO,
-        DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo,
-        GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+        DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
+        QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
     };
 
     let failed = |what: &str| format!("Could not list monitors ({what}).");
@@ -165,6 +169,16 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } != 0 {
             continue;
         }
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
+        source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = u32::try_from(size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>())
+            .map_err(|_| failed("header size"))?;
+        source.header.adapterId = path.sourceInfo.adapterId;
+        source.header.id = path.sourceInfo.id;
+        // SAFETY: header is the first field of a correctly sized DISPLAYCONFIG_SOURCE_DEVICE_NAME, as size says.
+        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
+            continue;
+        }
         // SAFETY: without QDC_VIRTUAL_MODE_AWARE the union holds modeInfoIdx.
         let mode_index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
         let Some(mode) = modes.get(mode_index) else {
@@ -176,6 +190,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         let name = wide_to_string(&target.monitorFriendlyDeviceName);
         monitors.push(Monitor {
             device_path: wide_to_string(&target.monitorDevicePath),
+            gdi_name: wide_to_string(&source.viewGdiDeviceName),
             name: if name.is_empty() {
                 format!("Monitor {}", index + 1)
             } else {
@@ -196,7 +211,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
 }
 
 #[cfg(windows)]
-fn wide_to_string(wide: &[u16]) -> String {
+pub(crate) fn wide_to_string(wide: &[u16]) -> String {
     let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     String::from_utf16_lossy(&wide[..end])
 }
