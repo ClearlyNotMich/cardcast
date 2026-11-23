@@ -114,7 +114,7 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_DISPLAYCHANGE || message == WM_DEVICECHANGE {
+    if message == WM_DISPLAYCHANGE || (message == WM_DEVICECHANGE && wparam.0 == usize::MAX) {
         WAKE.with_borrow(|wake| {
             if let Some(wake) = wake {
                 wake();

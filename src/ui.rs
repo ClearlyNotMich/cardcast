@@ -608,7 +608,7 @@ mod tests {
         assert!(window.mirror.is_running(), "the mirror did not restart");
         assert_eq!(
             mirror::shown_at(),
-            Some((first.left, first.top)),
+            Some((second.left, second.top)),
             "the mirror window is not on the new card display"
         );
         assert_eq!(
