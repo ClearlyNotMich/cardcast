@@ -562,6 +562,28 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
 
         let unplugged = Unplugged::monitor(&source_monitor.device_path);
+        // shortcut: temporary diagnosis of what disabling the monitor device changes.
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(500));
+            println!(
+                "DIAG displays_changed={} running={} status={:?} monitors={:?}",
+                window.displays_changed.load(Ordering::Relaxed),
+                window.mirror.is_running(),
+                window.status.mirror,
+                guard::monitors().map(|monitors| monitors
+                    .iter()
+                    .map(|monitor| format!(
+                        "{} {} {}x{} at {},{}",
+                        monitor.device_path,
+                        monitor.gdi_name,
+                        monitor.width,
+                        monitor.height,
+                        monitor.left,
+                        monitor.top
+                    ))
+                    .collect::<Vec<_>>())
+            );
+        }
         wait_for(
             "Waiting for source monitor",
             Duration::from_secs(15),
