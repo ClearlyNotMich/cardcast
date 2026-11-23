@@ -280,15 +280,16 @@ fn move_onto(window: HWND, monitor: &Monitor) {
 
 #[test]
 fn second_monitor_window_moved_onto_the_card_display_is_returned() {
-    let Some((primary, card_display)) = second_monitor::monitors() else {
+    let Some(monitors) = second_monitor::monitors(2) else {
         return;
     };
-    let _guard = guard_on(&card_display, &primary);
+    let (primary, card_display) = (&monitors[0], &monitors[1]);
+    let _guard = guard_on(card_display, primary);
     let test = TestWindow::spawn(true);
     let before = foreground();
-    move_onto(test.window, &card_display);
+    move_onto(test.window, card_display);
     wait_for("window returned to the primary monitor", || {
-        on(&primary, frame(test.window))
+        on(primary, frame(test.window))
     });
     assert_eq!(
         foreground(),
@@ -299,33 +300,35 @@ fn second_monitor_window_moved_onto_the_card_display_is_returned() {
 
 #[test]
 fn second_monitor_window_on_the_card_display_at_guard_start_is_returned() {
-    let Some((primary, card_display)) = second_monitor::monitors() else {
+    let Some(monitors) = second_monitor::monitors(2) else {
         return;
     };
+    let (primary, card_display) = (&monitors[0], &monitors[1]);
     let test = TestWindow::spawn(true);
-    move_onto(test.window, &card_display);
-    let _guard = guard_on(&card_display, &primary);
+    move_onto(test.window, card_display);
+    let _guard = guard_on(card_display, primary);
     wait_for("window returned to the primary monitor", || {
-        on(&primary, frame(test.window))
+        on(primary, frame(test.window))
     });
 }
 
 #[test]
 fn second_monitor_maximised_window_stays_maximised_on_return() {
-    let Some((primary, card_display)) = second_monitor::monitors() else {
+    let Some(monitors) = second_monitor::monitors(2) else {
         return;
     };
+    let (primary, card_display) = (&monitors[0], &monitors[1]);
     let test = TestWindow::spawn(true);
-    move_onto(test.window, &card_display);
+    move_onto(test.window, card_display);
     // SAFETY: plain call on a window that exists until `test` drops.
     let _ = unsafe { ShowWindow(test.window, SW_SHOWMAXIMIZED) };
     wait_for("window maximised on the card display", || {
         // SAFETY: plain flag read.
-        unsafe { IsZoomed(test.window) }.as_bool() && on(&card_display, frame(test.window))
+        unsafe { IsZoomed(test.window) }.as_bool() && on(card_display, frame(test.window))
     });
-    let _guard = guard_on(&card_display, &primary);
+    let _guard = guard_on(card_display, primary);
     wait_for("window returned to the primary monitor", || {
-        on(&primary, frame(test.window))
+        on(primary, frame(test.window))
     });
     let (state, _) = read_window(test.window).unwrap();
     assert!(
@@ -333,7 +336,7 @@ fn second_monitor_maximised_window_stays_maximised_on_return() {
         "the returned window is no longer maximised"
     );
     assert!(
-        on(&primary, state.restore),
+        on(primary, state.restore),
         "restore position left on the card display"
     );
 }
@@ -347,10 +350,11 @@ fn pointer() -> (i32, i32) {
 
 #[test]
 fn second_monitor_pointer_is_put_back_off_the_card_display() {
-    let Some((primary, card_display)) = second_monitor::monitors() else {
+    let Some(monitors) = second_monitor::monitors(2) else {
         return;
     };
-    let _guard = guard_on(&card_display, &primary);
+    let (primary, card_display) = (&monitors[0], &monitors[1]);
+    let _guard = guard_on(card_display, primary);
     let off_card = (primary.left + 100, primary.top + 100);
     // SAFETY: plain call; moving the pointer has no memory effects.
     unsafe { SetCursorPos(off_card.0, off_card.1) }.unwrap();
@@ -361,4 +365,63 @@ fn second_monitor_pointer_is_put_back_off_the_card_display() {
     wait_for("pointer back at its last off-card position", || {
         pointer() == off_card
     });
+}
+
+// TEMPORARY probe: how a window maximised on the card display can be maximised elsewhere.
+#[test]
+fn second_monitor_probe_maximise() {
+    let Some(monitors) = second_monitor::monitors(2) else {
+        return;
+    };
+    let (primary, card_display) = (&monitors[0], &monitors[1]);
+    let work = work_area();
+    let restore = Rect {
+        left: work.left + 100,
+        top: work.top + 80,
+        right: work.left + 500,
+        bottom: work.top + 380,
+    };
+    for variant in ["placement", "restore-then-placement", "placement-sync"] {
+        let test = TestWindow::spawn(true);
+        move_onto(test.window, card_display);
+        // SAFETY: plain call on a live window.
+        let _ = unsafe { ShowWindow(test.window, SW_SHOWMAXIMIZED) };
+        std::thread::sleep(Duration::from_millis(300));
+        println!("{variant} before: {:?}", read_window(test.window));
+        let mut placement = window_placement(test.window).unwrap();
+        let (x, y) = workspace_origin();
+        placement.rcNormalPosition = RECT {
+            left: restore.left - x,
+            top: restore.top - y,
+            right: restore.right - x,
+            bottom: restore.bottom - y,
+        };
+        placement.flags = WPF_ASYNCWINDOWPLACEMENT;
+        match variant {
+            "placement" => maximise(test.window, restore),
+            "restore-then-placement" => {
+                placement.showCmd =
+                    windows::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE.0 as u32;
+                // SAFETY: valid placement.
+                let _ = unsafe { SetWindowPlacement(test.window, &placement) };
+                placement.showCmd = SW_SHOWMAXIMIZED.0 as u32;
+                // SAFETY: valid placement.
+                let _ = unsafe { SetWindowPlacement(test.window, &placement) };
+            }
+            _ => {
+                placement.flags = Default::default();
+                placement.showCmd = SW_SHOWMAXIMIZED.0 as u32;
+                // SAFETY: valid placement.
+                let _ = unsafe { SetWindowPlacement(test.window, &placement) };
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let after = read_window(test.window).unwrap();
+        println!(
+            "{variant} after: {after:?} on primary {} foreground same? zoomed {}",
+            on(primary, after.0.frame),
+            after.0.maximised
+        );
+    }
+    panic!("probe: read the output");
 }

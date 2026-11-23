@@ -278,8 +278,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
     Ok(monitors)
 }
 
-/// Helpers for the tests the CI `second-monitor` job runs: it adds a virtual monitor and sets
-/// `CARDCAST_SECOND_MONITOR` to that monitor's display adapter (a PnP instance id).
+/// Helpers for the tests the CI `second-monitor` job runs: it adds two virtual monitors on one
+/// virtual graphics card and sets `CARDCAST_SECOND_MONITOR` to that card (a PnP instance id).
 #[cfg(all(test, windows))]
 pub mod second_monitor {
     use super::Monitor;
@@ -288,22 +288,22 @@ pub mod second_monitor {
 
     const ENV: &str = "CARDCAST_SECOND_MONITOR";
 
-    /// The primary monitor and the second monitor, or `None` (the test skips) outside that job.
-    pub fn monitors() -> Option<(Monitor, Monitor)> {
+    /// The primary monitor then the others, or `None` (the test skips) outside that job or with fewer than `count`.
+    pub fn monitors(count: usize) -> Option<Vec<Monitor>> {
         if std::env::var_os(ENV).is_none() {
             eprintln!("skipped: {ENV} is not set");
             return None;
         }
-        let monitors = super::monitors().unwrap_or_else(|error| panic!("{error}"));
-        let primary = monitors.iter().find(|monitor| monitor.primary).cloned();
-        let second = monitors.iter().find(|monitor| !monitor.primary).cloned();
-        if second.is_none() {
-            eprintln!("skipped: only one monitor is connected");
+        let mut monitors = super::monitors().unwrap_or_else(|error| panic!("{error}"));
+        monitors.sort_by_key(|monitor| !monitor.primary);
+        if monitors.len() < count || !monitors[0].primary {
+            eprintln!("skipped: needs {count} monitors, one of them primary");
+            return None;
         }
-        Some((primary?, second?))
+        Some(monitors)
     }
 
-    /// Unplugs the second monitor by disabling its display adapter; it is plugged back in on drop.
+    /// Unplugs the virtual monitors by disabling their graphics card; they are plugged back in on drop.
     pub struct Unplugged;
 
     impl Unplugged {
@@ -321,7 +321,7 @@ pub mod second_monitor {
             }
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline
-                && !super::monitors().is_ok_and(|monitors| monitors.len() > 1)
+                && !super::monitors().is_ok_and(|monitors| monitors.len() > 2)
             {
                 std::thread::sleep(Duration::from_millis(50));
             }

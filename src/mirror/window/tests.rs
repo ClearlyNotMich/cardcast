@@ -115,17 +115,14 @@ fn stop_closes_the_mirror_window() {
 
 #[test]
 fn second_monitor_mirror_starts_on_it_and_presents_at_its_refresh_rate() {
-    let Some((source_monitor, card_display)) = crate::guard::second_monitor::monitors() else {
+    // The two virtual monitors share a graphics card, as SPEC section 1 needs.
+    let Some(monitors) = crate::guard::second_monitor::monitors(3) else {
         return;
     };
+    let (source_monitor, card_display) = (&monitors[1], &monitors[2]);
     let _duplicating = duplicating();
-    // SAFETY: plain factory creation.
-    let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }.unwrap();
-    // Shown if the test fails: which graphics card owns which monitor.
-    println!("monitors: {:#?}", crate::guard::monitors());
-    println!("outputs: {:#?}", outputs(&factory));
     let mut mirror = MirrorWindow::default();
-    mirror.start(&source_monitor, &card_display).unwrap();
+    mirror.start(source_monitor, card_display).unwrap();
     let mut rect = RECT::default();
     // SAFETY: rect is a valid RECT; the window lives until `mirror` drops.
     unsafe { GetWindowRect(window(&mirror), &mut rect) }.unwrap();
@@ -146,4 +143,32 @@ fn second_monitor_mirror_starts_on_it_and_presents_at_its_refresh_rate() {
         "{per_second:.1} presents per second on a {refresh} Hz card display"
     );
     assert!(mirror.is_running(), "the mirror ended on its own");
+}
+
+#[test]
+fn second_monitor_card_display_on_another_graphics_card_is_refused() {
+    let Some(monitors) = crate::guard::second_monitor::monitors(2) else {
+        return;
+    };
+    let (source_monitor, card_display) = (&monitors[0], &monitors[1]);
+    // SAFETY: plain factory creation.
+    let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }.unwrap();
+    let outputs = outputs(&factory);
+    let adapter = |monitor: &Monitor| {
+        find_output(&monitor.device_path, &monitors, &outputs)
+            .unwrap()
+            .adapter
+    };
+    if adapter(source_monitor) == adapter(card_display) {
+        eprintln!("skipped: the primary and second monitor share a graphics card");
+        return;
+    }
+    let _duplicating = duplicating();
+    let mut mirror = MirrorWindow::default();
+    let refused = mirror.start(source_monitor, card_display).unwrap_err();
+    assert_eq!(
+        refused,
+        "The source monitor and the card display are on different graphics cards. Plug both into the same one."
+    );
+    assert!(!mirror.is_running());
 }

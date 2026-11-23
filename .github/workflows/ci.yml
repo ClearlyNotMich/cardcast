@@ -34,7 +34,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "no manifest embedded in cardcast.exe" }
           if (-not (Select-String -Path extracted.manifest -SimpleMatch -Quiet 'PerMonitorV2')) { throw "embedded manifest lacks PerMonitorV2 DPI awareness" }
 
-  # Adds a virtual second monitor (docs/research/ci-second-monitor.md) and runs the second_monitor tests.
+  # Adds two virtual monitors (docs/research/ci-second-monitor.md) and runs the second_monitor tests.
   # The driver is third-party and its certificate becomes a trusted root, so this job gets no secrets and read-only access.
   second-monitor:
     runs-on: windows-latest
@@ -59,7 +59,8 @@ jobs:
           Import-Certificate "$pkg\Virtual_Display_Driver.cer" -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
           Import-Certificate "$pkg\Virtual_Display_Driver.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
           New-Item -ItemType Directory C:\VirtualDisplayDriver -Force | Out-Null
-          Copy-Item "$pkg\vdd_settings.xml" C:\VirtualDisplayDriver\
+          # Two virtual monitors on one virtual graphics card: a source monitor and a card display.
+          (Get-Content "$pkg\vdd_settings.xml") -replace '<count>1</count>', '<count>2</count>' | Set-Content C:\VirtualDisplayDriver\vdd_settings.xml
           Add-Type -TypeDefinition @'
           using System; using System.Runtime.InteropServices;
           public static class Dev {
@@ -86,8 +87,8 @@ jobs:
           if ($result -ne 'ok reboot=False') { throw "driver install: $result" }
           Add-Type -AssemblyName System.Windows.Forms
           $deadline = (Get-Date).AddSeconds(60)
-          while ([System.Windows.Forms.Screen]::AllScreens.Count -lt 2) {
-            if ((Get-Date) -gt $deadline) { throw 'no second monitor appeared' }
+          while ([System.Windows.Forms.Screen]::AllScreens.Count -lt 3) {
+            if ((Get-Date) -gt $deadline) { throw 'the two virtual monitors did not appear' }
             Start-Sleep -Milliseconds 500
           }
           [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { "$($_.DeviceName) $($_.Bounds) primary=$($_.Primary)" }

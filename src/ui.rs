@@ -406,9 +406,11 @@ mod tests {
     fn second_monitor_unplug_waits_for_the_card_display_and_replug_brings_the_mirror_back() {
         use guard::second_monitor::{Unplugged, wait_for};
         use std::time::Duration;
-        let Some((source_monitor, card_display)) = guard::second_monitor::monitors() else {
+        // The two virtual monitors share a graphics card, as SPEC section 1 needs.
+        let Some(monitors) = guard::second_monitor::monitors(3) else {
             return;
         };
+        let (source_monitor, card_display) = (monitors[1].clone(), monitors[2].clone());
         let displays_changed = Arc::new(AtomicBool::new(false));
         let display_watcher = {
             let displays_changed = displays_changed.clone();
@@ -420,7 +422,7 @@ mod tests {
                 card_display: Some(card_display.device_path.clone()),
                 ..Settings::default()
             },
-            monitors: guard::monitors().unwrap(),
+            monitors,
             playback_devices: Vec::new(),
             status: Status::Stopped,
             mirror: mirror::new_mirror(),

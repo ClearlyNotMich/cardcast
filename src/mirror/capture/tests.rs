@@ -263,13 +263,14 @@ fn duplicating_the_monitor_draws_its_colour() {
 
 #[test]
 fn second_monitor_duplicating_it_draws_its_colour() {
-    let Some((_, second)) = crate::guard::second_monitor::monitors() else {
+    let Some(monitors) = crate::guard::second_monitor::monitors(2) else {
         return;
     };
+    let second = &monitors[1];
     let _duplicating = duplicating();
     let (adapter, output) = output_named(&second.gdi_name);
     let (device, context, output) = device_on(&adapter, output);
-    duplicate_and_check_colour(&second, &device, &context, &output);
+    duplicate_and_check_colour(second, &device, &context, &output);
 }
 
 /// Covers `monitor` with a colour, duplicates `output` (that monitor's) and checks the colour arrives.
