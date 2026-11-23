@@ -14,6 +14,14 @@
     )
 )]
 mod placement;
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows pointer guard calls it; its tests run everywhere"
+    )
+)]
+mod pointer;
 #[cfg(windows)]
 mod window_guard;
 
