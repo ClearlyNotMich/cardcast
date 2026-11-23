@@ -18,7 +18,7 @@ fn card_display() -> Monitor {
 }
 
 fn started(card_display: &Monitor) -> MirrorWindow {
-    let mut mirror = MirrorWindow::default();
+    let mut mirror = MirrorWindow::new(|| {});
     mirror.start(card_display, card_display).unwrap();
     mirror
 }
@@ -121,7 +121,7 @@ fn second_monitor_mirror_starts_on_it_and_presents() {
     };
     let (source_monitor, card_display) = (&monitors[1], &monitors[2]);
     let _duplicating = duplicating();
-    let mut mirror = MirrorWindow::default();
+    let mut mirror = MirrorWindow::new(|| {});
     mirror.start(source_monitor, card_display).unwrap();
     let mut rect = RECT::default();
     // SAFETY: rect is a valid RECT; the window lives until `mirror` drops.
@@ -165,11 +165,40 @@ fn second_monitor_card_display_on_another_graphics_card_is_refused() {
         return;
     }
     let _duplicating = duplicating();
-    let mut mirror = MirrorWindow::default();
+    let mut mirror = MirrorWindow::new(|| {});
     let refused = mirror.start(source_monitor, card_display).unwrap_err();
     assert_eq!(
         refused,
         "The source monitor and the card display are on different graphics cards. Plug both into the same one."
     );
     assert!(!mirror.is_running());
+}
+
+#[test]
+fn a_lost_graphics_card_restarts_and_other_failures_stop() {
+    assert!(matches!(
+        ended(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED.0),
+        Ended::Restart(_)
+    ));
+    assert!(matches!(
+        ended(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_HUNG.0),
+        Ended::Restart(_)
+    ));
+    assert!(matches!(
+        ended(windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_LOST.0),
+        Ended::Restart(_)
+    ));
+    assert!(matches!(
+        ended(windows::Win32::Foundation::E_OUTOFMEMORY.0),
+        Ended::Stop(_)
+    ));
+}
+
+#[test]
+fn stopped_mirror_has_no_end_to_report() {
+    let _duplicating = duplicating();
+    let mut mirror = started(&card_display());
+    assert_eq!(mirror.take_end(), None);
+    mirror.stop();
+    assert_eq!(mirror.take_end(), None);
 }

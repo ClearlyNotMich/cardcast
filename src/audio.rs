@@ -32,8 +32,21 @@ pub trait Relay {
     /// card display. Problems arrive later through `take_report`, as the relay keeps retrying.
     fn start(&mut self, audio_source: &str, card_display_name: &str);
     fn stop(&mut self);
-    /// The relay's latest problem for the status line, in plain words.
-    fn take_report(&mut self) -> Option<String>;
+    /// The relay's latest change for the status line.
+    fn take_report(&mut self) -> Option<RelayReport>;
+}
+
+/// What the relay tells the status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows relay and the tests send them")
+)]
+pub enum RelayReport {
+    /// It keeps failing, for this reason in plain words.
+    Failing(String),
+    /// It relays again after a reported failure.
+    Relaying,
 }
 
 /// The audio relay; `wake` asks the settings window to repaint when a report is waiting.
@@ -56,7 +69,7 @@ pub struct StandInRelay;
 impl Relay for StandInRelay {
     fn start(&mut self, _audio_source: &str, _card_display_name: &str) {}
     fn stop(&mut self) {}
-    fn take_report(&mut self) -> Option<String> {
+    fn take_report(&mut self) -> Option<RelayReport> {
         None
     }
 }

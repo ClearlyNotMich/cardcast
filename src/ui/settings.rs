@@ -3,13 +3,15 @@
 use crate::guard::Monitor;
 use crate::mirror::Mirror;
 
-/// The one-line status under the controls.
+/// What the mirror is doing; it alone decides the Start/Stop button.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Stopped,
     Running,
     WaitingForCardDisplay,
-    /// The last error, in plain words.
+    /// The mirror ended on its own and is being started again; why, in plain words.
+    Restarting(String),
+    /// The mirror is stopped by this error, in plain words.
     Error(String),
 }
 
@@ -19,8 +21,50 @@ impl Status {
             Self::Stopped => "Stopped".into(),
             Self::Running => "Running".into(),
             Self::WaitingForCardDisplay => "Waiting for card display".into(),
-            Self::Error(message) => message.clone(),
+            Self::Restarting(message) | Self::Error(message) => message.clone(),
         }
+    }
+}
+
+/// The one-line status under the controls: the mirror, then any audio or other problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusLine {
+    pub mirror: Status,
+    /// The audio relay's problem; cleared when it relays again, or on Start and Stop.
+    pub audio: Option<String>,
+    /// A guard, settings or monitor-list problem; cleared on Start and Stop.
+    pub other: Option<String>,
+}
+
+impl StatusLine {
+    pub fn new(mirror: Status) -> Self {
+        Self {
+            mirror,
+            audio: None,
+            other: None,
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let mut text = self.mirror.text();
+        for problem in [&self.audio, &self.other].into_iter().flatten() {
+            text.push_str(" | ");
+            text.push_str(problem);
+        }
+        text
+    }
+
+    /// Stop while the mirror runs or will start by itself; Start once it is stopped.
+    pub fn shows_stop(&self) -> bool {
+        !matches!(self.mirror, Status::Stopped | Status::Error(_))
+    }
+}
+
+/// The status after a start made while restarting: a failure keeps restarting instead of stopping.
+pub fn restarted(status: Status) -> Status {
+    match status {
+        Status::Error(message) => Status::Restarting(message),
+        status => status,
     }
 }
 
@@ -242,6 +286,9 @@ mod tests {
         fn is_running(&self) -> bool {
             false
         }
+        fn take_end(&mut self) -> Option<crate::mirror::Ended> {
+            None
+        }
     }
 
     fn start_text(settings: &Settings, mirror: &mut dyn Mirror) -> String {
@@ -296,6 +343,41 @@ mod tests {
             start_text(&chosen("source", "card"), &mut FailingMirror),
             "Could not capture the source monitor."
         );
+    }
+
+    #[test]
+    fn audio_and_other_problems_follow_the_mirror_status_without_changing_the_button() {
+        let line = StatusLine {
+            mirror: Status::Running,
+            audio: Some("The audio source is not connected.".into()),
+            other: Some("Could not save settings: denied".into()),
+        };
+        assert_eq!(
+            line.text(),
+            "Running | The audio source is not connected. | Could not save settings: denied"
+        );
+        assert!(line.shows_stop());
+    }
+
+    #[test]
+    fn button_shows_stop_exactly_while_the_mirror_runs_or_will_start_by_itself() {
+        let shows_stop = |mirror| StatusLine::new(mirror).shows_stop();
+        assert!(shows_stop(Status::Running));
+        assert!(shows_stop(Status::WaitingForCardDisplay));
+        assert!(shows_stop(Status::Restarting("lost".into())));
+        assert!(!shows_stop(Status::Stopped));
+        assert!(!shows_stop(Status::Error("failed".into())));
+    }
+
+    #[test]
+    fn a_failed_restart_keeps_restarting() {
+        assert_eq!(
+            restarted(Status::Error(
+                "Could not capture the source monitor.".into()
+            )),
+            Status::Restarting("Could not capture the source monitor.".into())
+        );
+        assert_eq!(restarted(Status::Running), Status::Running);
     }
 
     #[test]
