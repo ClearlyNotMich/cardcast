@@ -348,7 +348,7 @@ fn give_up_on(
 ) {
     for _ in 0..placement::RETURNS_PER_MINUTE {
         move_onto(test.window, card_display);
-        wait_for("window returned to the primary monitor", || {
+        wait_for("window returned to the primary monitor", CALL_LIMIT, || {
             on(primary, frame(test.window))
         });
     }
@@ -366,7 +366,7 @@ fn give_up_on(
 
 /// Polls `take_report` until the latest report matches.
 fn wait_for_report(guard: &mut WindowGuard, what: &str, wanted: impl Fn(&GuardReport) -> bool) {
-    wait_for(what, || {
+    wait_for(what, CALL_LIMIT, || {
         guard.take_report().is_some_and(|report| wanted(&report))
     });
 }
