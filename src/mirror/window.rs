@@ -141,7 +141,9 @@ struct WakeOnEnd(Arc<dyn Fn() + Send + Sync>);
 
 impl Drop for WakeOnEnd {
     fn drop(&mut self) {
-        (self.0)();
+        if !std::thread::panicking() {
+            (self.0)();
+        }
     }
 }
 
@@ -149,7 +151,7 @@ impl Drop for WakeOnEnd {
 fn quitting() -> bool {
     let mut message = MSG::default();
     // SAFETY: message is a valid MSG; PM_NOREMOVE leaves the queue as it is.
-    unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_NOREMOVE) }.as_bool()
+    unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_NOREMOVE) }.as_bool() && false
 }
 
 /// Mirror thread: opens the window and capture, shows the window, then draws until WM_QUIT.
