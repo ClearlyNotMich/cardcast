@@ -37,7 +37,7 @@ The settings window has these controls. Each monitor dropdown shows the monitor'
 - **Audio source**: the playback device whose sound goes to the capture card.
 - **Start / Stop**: starts or stops the mirror. Audio starts and stops with it.
 - **Guard**: turns the window guard and the pointer guard on and off together. The guard works whether or not the mirror is running.
-- **Status line**: shows "Running", "Waiting for card display", or the last error in plain words.
+- **Status line**: shows "Running", "Waiting for card display", "Stopped", or the last error in plain words, followed by any audio or guard problem. A mirror stopped by an error stays stopped until you press Start.
 
 Choices are saved when you change them. On launch the mirror starts by itself, and the window starts minimised if it does. Closing the window quits cardcast.
 
@@ -46,7 +46,8 @@ If the capture card is unplugged, the mirror stops and waits. When it is plugged
 ## Window guard and pointer guard
 
 - Any window that lands on the card display is moved to the "send windows to" monitor, without taking focus from the game. A maximised window stays maximised there.
-- If the same window keeps going back to the card display (more than 3 times within a minute), the guard stops moving it and names it in the status line, so it never fights a program. Restarting the guard resets this.
+- If the same window keeps going back to the card display (more than 3 times within a minute), the guard stops moving it and names it in the status line, so it never fights a program. The notice stays until you press **Dismiss guard notice**, or until that window leaves the card display or closes; then the guard watches it again. Turning the guard off and on, or changing the card display or "send windows to", also resets this.
+- If "send windows to" is the card display, or there is no monitor to send windows to, the guard does nothing and says so in the status line.
 - The pointer is checked about 60 times a second. If it is on the card display, it is put back where it was last seen on another monitor.
 
 **Admin-window limit.** cardcast does not run as administrator, so the window guard cannot move windows of programs that run as administrator. If one opens on the card display, move it yourself with Win+Shift+Arrow.
@@ -66,8 +67,9 @@ To choose which programs go to the capture card, use Windows' own per-app sound 
 - Changing the SDR content brightness slider in Windows while the mirror runs has no effect until the mirror is restarted.
 - A rotated (portrait) source monitor shows un-rotated in the mirror.
 - Pointer pixels that normally invert the screen are drawn black, so such a pointer can vanish on dark scenes.
-- If the graphics device is lost or a draw fails, the mirror stops until the next display change restarts it.
-- The card display's sound output is found by matching its name to the monitor's name. This has not been checked on every capture card.
+- If the mirror loses the graphics card (driver update or reset, mode change), it restarts by itself every second until it runs again. Any other failure stops it with the reason in the status line; press Start to try again.
+- The primary monitor is taken to be the one at the top-left corner (0,0) of the Windows desktop. Not yet confirmed on the sender.
+- The card display's sound output is found by matching its name to the monitor's name. Not yet confirmed on the sender or on any capture card.
 
 ## Reporting a problem
 

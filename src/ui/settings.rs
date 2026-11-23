@@ -26,13 +26,17 @@ impl Status {
     }
 }
 
-/// The one-line status under the controls: the mirror, then any audio or other problem.
+/// The one-line status under the controls: the mirror, then any audio, guard or other problem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusLine {
     pub mirror: Status,
     /// The audio relay's problem; cleared when it relays again, or on Start and Stop.
     pub audio: Option<String>,
-    /// A guard, settings or monitor-list problem; cleared on Start and Stop.
+    /// The guard's notice; kept until the guard clears it or the user dismisses it.
+    pub guard: Option<String>,
+    /// The display watcher could not start; kept until cardcast restarts.
+    pub displays: Option<String>,
+    /// A settings or monitor-list problem; cleared on Start and Stop.
     pub other: Option<String>,
 }
 
@@ -41,13 +45,23 @@ impl StatusLine {
         Self {
             mirror,
             audio: None,
+            guard: None,
+            displays: None,
             other: None,
         }
     }
 
+    /// Start and Stop: the new mirror status clears audio and other problems, not the lasting ones.
+    pub fn set_mirror(&mut self, mirror: Status) {
+        self.mirror = mirror;
+        self.audio = None;
+        self.other = None;
+    }
+
     pub fn text(&self) -> String {
         let mut text = self.mirror.text();
-        for problem in [&self.audio, &self.other].into_iter().flatten() {
+        let problems = [&self.audio, &self.guard, &self.displays, &self.other];
+        for problem in problems.into_iter().flatten() {
             text.push_str(" | ");
             text.push_str(problem);
         }
@@ -105,8 +119,9 @@ pub enum Follow {
     Stop,
 }
 
-/// `wanted` is true from Start (pressed or at launch) until Stop is pressed; `before` and `now`
-/// are the card display in the monitor list before and after the change.
+/// `wanted` is whether the mirror runs or will start by itself ([`StatusLine::shows_stop`]), so a
+/// mirror stopped by Stop or an error stays stopped; `before` and `now` are the card display in the
+/// monitor list before and after the change.
 pub fn follow_card_display(
     wanted: bool,
     mirror_running: bool,
@@ -351,12 +366,27 @@ mod tests {
             mirror: Status::Running,
             audio: Some("The audio source is not connected.".into()),
             other: Some("Could not save settings: denied".into()),
+            ..StatusLine::new(Status::Running)
         };
         assert_eq!(
             line.text(),
             "Running | The audio source is not connected. | Could not save settings: denied"
         );
         assert!(line.shows_stop());
+    }
+
+    #[test]
+    fn start_and_stop_keep_the_guard_and_display_watcher_notices() {
+        let mut line = StatusLine {
+            mirror: Status::Running,
+            audio: Some("audio".into()),
+            guard: Some("guard".into()),
+            displays: Some("displays".into()),
+            other: Some("other".into()),
+        };
+        assert_eq!(line.text(), "Running | audio | guard | displays | other");
+        line.set_mirror(Status::Stopped);
+        assert_eq!(line.text(), "Stopped | guard | displays");
     }
 
     #[test]

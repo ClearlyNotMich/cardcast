@@ -36,8 +36,8 @@ pub struct DisplayWatcher;
 
 #[cfg(not(windows))]
 impl DisplayWatcher {
-    pub fn new(_wake: impl Fn() + Send + 'static) -> Self {
-        Self
+    pub fn new(_wake: impl Fn() + Send + 'static) -> Result<Self, String> {
+        Ok(Self)
     }
 }
 
@@ -62,8 +62,17 @@ pub struct Monitor {
 pub trait Guard {
     /// Applies the guard checkbox and the chosen card display and "send windows to" monitor.
     fn update(&mut self, enabled: bool, card_display: Option<&str>, send_windows_to: Option<&str>);
-    /// The guard's latest message for the status line, in plain words.
-    fn take_report(&mut self) -> Option<String>;
+    /// The guard's latest notice for the status line, if it changed.
+    fn take_report(&mut self) -> Option<GuardReport>;
+}
+
+/// What the guard tells the status line; each report replaces the one before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardReport {
+    /// A problem or a given-up window, in plain words; it stays until the next report or dismissed.
+    Notice(String),
+    /// Nothing to report any more.
+    Clear,
 }
 
 /// The window guard; `wake` asks the settings window to repaint when a report is waiting.
@@ -91,7 +100,7 @@ impl Guard for StandInGuard {
         self.enabled = enabled;
     }
 
-    fn take_report(&mut self) -> Option<String> {
+    fn take_report(&mut self) -> Option<GuardReport> {
         None
     }
 }
@@ -152,7 +161,7 @@ fn display_config() -> Result<
         QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
     };
 
-    let failed = |what: &str| format!("Could not list monitors ({what}).");
+    let failed = |what: &str| format!("Could not list monitors. ({what})");
     let mut path_count = 0u32;
     let mut mode_count = 0u32;
     // SAFETY: both pointers are valid u32 locals for the duration of the call.
@@ -231,7 +240,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         DisplayConfigGetDeviceInfo,
     };
 
-    let failed = |what: &str| format!("Could not list monitors ({what}).");
+    let failed = |what: &str| format!("Could not list monitors. ({what})");
     let (paths, modes) = display_config()?;
     let mut monitors = Vec::new();
     for (index, path) in paths.iter().enumerate() {

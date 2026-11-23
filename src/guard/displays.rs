@@ -19,27 +19,25 @@ thread_local! {
 
 /// Calls its `wake` after every display change (a monitor plugged, unplugged or changing mode).
 pub struct DisplayWatcher {
-    /// `None` if the thread could not start; then display changes go unnoticed.
+    /// `None` once dropped.
     running: Option<(u32, JoinHandle<()>)>,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the Windows tests"))]
     window: isize,
 }
 
 impl DisplayWatcher {
-    pub fn new(wake: impl Fn() + Send + 'static) -> Self {
+    /// Errors are plain words for the status line.
+    pub fn new(wake: impl Fn() + Send + 'static) -> Result<Self, String> {
         let (started_sender, started) = mpsc::channel();
         let thread = std::thread::spawn(move || run(Box::new(wake), &started_sender));
         match started.recv() {
-            Ok((thread_id, window)) => Self {
+            Ok((thread_id, window)) => Ok(Self {
                 running: Some((thread_id, thread)),
                 window,
-            },
+            }),
             Err(_) => {
                 let _ = thread.join();
-                Self {
-                    running: None,
-                    window: 0,
-                }
+                Err("cardcast can't watch for display changes, so it won't follow the card display being unplugged or plugged back in. Restart cardcast.".into())
             }
         }
     }
@@ -142,6 +140,7 @@ mod tests {
             DisplayWatcher::new(move || {
                 wakes.fetch_add(1, Ordering::Relaxed);
             })
+            .unwrap()
         };
         let window = HWND(watcher.window as *mut _);
         // SAFETY: the window is alive until the watcher drops; WM_DISPLAYCHANGE carries no pointers.

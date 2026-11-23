@@ -141,7 +141,7 @@ pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
     };
 
     let failed =
-        |error: windows::core::Error| format!("Could not list playback devices ({error}).");
+        |error: windows::core::Error| format!("Could not list playback devices. ({error})");
     // SAFETY: plain COM initialisation of this thread; apartment-threaded to match the OLE init winit does on the UI thread.
     // Left initialised for the life of the thread on purpose: the UI thread lives as long as cardcast.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
