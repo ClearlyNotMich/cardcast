@@ -6,6 +6,8 @@
     reason = "SPEC allows unsafe only in mirror, guard and audio, for Windows API calls"
 )]
 
+#[cfg(windows)]
+mod displays;
 #[cfg_attr(
     not(windows),
     allow(
@@ -24,6 +26,20 @@ mod placement;
 mod pointer;
 #[cfg(windows)]
 mod window_guard;
+
+#[cfg(windows)]
+pub use displays::DisplayWatcher;
+
+/// Linux has no display changes to hear; this stand-in never wakes.
+#[cfg(not(windows))]
+pub struct DisplayWatcher;
+
+#[cfg(not(windows))]
+impl DisplayWatcher {
+    pub fn new(_wake: impl Fn() + Send + 'static) -> Self {
+        Self
+    }
+}
 
 /// A monitor on the sender, as shown in the settings dropdowns.
 #[derive(Debug, Clone, PartialEq, Eq)]

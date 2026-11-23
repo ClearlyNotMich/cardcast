@@ -113,6 +113,12 @@ impl Mirror for MirrorWindow {
             }
         }
     }
+
+    fn is_running(&self) -> bool {
+        self.running
+            .as_ref()
+            .is_some_and(|running| !running.thread.is_finished())
+    }
 }
 
 /// Mirror thread: opens the window, reports its thread id and window, then draws until WM_QUIT.
@@ -147,7 +153,7 @@ fn run(
     {
         return;
     }
-    // shortcut: a lost device or failed present just closes the window; #7 adds recovery and reporting.
+    // shortcut: a lost device or failed present ends the thread; the settings window restarts it on the next display change, add a wake from here if that proves too late.
     let _ = screen.draw_until_quit(&mut desktop, presents);
 }
 

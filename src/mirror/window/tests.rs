@@ -106,7 +106,9 @@ fn stop_closes_the_mirror_window() {
     let _duplicating = duplicating();
     let mut mirror = started(&card_display());
     let window = window(&mirror);
+    assert!(mirror.is_running());
     mirror.stop();
+    assert!(!mirror.is_running());
     // SAFETY: IsWindow accepts any handle.
     assert!(!unsafe { IsWindow(Some(window)) }.as_bool());
 }

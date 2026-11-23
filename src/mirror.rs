@@ -26,6 +26,8 @@ pub trait Mirror {
     /// Errors are plain words for the status line.
     fn start(&mut self, source_monitor: &Monitor, card_display: &Monitor) -> Result<(), String>;
     fn stop(&mut self);
+    /// False once stopped, or if the mirror ended on its own (for example a failed present).
+    fn is_running(&self) -> bool;
 }
 
 /// The mirror window on the card display.
@@ -56,6 +58,10 @@ impl Mirror for StandInMirror {
 
     fn stop(&mut self) {
         self.running = false;
+    }
+
+    fn is_running(&self) -> bool {
+        self.running
     }
 }
 

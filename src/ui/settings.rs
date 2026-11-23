@@ -51,6 +51,38 @@ pub fn start(settings: &Settings, monitors: &[Monitor], mirror: &mut dyn Mirror)
     }
 }
 
+/// What the settings window does to the mirror after a display change.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Follow {
+    Nothing,
+    /// (Re)start it: the card display came back or changed, or the mirror ended on its own.
+    Start,
+    /// Stop it and wait: the card display is gone.
+    Stop,
+}
+
+/// `wanted` is true from Start (pressed or at launch) until Stop is pressed; `before` and `now`
+/// are the card display in the monitor list before and after the change.
+pub fn follow_card_display(
+    wanted: bool,
+    mirror_running: bool,
+    before: Option<&Monitor>,
+    now: Option<&Monitor>,
+) -> Follow {
+    match now {
+        _ if !wanted => Follow::Nothing,
+        None if mirror_running => Follow::Stop,
+        None => Follow::Nothing,
+        Some(card) if !mirror_running || before != Some(card) => Follow::Start,
+        Some(_) => Follow::Nothing,
+    }
+}
+
+/// Saved settings start the mirror at launch once both monitors were chosen.
+pub fn starts_on_launch(settings: &Settings) -> bool {
+    settings.source_monitor.is_some() && settings.card_display.is_some()
+}
+
 /// The user's choices. Monitors are stored by their display-configuration device path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -207,6 +239,9 @@ mod tests {
             Err("Could not capture the source monitor.".into())
         }
         fn stop(&mut self) {}
+        fn is_running(&self) -> bool {
+            false
+        }
     }
 
     fn start_text(settings: &Settings, mirror: &mut dyn Mirror) -> String {
@@ -266,5 +301,73 @@ mod tests {
     #[test]
     fn stopped_status_text() {
         assert_eq!(Status::Stopped.text(), "Stopped");
+    }
+
+    #[test]
+    fn mirror_stops_when_the_card_display_is_unplugged() {
+        let card = monitor("card", false);
+        assert_eq!(
+            follow_card_display(true, true, Some(&card), None),
+            Follow::Stop
+        );
+    }
+
+    #[test]
+    fn mirror_starts_when_the_card_display_comes_back() {
+        let card = monitor("card", false);
+        assert_eq!(
+            follow_card_display(true, false, None, Some(&card)),
+            Follow::Start
+        );
+    }
+
+    #[test]
+    fn mirror_restarts_when_the_card_display_changes_or_the_mirror_ended() {
+        let card = monitor("card", false);
+        let moved = Monitor {
+            left: 1920,
+            ..card.clone()
+        };
+        assert_eq!(
+            follow_card_display(true, true, Some(&card), Some(&moved)),
+            Follow::Start
+        );
+        assert_eq!(
+            follow_card_display(true, false, Some(&card), Some(&card)),
+            Follow::Start
+        );
+    }
+
+    #[test]
+    fn running_mirror_is_left_alone_when_another_monitor_changes() {
+        let card = monitor("card", false);
+        assert_eq!(
+            follow_card_display(true, true, Some(&card), Some(&card)),
+            Follow::Nothing
+        );
+        assert_eq!(
+            follow_card_display(true, false, None, None),
+            Follow::Nothing
+        );
+    }
+
+    #[test]
+    fn stopped_mirror_ignores_the_card_display() {
+        let card = monitor("card", false);
+        assert_eq!(
+            follow_card_display(false, false, None, Some(&card)),
+            Follow::Nothing
+        );
+    }
+
+    #[test]
+    fn saved_monitors_start_the_mirror_at_launch() {
+        assert!(starts_on_launch(&chosen("source", "card")));
+        assert!(!starts_on_launch(&Settings::default()));
+        let half = Settings {
+            card_display: Some("card".into()),
+            ..Settings::default()
+        };
+        assert!(!starts_on_launch(&half));
     }
 }
