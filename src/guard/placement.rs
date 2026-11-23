@@ -1,6 +1,7 @@
 //! Window placement decision: where a window on the sender goes. No Windows calls.
 
-use std::collections::{HashMap, HashSet};
+use super::{GuardReport, Monitor};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// A rectangle in desktop pixels; `right` and `bottom` are exclusive.
@@ -41,6 +42,8 @@ pub enum Placement {
     },
     /// The window keeps landing on the card display; leave it there and report it.
     GiveUp,
+    /// A given-up window was seen off the card display after an event (for example moved away); it is guarded again.
+    Handled,
 }
 
 impl Rect {
@@ -67,13 +70,14 @@ impl Rect {
 }
 
 /// Returns allowed per window per minute before the guard leaves the window alone.
-const RETURNS_PER_MINUTE: usize = 3;
+pub(super) const RETURNS_PER_MINUTE: usize = 3;
 
 /// Recent returns per window, so the guard never fights a program in a loop.
 #[derive(Debug, Default)]
 pub struct ReturnHistory {
     returns: HashMap<isize, Vec<Instant>>,
-    given_up: HashSet<isize>,
+    /// Given-up windows, latest last.
+    given_up: Vec<isize>,
 }
 
 impl ReturnHistory {
@@ -86,10 +90,14 @@ impl ReturnHistory {
         send_windows_to: Rect,
         now: Instant,
     ) -> Placement {
-        if self.given_up.contains(&id) {
-            return Placement::Stay;
-        }
         let placement = place(window, card_display, send_windows_to);
+        if self.given_up.contains(&id) {
+            if placement != Placement::Stay {
+                return Placement::Stay;
+            }
+            self.given_up.retain(|&given_up| given_up != id);
+            return Placement::Handled;
+        }
         if placement == Placement::Stay {
             return placement;
         }
@@ -97,12 +105,62 @@ impl ReturnHistory {
         returns.retain(|&at| now.duration_since(at) < Duration::from_secs(60));
         if returns.len() >= RETURNS_PER_MINUTE {
             self.returns.remove(&id);
-            self.given_up.insert(id);
+            self.given_up.push(id);
             return Placement::GiveUp;
         }
         returns.push(now);
         placement
     }
+
+    /// Forgets window `id`, which was closed; true if it had been given up.
+    pub fn forget(&mut self, id: isize) -> bool {
+        self.returns.remove(&id);
+        let before = self.given_up.len();
+        self.given_up.retain(|&given_up| given_up != id);
+        self.given_up.len() != before
+    }
+
+    /// The window given up on most recently that is still on the card display.
+    pub fn latest_given_up(&self) -> Option<isize> {
+        self.given_up.last().copied()
+    }
+}
+
+/// The guard's notice for the status line: a monitor problem first, else the latest given-up window.
+pub fn notice(problem: Option<&str>, given_up_title: Option<&str>) -> GuardReport {
+    match (problem, given_up_title) {
+        (Some(problem), _) => GuardReport::Notice(problem.to_owned()),
+        (None, Some(title)) => GuardReport::Notice(format!(
+            "The window guard left \"{title}\" on the card display because it keeps going back there. Move it off to guard it again."
+        )),
+        (None, None) => GuardReport::Clear,
+    }
+}
+
+/// The card display and the "send windows to" monitor (primary if it is not connected).
+/// `Ok(None)` while the card display is unplugged: there is nothing to guard.
+pub fn guarded_monitors<'a>(
+    monitors: &'a [Monitor],
+    card_display: &str,
+    send_windows_to: Option<&str>,
+) -> Result<Option<(&'a Monitor, &'a Monitor)>, String> {
+    let Some(card) = monitors
+        .iter()
+        .find(|monitor| monitor.device_path == card_display)
+    else {
+        return Ok(None);
+    };
+    let send_to = send_windows_to
+        .and_then(|path| monitors.iter().find(|monitor| monitor.device_path == path))
+        .or_else(|| monitors.iter().find(|monitor| monitor.primary))
+        .ok_or("The window guard has no monitor to send windows to. Choose one in \"Send windows to\".")?;
+    if send_to == card {
+        return Err(
+            "The window guard is off: \"Send windows to\" is the card display. Choose another monitor."
+                .into(),
+        );
+    }
+    Ok(Some((card, send_to)))
 }
 
 /// Decides where a window goes, given the card display and the "send windows to" monitor's work area.
@@ -294,6 +352,112 @@ mod tests {
         assert_eq!(
             land_on_card(&mut history, start + Duration::from_secs(40)),
             Placement::Stay
+        );
+    }
+
+    fn give_up(history: &mut ReturnHistory, id: isize, now: Instant) {
+        let on_card = window(rect(2000, 100, 2800, 700));
+        while history.place(id, &on_card, CARD, PRIMARY_WORK, now) != Placement::GiveUp {}
+    }
+
+    #[test]
+    fn given_up_window_moved_off_the_card_display_is_handled_then_guarded_again() {
+        let mut history = ReturnHistory::default();
+        let now = Instant::now();
+        give_up(&mut history, ID, now);
+        let off_card = window(rect(100, 100, 900, 700));
+        assert_eq!(
+            history.place(ID, &off_card, CARD, PRIMARY_WORK, now),
+            Placement::Handled
+        );
+        assert_eq!(history.latest_given_up(), None);
+        assert!(matches!(
+            land_on_card(&mut history, now),
+            Placement::MoveTo(_)
+        ));
+    }
+
+    #[test]
+    fn closed_given_up_window_is_forgotten_and_the_previous_one_is_latest_again() {
+        let mut history = ReturnHistory::default();
+        let now = Instant::now();
+        give_up(&mut history, 1, now);
+        give_up(&mut history, 2, now);
+        assert_eq!(history.latest_given_up(), Some(2));
+        assert!(history.forget(2));
+        assert!(!history.forget(2));
+        assert_eq!(history.latest_given_up(), Some(1));
+    }
+
+    #[test]
+    fn notice_names_the_given_up_window_unless_a_monitor_problem_comes_first() {
+        assert_eq!(notice(None, None), GuardReport::Clear);
+        assert_eq!(
+            notice(None, Some("Notepad")),
+            GuardReport::Notice("The window guard left \"Notepad\" on the card display because it keeps going back there. Move it off to guard it again.".into())
+        );
+        assert_eq!(
+            notice(Some("problem"), Some("Notepad")),
+            GuardReport::Notice("problem".into())
+        );
+    }
+
+    fn monitor(device_path: &str, primary: bool) -> Monitor {
+        Monitor {
+            device_path: device_path.into(),
+            gdi_name: String::new(),
+            name: device_path.into(),
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            primary,
+            left: 0,
+            top: 0,
+        }
+    }
+
+    fn guarded<'a>(
+        monitors: &'a [Monitor],
+        send_windows_to: Option<&str>,
+    ) -> Result<Option<(&'a str, &'a str)>, String> {
+        guarded_monitors(monitors, "card", send_windows_to).map(|found| {
+            found.map(|(card, send_to)| (card.device_path.as_str(), send_to.device_path.as_str()))
+        })
+    }
+
+    #[test]
+    fn guard_sends_windows_to_the_chosen_monitor_or_the_primary() {
+        let monitors = [
+            monitor("primary", true),
+            monitor("card", false),
+            monitor("side", false),
+        ];
+        assert_eq!(guarded(&monitors, Some("side")), Ok(Some(("card", "side"))));
+        assert_eq!(
+            guarded(&monitors, Some("gone")),
+            Ok(Some(("card", "primary")))
+        );
+        assert_eq!(guarded(&monitors, None), Ok(Some(("card", "primary"))));
+    }
+
+    #[test]
+    fn guard_waits_quietly_while_the_card_display_is_unplugged() {
+        assert_eq!(
+            guarded(&[monitor("primary", true)], Some("primary")),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn guard_reports_sending_windows_to_the_card_display_or_nowhere() {
+        let monitors = [monitor("primary", true), monitor("card", false)];
+        assert_eq!(
+            guarded(&monitors, Some("card")),
+            Err("The window guard is off: \"Send windows to\" is the card display. Choose another monitor.".into())
+        );
+        assert_eq!(
+            guarded(&[monitor("card", false)], Some("gone")),
+            Err("The window guard has no monitor to send windows to. Choose one in \"Send windows to\".".into())
         );
     }
 

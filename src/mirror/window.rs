@@ -158,8 +158,10 @@ fn run(
 ) -> Option<i32> {
     let opened = Screen::open(source_monitor, card_display).and_then(|(screen, source)| {
         // SAFETY: plain call returning the context's device.
-        let device = unsafe { screen.context.GetDevice() }
-            .map_err(|_| "Could not start the mirror (Direct3D device).".to_owned())?;
+        let device = unsafe { screen.context.GetDevice() }.map_err(|_| {
+            "Could not start the mirror: the graphics card did not respond. (Direct3D device)"
+                .to_owned()
+        })?;
         let desktop = Desktop::open(&device, &source, &source_monitor.device_path)?;
         Ok((screen, desktop))
     });
@@ -225,8 +227,10 @@ impl Screen {
     ) -> Result<(Self, IDXGIOutput), String> {
         let monitors = crate::guard::monitors()?;
         // SAFETY: plain factory creation.
-        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }
-            .map_err(|_| "Could not start DirectX (DXGI factory).".to_owned())?;
+        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }.map_err(|_| {
+            "Could not start the mirror: Windows graphics did not respond. (DXGI factory)"
+                .to_owned()
+        })?;
         let outputs = outputs(&factory);
         let output = find_output(&card_display.device_path, &monitors, &outputs)
             .ok_or("The card display is not connected to any graphics card.")?;
@@ -236,7 +240,7 @@ impl Screen {
             .find(|monitor| monitor.device_path == card_display.device_path)
             .ok_or("The card display is not connected.")?;
         let failed =
-            |what: &str| format!("Could not start the mirror on the card display ({what}).");
+            |what: &str| format!("Could not start the mirror on the card display. ({what})");
         // SAFETY: the index came from EnumAdapters1 on this factory just above.
         let adapter = unsafe { factory.EnumAdapters1(output.adapter) }
             .map_err(|_| failed("graphics card"))?;
@@ -263,7 +267,10 @@ impl Screen {
         let (Some(device), Some(context)) = (device, context) else {
             return Err(failed("Direct3D device"));
         };
-        let context: ID3D11DeviceContext1 = context.cast().map_err(|_| failed("Direct3D 11.1"))?;
+        let context: ID3D11DeviceContext1 = context.cast().map_err(|_| {
+            "Could not start the mirror: the graphics driver is too old. Update it. (Direct3D 11.1)"
+                .to_owned()
+        })?;
 
         let window = Window(create_window(card_display).ok_or_else(|| failed("window"))?);
         let size = (card_display.width, card_display.height);

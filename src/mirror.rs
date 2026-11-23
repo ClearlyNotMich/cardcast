@@ -61,7 +61,7 @@ pub fn ended(code: i32) -> Ended {
         Ended::Restart("The mirror lost the graphics card; restarting it.".into())
     } else {
         Ended::Stop(format!(
-            "The mirror stopped (error 0x{code:08X}). Press Start to try again."
+            "The mirror stopped unexpectedly. Press Start to try again. (error 0x{code:08X})"
         ))
     }
 }
@@ -249,7 +249,10 @@ mod tests {
         // E_OUTOFMEMORY.
         assert_eq!(
             ended(0x8007_000E_u32.cast_signed()),
-            Ended::Stop("The mirror stopped (error 0x8007000E). Press Start to try again.".into())
+            Ended::Stop(
+                "The mirror stopped unexpectedly. Press Start to try again. (error 0x8007000E)"
+                    .into()
+            )
         );
     }
 

@@ -317,7 +317,7 @@ fn open(
     let mix = MixFormat(unsafe { client.GetMixFormat() }.map_err(&failed)?);
     // SAFETY: GetMixFormat returned a valid format, freed when `mix` drops.
     let format = unsafe { format_of(mix.0) }
-        .ok_or_else(|| format!("Audio stopped: could not {what} (unsupported sample format)."))?;
+        .ok_or_else(|| format!("Audio stopped: could not {what}. (unsupported sample format)"))?;
     // SAFETY: mix points to the device's own mix format, valid until `mix` drops after this call.
     unsafe {
         client.Initialize(
@@ -395,7 +395,7 @@ impl Drop for Event {
 
 /// A status-line message for a failed WASAPI call.
 fn failed(what: &'static str) -> impl Fn(windows::core::Error) -> String {
-    move |error| format!("Audio stopped: could not {what} ({}).", error.message())
+    move |error| format!("Audio stopped: could not {what}. ({})", error.message())
 }
 
 #[cfg(test)]

@@ -319,12 +319,12 @@ impl Desktop {
         output: &IDXGIOutput,
         device_path: &str,
     ) -> Result<Self, String> {
-        let failed = |what: &str| format!("Could not capture the source monitor ({what}).");
+        let failed = |what: &str| format!("Could not capture the source monitor. ({what})");
         let mut desktop = Self {
             device: device.clone(),
-            output: output
-                .cast()
-                .map_err(|_| failed("needs Windows 10 1803 or later"))?,
+            output: output.cast().map_err(
+                |_| "Could not capture the source monitor: it needs Windows 10 1803 or later.",
+            )?,
             device_path: device_path.to_owned(),
             painter: Painter::new(device).map_err(|_| failed("shaders"))?,
             duplication: None,

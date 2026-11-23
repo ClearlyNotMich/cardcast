@@ -141,7 +141,7 @@ pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
     };
 
     let failed =
-        |error: windows::core::Error| format!("Could not list playback devices ({error}).");
+        |error: windows::core::Error| format!("Could not list playback devices. ({error})");
     // SAFETY: plain COM initialisation of this thread. On the UI thread this joins winit's STA; on the relay
     // thread, already MTA, it returns RPC_E_CHANGED_MODE and COM stays initialised as MTA, so the calls below
     // are valid on either. Left initialised for the life of the thread on purpose.

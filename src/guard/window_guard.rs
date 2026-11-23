@@ -1,6 +1,7 @@
 //! The window guard and pointer guard: out-of-context window event hooks and a pointer timer on their own thread.
 
-use super::placement::{Placement, Rect, ReturnHistory, WindowState};
+use super::GuardReport;
+use super::placement::{self, Placement, Rect, ReturnHistory, WindowState};
 use super::pointer::PointerHistory;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -19,14 +20,15 @@ use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId}
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_MINIMIZEEND, EnumWindows, GA_ROOT,
-    GWL_EXSTYLE, GetAncestor, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowPlacement,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed,
-    KillTimer, MSG, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
-    SW_SHOWMAXIMIZED, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
-    SetCursorPos, SetTimer, SetWindowPlacement, SetWindowPos, WINDOW_EX_STYLE, WINDOWPLACEMENT,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW,
-    WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_MINIMIZEEND,
+    EnumWindows, GA_ROOT, GWL_EXSTYLE, GetAncestor, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    GetWindowPlacement, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, IsZoomed, KillTimer, MSG, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW,
+    PostThreadMessageW, RegisterClassW, SW_SHOWMAXIMIZED, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
+    SWP_NOOWNERZORDER, SWP_NOZORDER, SetCursorPos, SetTimer, SetWindowPlacement, SetWindowPos,
+    WINDOW_EX_STYLE, WINDOWPLACEMENT, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW, WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW,
+    WS_OVERLAPPED,
 };
 use windows::core::{BOOL, w};
 
@@ -46,8 +48,8 @@ struct Running {
 
 pub struct WindowGuard {
     running: Option<Running>,
-    report_sender: Sender<String>,
-    reports: Receiver<String>,
+    report_sender: Sender<GuardReport>,
+    reports: Receiver<GuardReport>,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -85,6 +87,13 @@ impl Drop for WindowGuard {
     }
 }
 
+impl WindowGuard {
+    fn report(&self, report: GuardReport) {
+        let _ = self.report_sender.send(report);
+        (self.wake)();
+    }
+}
+
 impl super::Guard for WindowGuard {
     fn update(&mut self, enabled: bool, card_display: Option<&str>, send_windows_to: Option<&str>) {
         let wanted = card_display.filter(|_| enabled);
@@ -96,6 +105,8 @@ impl super::Guard for WindowGuard {
         }
         self.stop();
         let Some(card_display) = wanted else {
+            // The guard is off, so its notices are out of date.
+            self.report(GuardReport::Clear);
             return;
         };
         let (started_sender, started) = mpsc::channel();
@@ -119,14 +130,14 @@ impl super::Guard for WindowGuard {
             }
             Err(_) => {
                 let _ = thread.join();
-                let _ = self
-                    .report_sender
-                    .send("The window guard could not start.".into());
+                self.report(GuardReport::Notice(
+                    "The window guard could not start. Untick and tick Guard to try again.".into(),
+                ));
             }
         }
     }
 
-    fn take_report(&mut self) -> Option<String> {
+    fn take_report(&mut self) -> Option<GuardReport> {
         self.reports.try_iter().last()
     }
 }
@@ -135,15 +146,17 @@ impl super::Guard for WindowGuard {
 struct State {
     card_display: String,
     send_windows_to: Option<String>,
-    /// Card display rectangle and the "send windows to" work area; `None` while the card display is unplugged.
+    /// Card display rectangle and the "send windows to" work area; `None` while there is nothing to guard.
     monitors: Option<(Rect, Rect)>,
+    /// Why there is nothing to guard, unless the card display is just unplugged.
+    problem: Option<String>,
     /// Windows waiting to settle, with their latest event time.
     pending: HashMap<isize, Instant>,
     timer: usize,
     history: ReturnHistory,
     pointer_timer: usize,
     pointer_history: PointerHistory,
-    reports: Sender<String>,
+    reports: Sender<GuardReport>,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
 
@@ -154,14 +167,15 @@ thread_local! {
 fn run(
     card_display: String,
     send_windows_to: Option<String>,
-    reports: Sender<String>,
+    reports: Sender<GuardReport>,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
     started: Sender<u32>,
 ) {
-    let mut state = State {
+    let state = State {
         card_display,
         send_windows_to,
         monitors: None,
+        problem: None,
         pending: HashMap::new(),
         timer: 0,
         history: ReturnHistory::default(),
@@ -170,7 +184,6 @@ fn run(
         reports,
         wake,
     };
-    state.monitors = find_monitors(&state);
     STATE.set(Some(state));
 
     let hook = |event| {
@@ -191,6 +204,7 @@ fn run(
         hook(EVENT_OBJECT_SHOW),
         hook(EVENT_OBJECT_LOCATIONCHANGE),
         hook(EVENT_SYSTEM_MINIMIZEEND),
+        hook(EVENT_OBJECT_DESTROY),
     ];
     let display_window = create_display_window();
     if hooks.iter().any(HWINEVENTHOOK::is_invalid) || display_window.is_none() {
@@ -209,7 +223,7 @@ fn run(
     with_state(|state| {
         // SAFETY: a thread timer with no window posts WM_TIMER to this thread's queue.
         state.pointer_timer = unsafe { SetTimer(None, 0, POINTER_INTERVAL_MS, None) };
-        sweep(state);
+        follow_displays(state);
     });
     // SAFETY: message is a valid MSG; the loop ends on WM_QUIT (0) or error (-1).
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
@@ -298,10 +312,7 @@ extern "system" fn display_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if message == WM_DISPLAYCHANGE {
-        with_state(|state| {
-            state.monitors = find_monitors(state);
-            sweep(state);
-        });
+        with_state(follow_displays);
     }
     // SAFETY: forwards the message this procedure received unchanged.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -309,7 +320,7 @@ extern "system" fn display_window_proc(
 
 extern "system" fn on_event(
     _hook: HWINEVENTHOOK,
-    _event: u32,
+    event: u32,
     window: HWND,
     object: i32,
     child: i32,
@@ -318,6 +329,15 @@ extern "system" fn on_event(
 ) {
     // Position events arrive for every mouse movement; drop all but top-level windows at once.
     if object != OBJID_WINDOW.0 || child != CHILDID_SELF as i32 || window.is_invalid() {
+        return;
+    }
+    // A destroyed window has no ancestor to check; only a given-up one matters.
+    if event == EVENT_OBJECT_DESTROY {
+        with_state(|state| {
+            if state.history.forget(window.0 as isize) {
+                report(state);
+            }
+        });
         return;
     }
     // SAFETY: GetAncestor only reads the window tree; a stale handle returns null.
@@ -421,12 +441,8 @@ fn check(state: &mut State, window: HWND, now: Instant) {
             // a restored one activates it, so move the maximised frame over (measured on the CI runner).
             work_area
         }
-        Placement::GiveUp => {
-            let _ = state.reports.send(format!(
-                "The window guard left \"{}\" on the card display because it keeps going back there.",
-                window_title(window)
-            ));
-            (state.wake)();
+        Placement::GiveUp | Placement::Handled => {
+            report(state);
             return;
         }
     };
@@ -571,20 +587,40 @@ fn window_title(window: HWND) -> String {
     String::from_utf16_lossy(&title[..length])
 }
 
-/// The card display rectangle and the "send windows to" work area (primary if it is not connected).
-fn find_monitors(state: &State) -> Option<(Rect, Rect)> {
-    let monitors = super::monitors().ok()?;
-    let card_display = monitors
-        .iter()
-        .find(|monitor| monitor.device_path == state.card_display)?;
-    let send_windows_to = state
-        .send_windows_to
-        .as_ref()
-        .and_then(|path| monitors.iter().find(|monitor| &monitor.device_path == path))
-        .or_else(|| monitors.iter().find(|monitor| monitor.primary))?;
-    if send_windows_to == card_display {
-        return None;
-    }
+/// Sends the guard's current notice to the status line.
+fn report(state: &State) {
+    let title = state
+        .history
+        .latest_given_up()
+        .map(|window| window_title(HWND(window as *mut _)));
+    let _ = state.reports.send(placement::notice(
+        state.problem.as_deref(),
+        title.as_deref(),
+    ));
+    (state.wake)();
+}
+
+/// At start and after a display change: finds the monitors, reports, and checks every window.
+fn follow_displays(state: &mut State) {
+    (state.monitors, state.problem) = match find_monitors(state) {
+        Ok(monitors) => (monitors, None),
+        Err(problem) => (None, Some(problem)),
+    };
+    report(state);
+    sweep(state);
+}
+
+/// The card display rectangle and the "send windows to" work area; `Ok(None)` while the card display is unplugged.
+fn find_monitors(state: &State) -> Result<Option<(Rect, Rect)>, String> {
+    let monitors = super::monitors()?;
+    let Some((card_display, send_windows_to)) = placement::guarded_monitors(
+        &monitors,
+        &state.card_display,
+        state.send_windows_to.as_deref(),
+    )?
+    else {
+        return Ok(None);
+    };
     let info = |monitor: &super::Monitor| {
         let point = POINT {
             x: monitor.left,
@@ -601,10 +637,14 @@ fn find_monitors(state: &State) -> Option<(Rect, Rect)> {
             .as_bool()
             .then_some(info)
     };
-    Some((
-        rect(info(card_display)?.rcMonitor),
-        rect(info(send_windows_to)?.rcWork),
-    ))
+    let (Some(card_display), Some(send_windows_to)) = (info(card_display), info(send_windows_to))
+    else {
+        return Err("The window guard could not find the card display on the desktop.".into());
+    };
+    Ok(Some((
+        rect(card_display.rcMonitor),
+        rect(send_windows_to.rcWork),
+    )))
 }
 
 #[cfg(test)]

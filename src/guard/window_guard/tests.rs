@@ -339,6 +339,70 @@ fn second_monitor_maximised_window_stays_maximised_on_return() {
     );
 }
 
+/// Moves `test`'s window onto the card display until the guard gives up on it, and checks the notice.
+fn give_up_on(
+    guard: &mut WindowGuard,
+    test: &TestWindow,
+    card_display: &Monitor,
+    primary: &Monitor,
+) {
+    for _ in 0..placement::RETURNS_PER_MINUTE {
+        move_onto(test.window, card_display);
+        wait_for("window returned to the primary monitor", || {
+            on(primary, frame(test.window))
+        });
+    }
+    move_onto(test.window, card_display);
+    wait_for_report(
+        guard,
+        "the give-up notice",
+        |report| matches!(report, GuardReport::Notice(notice) if notice.contains(TITLE)),
+    );
+    assert!(
+        on(card_display, frame(test.window)),
+        "the given-up window was moved"
+    );
+}
+
+/// Polls `take_report` until the latest report matches.
+fn wait_for_report(guard: &mut WindowGuard, what: &str, wanted: impl Fn(&GuardReport) -> bool) {
+    wait_for(what, || {
+        guard.take_report().is_some_and(|report| wanted(&report))
+    });
+}
+
+#[test]
+fn second_monitor_give_up_notice_clears_when_the_window_is_moved_off() {
+    let Some(monitors) = second_monitor::monitors(2) else {
+        return;
+    };
+    let (primary, card_display) = (&monitors[0], &monitors[1]);
+    let mut guard = guard_on(card_display, primary);
+    let test = TestWindow::spawn(true);
+    give_up_on(&mut guard, &test, card_display, primary);
+    move_onto(test.window, primary);
+    wait_for_report(&mut guard, "the notice to clear", |report| {
+        *report == GuardReport::Clear
+    });
+}
+
+#[test]
+fn second_monitor_give_up_notice_clears_when_the_windows_process_is_killed() {
+    let Some(monitors) = second_monitor::monitors(2) else {
+        return;
+    };
+    let (primary, card_display) = (&monitors[0], &monitors[1]);
+    let mut guard = guard_on(card_display, primary);
+    let mut test = TestWindow::spawn(true);
+    give_up_on(&mut guard, &test, card_display, primary);
+    test.child.kill().unwrap();
+    test.child.wait().unwrap();
+    // Only EVENT_OBJECT_DESTROY tells the guard about a killed process's window.
+    wait_for_report(&mut guard, "the notice to clear", |report| {
+        *report == GuardReport::Clear
+    });
+}
+
 fn pointer() -> (i32, i32) {
     let mut pointer = POINT::default();
     // SAFETY: pointer is a valid POINT.
