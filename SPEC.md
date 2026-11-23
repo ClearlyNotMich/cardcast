@@ -113,7 +113,7 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 
 Code is written on Linux. GitHub Actions builds the Windows `.exe` on every push and attaches it to the run. The project owner downloads it and tests it on the sender in Windows. The mirror and window guard cannot be run on Linux.
 
-CI must pass `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on Windows and Linux.
+CI must pass `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on Windows and Linux.
 
 v1 contains every part below. Each part is handed over as a test build when it is ready, so problems are found one part at a time; v1 is done when all of them pass together.
 
