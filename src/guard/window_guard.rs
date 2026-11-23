@@ -27,8 +27,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SW_SHOWMAXIMIZED,
     SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetCursorPos, SetTimer,
     SetWindowPlacement, SetWindowPos, WINDOW_EX_STYLE, WINDOWPLACEMENT, WINEVENT_OUTOFCONTEXT,
-    WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW, WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW,
-    WS_OVERLAPPED,
+    WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW,
+    WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{BOOL, w};
 
@@ -196,7 +196,7 @@ fn run(
                 Some(on_event),
                 0,
                 0,
-                WINEVENT_OUTOFCONTEXT,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
             )
         }
     };
