@@ -8,6 +8,7 @@ Cardcast mirrors a screen from the sender onto the card display, so a second PC 
 - `GLOSSARY.md`: use its terms in code, issues and commits (say "sender", not "gaming PC").
 - `docs/adr/`: decisions already made. Flag it if your work contradicts one.
 - `CODING_STANDARDS.md`: rules every change must follow.
+- `docs/win32-pitfalls.md`: Win32 code (window guard, pointer guard, mirror, audio): sourced facts on blocking calls, coordinates, hooks and focus. Read it before guessing Win32 behaviour.
 
 ## Build and test
 
