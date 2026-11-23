@@ -334,8 +334,9 @@ extern "system" fn on_event(
     // A destroyed window has no ancestor to check; only a given-up one matters.
     if event == EVENT_OBJECT_DESTROY {
         with_state(|state| {
-            // RED RUN: deliberately not reporting.
-            let _ = state.history.forget(window.0 as isize);
+            if state.history.forget(window.0 as isize) {
+                report(state);
+            }
         });
         return;
     }
@@ -440,12 +441,10 @@ fn check(state: &mut State, window: HWND, now: Instant) {
             // a restored one activates it, so move the maximised frame over (measured on the CI runner).
             work_area
         }
-        Placement::GiveUp => {
+        Placement::GiveUp | Placement::Handled => {
             report(state);
             return;
         }
-        // RED RUN: deliberately not reporting.
-        Placement::Handled => return,
     };
     move_window(window, window_state.frame, window_rect, target);
 }
