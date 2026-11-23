@@ -80,7 +80,32 @@ pub struct Painter {
     white: ID3D11Buffer,
 }
 
-fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<Vec<u8>> {
+/// Shader compiles in this process; the tests check there are only three.
+#[cfg(test)]
+static COMPILES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The vertex, copy and HDR shaders' bytecode, or the HRESULT compiling them failed with.
+type Bytecode = Result<[Vec<u8>; 3], windows::core::HRESULT>;
+
+/// Compiles the shaders on first use only: every mirror start and restart reuses the bytecode,
+/// so a restart costs the sender no `D3DCompile`. A failure is kept too, since it would repeat.
+fn bytecode() -> windows::core::Result<&'static [Vec<u8>; 3]> {
+    static BYTECODE: std::sync::OnceLock<Bytecode> = std::sync::OnceLock::new();
+    BYTECODE
+        .get_or_init(|| {
+            Ok([
+                compile(s!("vertex_main"), s!("vs_4_0"))?,
+                compile(s!("copy_main"), s!("ps_4_0"))?,
+                compile(s!("hdr_main"), s!("ps_4_0"))?,
+            ])
+        })
+        .as_ref()
+        .map_err(|&code| code.into())
+}
+
+fn compile(entry: PCSTR, target: PCSTR) -> Result<Vec<u8>, windows::core::HRESULT> {
+    #[cfg(test)]
+    COMPILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut code: Option<ID3DBlob> = None;
     // SAFETY: the source pointer and length describe SHADERS; code is a valid out pointer.
     unsafe {
@@ -97,8 +122,9 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<Vec<u8>> {
             &mut code,
             None,
         )
-    }?;
-    let code = code.ok_or_else(|| windows::core::Error::from(E_POINTER))?;
+    }
+    .map_err(|error| error.code())?;
+    let code = code.ok_or(E_POINTER)?;
     // SAFETY: the blob owns GetBufferSize bytes at GetBufferPointer while `code` lives; they are copied out.
     let bytes = unsafe {
         std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
@@ -113,6 +139,7 @@ fn created<T>(value: Option<T>) -> windows::core::Result<T> {
 
 impl Painter {
     pub fn new(device: &ID3D11Device) -> windows::core::Result<Self> {
+        let [vertex_code, copy_code, hdr_code] = bytecode()?;
         let (mut vertex, mut copy, mut hdr, mut sampler, mut blend, mut white) =
             (None, None, None, None, None, None);
         let pointer_blend = D3D11_RENDER_TARGET_BLEND_DESC {
@@ -127,21 +154,9 @@ impl Painter {
         };
         // SAFETY: bytecode slices and descriptions outlive each call; out pointers are valid locals.
         unsafe {
-            device.CreateVertexShader(
-                &compile(s!("vertex_main"), s!("vs_4_0"))?,
-                None,
-                Some(&mut vertex),
-            )?;
-            device.CreatePixelShader(
-                &compile(s!("copy_main"), s!("ps_4_0"))?,
-                None,
-                Some(&mut copy),
-            )?;
-            device.CreatePixelShader(
-                &compile(s!("hdr_main"), s!("ps_4_0"))?,
-                None,
-                Some(&mut hdr),
-            )?;
+            device.CreateVertexShader(vertex_code, None, Some(&mut vertex))?;
+            device.CreatePixelShader(copy_code, None, Some(&mut copy))?;
+            device.CreatePixelShader(hdr_code, None, Some(&mut hdr))?;
             device.CreateSamplerState(
                 &D3D11_SAMPLER_DESC {
                     Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -360,8 +375,7 @@ impl Desktop {
             &[DXGI_FORMAT_B8G8R8A8_UNORM]
         };
         // shortcut: the SDR white level is read when capture starts or is re-created; a slider change while running needs a restart.
-        self.white_scale =
-            white_scale(crate::guard::sdr_white_level(&self.device_path).unwrap_or(0));
+        self.white_scale = white_scale(sdr_white_level(&self.device_path).unwrap_or(0));
         // SAFETY: the device is on the output's graphics card; formats outlives the call.
         self.duplication = Some(unsafe { self.output.DuplicateOutput1(&self.device, 0, formats) }?);
         Ok(())
@@ -508,6 +522,26 @@ impl Picture for Desktop {
         }
         Ok(())
     }
+}
+
+/// The monitor's SDR white level (`DISPLAYCONFIG_SDR_WHITE_LEVEL.SDRWhiteLevel`, 1000 = 80 nits).
+fn sdr_white_level(monitor_device_path: &str) -> Option<u32> {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_SDR_WHITE_LEVEL,
+        DisplayConfigGetDeviceInfo,
+    };
+    let (paths, _) = crate::guard::display_config().ok()?;
+    let path = paths.iter().find(|path| {
+        crate::guard::device_path(path)
+            .is_some_and(|(device_path, _)| device_path == monitor_device_path)
+    })?;
+    let mut level = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
+    level.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+    level.header.size = u32::try_from(size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>()).ok()?;
+    level.header.adapterId = path.targetInfo.adapterId;
+    level.header.id = path.targetInfo.id;
+    // SAFETY: header is the first field of a correctly sized DISPLAYCONFIG_SDR_WHITE_LEVEL, as size says.
+    (unsafe { DisplayConfigGetDeviceInfo(&mut level.header) } == 0).then_some(level.SDRWhiteLevel)
 }
 
 /// Only one Desktop Duplication of an output per process, so tests that duplicate take turns.

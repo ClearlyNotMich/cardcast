@@ -64,6 +64,8 @@ pub trait Guard {
     fn update(&mut self, enabled: bool, card_display: Option<&str>, send_windows_to: Option<&str>);
     /// The guard's latest notice for the status line, if it changed.
     fn take_report(&mut self) -> Option<GuardReport>;
+    /// After a display or device change: the guard finds its monitors again and checks every window.
+    fn follow_displays(&mut self);
 }
 
 /// What the guard tells the status line; each report replaces the one before.
@@ -103,6 +105,8 @@ impl Guard for StandInGuard {
     fn take_report(&mut self) -> Option<GuardReport> {
         None
     }
+
+    fn follow_displays(&mut self) {}
 }
 
 /// Stand-in monitors so the settings window can be laid out on Linux.
@@ -149,7 +153,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
 
 /// Active display paths and modes from `QueryDisplayConfig`.
 #[cfg(windows)]
-fn display_config() -> Result<
+pub(crate) fn display_config() -> Result<
     (
         Vec<windows::Win32::Devices::Display::DISPLAYCONFIG_PATH_INFO>,
         Vec<windows::Win32::Devices::Display::DISPLAYCONFIG_MODE_INFO>,
@@ -190,7 +194,7 @@ fn display_config() -> Result<
 
 /// The path's monitor device path and friendly name, or `None` if Windows cannot name its target.
 #[cfg(windows)]
-fn device_path(
+pub(crate) fn device_path(
     path: &windows::Win32::Devices::Display::DISPLAYCONFIG_PATH_INFO,
 ) -> Option<(String, String)> {
     use windows::Win32::Devices::Display::{
@@ -210,26 +214,6 @@ fn device_path(
         wide_to_string(&target.monitorDevicePath),
         wide_to_string(&target.monitorFriendlyDeviceName),
     ))
-}
-
-/// The monitor's SDR white level (`DISPLAYCONFIG_SDR_WHITE_LEVEL.SDRWhiteLevel`, 1000 = 80 nits).
-#[cfg(windows)]
-pub fn sdr_white_level(monitor_device_path: &str) -> Option<u32> {
-    use windows::Win32::Devices::Display::{
-        DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_SDR_WHITE_LEVEL,
-        DisplayConfigGetDeviceInfo,
-    };
-    let (paths, _) = display_config().ok()?;
-    let path = paths.iter().find(|path| {
-        device_path(path).is_some_and(|(device_path, _)| device_path == monitor_device_path)
-    })?;
-    let mut level = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
-    level.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
-    level.header.size = u32::try_from(size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>()).ok()?;
-    level.header.adapterId = path.targetInfo.adapterId;
-    level.header.id = path.targetInfo.id;
-    // SAFETY: header is the first field of a correctly sized DISPLAYCONFIG_SDR_WHITE_LEVEL, as size says.
-    (unsafe { DisplayConfigGetDeviceInfo(&mut level.header) } == 0).then_some(level.SDRWhiteLevel)
 }
 
 /// Active monitors from the Windows display configuration, keyed by device path.
@@ -376,4 +360,57 @@ pub mod second_monitor {
 pub(crate) fn wide_to_string(wide: &[u16]) -> String {
     let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
     String::from_utf16_lossy(&wide[..end])
+}
+
+/// Stops a thread that runs a message loop: posts WM_QUIT, then waits for it. The guard, mirror
+/// and display watcher threads all stop this way. A post fails until the thread has a message
+/// queue (it may still be starting) or while its queue is full, so it is retried until it lands
+/// or the thread ended; no stop leaves a thread running.
+#[cfg(windows)]
+pub(crate) fn quit_and_join<T>(thread: std::thread::JoinHandle<T>) -> std::thread::Result<T> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, LPARAM, WPARAM};
+    use windows::Win32::System::Threading::GetThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_QUIT};
+    // SAFETY: the handle is the thread's own, open until `thread` is joined below.
+    let thread_id = unsafe { GetThreadId(HANDLE(thread.as_raw_handle())) };
+    while !thread.is_finished() {
+        // SAFETY: posting to a thread id has no memory effects; a thread without a queue just fails the post.
+        if unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) }.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    thread.join()
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::quit_and_join;
+    use std::time::{Duration, Instant};
+    use windows::Win32::UI::WindowsAndMessaging::{GetMessageW, MSG};
+
+    #[test]
+    fn quit_and_join_stops_a_thread_that_has_no_message_queue_yet() {
+        // Like a mirror thread still opening the graphics card when Stop is pressed.
+        let thread = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut message = MSG::default();
+            // SAFETY: message is a valid MSG; the first call creates the queue, the loop ends on WM_QUIT (0) or error (-1).
+            while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {}
+            "quit"
+        });
+        let (done, joined) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let _ = done.send(quit_and_join(thread).ok());
+        });
+        let joined = joined.recv_timeout(Duration::from_secs(5));
+        println!("quit_and_join returned after {:?}", started.elapsed());
+        assert_eq!(
+            joined,
+            Ok(Some("quit")),
+            "the thread was left running or never asked to quit"
+        );
+    }
 }

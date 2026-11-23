@@ -5,8 +5,8 @@ use crate::mirror::capture::duplicating;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
-    GetWindowRect, IsWindow, WS_CAPTION, WS_THICKFRAME,
+    FindWindowW, GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowDisplayAffinity,
+    GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible, WS_CAPTION, WS_THICKFRAME,
 };
 
 fn card_display() -> Monitor {
@@ -20,11 +20,98 @@ fn card_display() -> Monitor {
 fn started(card_display: &Monitor) -> MirrorWindow {
     let mut mirror = MirrorWindow::new(|| {});
     mirror.start(card_display, card_display).unwrap();
+    shows_picture(&mut mirror);
     mirror
 }
 
+/// Waits for a started mirror to show the picture; fails with its reason if it ended instead.
+fn shows_picture(mirror: &mut MirrorWindow) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !mirror.shows_picture() {
+        if let Some(end) = mirror.take_end() {
+            panic!("the mirror did not start: {end:?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the mirror never showed the picture"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// How a started mirror ended; fails if it is still running after 10 s.
+fn end(mirror: &mut MirrorWindow) -> Ended {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(end) = mirror.take_end() {
+            return end;
+        }
+        assert!(Instant::now() < deadline, "the mirror did not end");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn window(mirror: &MirrorWindow) -> HWND {
-    HWND(mirror.running.as_ref().unwrap().window as *mut _)
+    HWND(
+        mirror
+            .running
+            .as_ref()
+            .unwrap()
+            .shown
+            .load(Ordering::Acquire) as *mut _,
+    )
+}
+
+#[test]
+fn start_returns_before_the_mirror_opens_the_graphics_card() {
+    let _duplicating = duplicating();
+    let card_display = card_display();
+    let woken = Arc::new(AtomicU64::new(0));
+    let mut mirror = {
+        let woken = woken.clone();
+        MirrorWindow::new(move || {
+            woken.fetch_add(1, Ordering::Relaxed);
+        })
+    };
+    let start = Instant::now();
+    mirror.start(&card_display, &card_display).unwrap();
+    let returned = start.elapsed();
+    let showing = mirror.shows_picture();
+    // SAFETY: the class name is a static string; no window name is matched.
+    let window = unsafe { FindWindowW(CLASS, None) }.ok();
+    let visible = window.is_some_and(|window| {
+        // SAFETY: IsWindowVisible accepts any handle.
+        unsafe { IsWindowVisible(window) }.as_bool()
+    });
+    println!("start returned after {returned:?}");
+    assert!(
+        !showing && !visible,
+        "start waited for the mirror to show the picture"
+    );
+    assert!(mirror.is_running(), "the mirror is not starting");
+    shows_picture(&mut mirror);
+    println!("the picture showed after {:?}", start.elapsed());
+    assert!(
+        woken.load(Ordering::Relaxed) >= 1,
+        "the settings window was not woken to see the mirror run"
+    );
+    mirror.stop();
+    assert!(!mirror.is_running());
+}
+
+#[test]
+fn stop_while_starting_leaves_no_mirror_thread_or_window_behind() {
+    let _duplicating = duplicating();
+    let card_display = card_display();
+    let mut mirror = MirrorWindow::new(|| {});
+    mirror.start(&card_display, &card_display).unwrap();
+    mirror.stop();
+    assert!(!mirror.is_running());
+    // A mirror thread left running would have opened its window by now.
+    std::thread::sleep(Duration::from_secs(1));
+    // SAFETY: the class name is a static string; no window name is matched.
+    let window = unsafe { FindWindowW(CLASS, None) };
+    assert!(window.is_err(), "a mirror window was left behind");
 }
 
 fn foreground() -> isize {
@@ -123,6 +210,7 @@ fn second_monitor_mirror_starts_on_it_and_presents() {
     let _duplicating = duplicating();
     let mut mirror = MirrorWindow::new(|| {});
     mirror.start(source_monitor, card_display).unwrap();
+    shows_picture(&mut mirror);
     let mut rect = RECT::default();
     // SAFETY: rect is a valid RECT; the window lives until `mirror` drops.
     unsafe { GetWindowRect(window(&mirror), &mut rect) }.unwrap();
@@ -169,7 +257,8 @@ fn second_monitor_card_display_on_another_graphics_card_is_refused() {
     };
     let _duplicating = duplicating();
     let mut mirror = MirrorWindow::new(|| {});
-    let refused = mirror.start(source_monitor, card_display).unwrap_err();
+    mirror.start(source_monitor, card_display).unwrap();
+    let refused = end(&mut mirror);
     assert_eq!(
         refused,
         Ended::Stop(

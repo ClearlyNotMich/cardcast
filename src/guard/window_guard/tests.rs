@@ -6,11 +6,14 @@ use crate::guard::second_monitor::{self, wait_for};
 use crate::guard::{Guard as _, Monitor};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
+use windows::Win32::Foundation::LRESULT;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SWP_NOSIZE, SendMessageTimeoutW,
-    ShowWindow, TranslateMessage, WM_NULL, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, RegisterClassW,
+    SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SWP_NOSIZE, SendMessageTimeoutW, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WM_NULL, WM_QUIT, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
-use windows::core::PCWSTR;
+use windows::core::{HSTRING, PCWSTR, w};
 
 const CHILD_MODE: &str = "CARDCAST_TEST_WINDOW";
 const TITLE: &str = "cardcast test window";
@@ -411,11 +414,11 @@ struct OwnWindow {
 }
 
 impl OwnWindow {
-    fn spawn(class_name: PCWSTR) -> Self {
-        let class_name = class_name.0 as usize;
+    fn spawn(class_name: &'static str) -> Self {
         let (sender, created) = mpsc::channel();
         std::thread::spawn(move || {
-            let class_name = PCWSTR(class_name as *const u16);
+            let name = HSTRING::from(class_name);
+            let class_name = PCWSTR(name.as_ptr());
             // SAFETY: a null module name returns this executable's handle.
             let instance = unsafe { GetModuleHandleW(None) }.unwrap();
             let class = WNDCLASSW {
@@ -479,9 +482,9 @@ fn second_monitor_settings_window_moved_onto_the_card_display_is_returned_but_th
     };
     let (primary, card_display) = (&monitors[0], &monitors[1]);
     let _guard = guard_on(card_display, primary);
-    let mirror = OwnWindow::spawn(w!("cardcast mirror"));
+    let mirror = OwnWindow::spawn(placement::MIRROR_WINDOW_CLASS);
     move_onto(mirror.window, card_display);
-    let settings = OwnWindow::spawn(w!("cardcast test settings window"));
+    let settings = OwnWindow::spawn("cardcast test settings window");
     move_onto(settings.window, card_display);
     wait_for(
         "settings window returned to the primary monitor",
@@ -519,5 +522,80 @@ fn second_monitor_pointer_is_put_back_off_the_card_display() {
         "pointer back at its last off-card position",
         CALL_LIMIT,
         || pointer() == off_card,
+    );
+}
+
+#[test]
+fn second_monitor_disable_leaves_no_guard_thread_or_hooks_behind() {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{OpenThread, THREAD_SYNCHRONIZE, WaitForSingleObject};
+    let Some(monitors) = second_monitor::monitors(2) else {
+        return;
+    };
+    let (primary, card_display) = (&monitors[0], &monitors[1]);
+    let mut guard = guard_on(card_display, primary);
+    let thread_id = guard.running.as_ref().unwrap().thread_id;
+    guard.update(
+        false,
+        Some(&card_display.device_path),
+        Some(&primary.device_path),
+    );
+    // SAFETY: plain open by id; it fails once the thread is gone and no handle keeps it.
+    let alive = unsafe { OpenThread(THREAD_SYNCHRONIZE, false, thread_id) }.is_ok_and(|thread| {
+        // SAFETY: the handle was opened above, waited on without blocking, and closed once.
+        unsafe {
+            let running = WaitForSingleObject(thread, 0) != WAIT_OBJECT_0;
+            let _ = CloseHandle(thread);
+            running
+        }
+    });
+    assert!(!alive, "the guard thread still runs after Disable");
+    let test = TestWindow::spawn(true);
+    move_onto(test.window, card_display);
+    // Well past the settle time and timer the guard would return it in.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        on(card_display, frame(test.window)),
+        "a window was returned after Disable: the guard's hooks are still installed"
+    );
+}
+
+#[test]
+fn second_monitor_send_windows_to_device_disabled_is_seen_by_the_guard() {
+    use crate::guard::DisplayWatcher;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(monitors) = second_monitor::monitors(3) else {
+        return;
+    };
+    let (primary, send_windows_to, card_display) = (&monitors[0], &monitors[1], &monitors[2]);
+    let mut guard = guard_on(card_display, send_windows_to);
+    // The settings window's part: the one display watcher wakes it, and it tells the guard.
+    let changed = Arc::new(AtomicBool::new(false));
+    let _watcher = {
+        let changed = changed.clone();
+        DisplayWatcher::new(move || changed.store(true, Ordering::Relaxed)).unwrap()
+    };
+    // The report from the guard's start, so the next one comes from the device change.
+    wait_for_report(&mut guard, "the guard to start", |_| true);
+    // Its display path stays active at the same place, and no WM_DISPLAYCHANGE comes
+    // (docs/win32-mirror-audio.md), so only the device change tells the guard it is gone.
+    let _unplugged = second_monitor::Unplugged::monitor(&send_windows_to.device_path);
+    wait_for(
+        "the guard to follow the device change",
+        Duration::from_secs(15),
+        || {
+            if changed.swap(false, Ordering::Relaxed) {
+                guard.follow_displays();
+            }
+            guard.take_report().is_some()
+        },
+    );
+    let test = TestWindow::spawn(true);
+    move_onto(test.window, card_display);
+    wait_for(
+        "window sent to the primary monitor instead of the disabled one",
+        CALL_LIMIT,
+        || on(primary, frame(test.window)),
     );
 }

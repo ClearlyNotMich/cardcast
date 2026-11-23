@@ -2,11 +2,14 @@
 
 use crate::guard::{GuardReport, Monitor};
 use crate::mirror::{Ended, Mirror};
+use std::time::Duration;
 
 /// What the mirror is doing; it alone decides the Start/Stop button.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
     Stopped,
+    /// Started; the mirror shows the picture once it opened the graphics card and the window.
+    Starting,
     Running,
     WaitingForCardDisplay,
     WaitingForSourceMonitor,
@@ -20,6 +23,7 @@ impl Status {
     pub fn text(&self) -> String {
         match self {
             Self::Stopped => "Stopped".into(),
+            Self::Starting => "Starting".into(),
             Self::Running => "Running".into(),
             Self::WaitingForCardDisplay => "Waiting for card display".into(),
             Self::WaitingForSourceMonitor => "Waiting for source monitor".into(),
@@ -106,7 +110,18 @@ pub fn restarted(status: Status) -> Status {
     }
 }
 
-/// Applies the refusal rules, then starts the mirror.
+/// How long a restarting mirror waits before its next start, given the starts made since it last
+/// showed the picture: at once after it ran, then 1 s doubling to 30 s. It never gives up, so a
+/// slow mode change still recovers (SPEC section 9), but a failure that keeps coming back costs
+/// the sender a device and a window only twice a minute.
+pub fn restart_delay(attempts: u32) -> Duration {
+    match attempts {
+        0 => Duration::ZERO,
+        attempts => Duration::from_secs(1 << (attempts - 1).min(5)).min(Duration::from_secs(30)),
+    }
+}
+
+/// Applies the refusal rules, then starts the mirror in the background.
 pub fn start(settings: &Settings, monitors: &[Monitor], mirror: &mut dyn Mirror) -> Status {
     let (Some(source_path), Some(card_path)) = (&settings.source_monitor, &settings.card_display)
     else {
@@ -128,7 +143,7 @@ pub fn start(settings: &Settings, monitors: &[Monitor], mirror: &mut dyn Mirror)
         return Status::WaitingForSourceMonitor;
     };
     match mirror.start(source_monitor, card_display) {
-        Ok(()) => Status::Running,
+        Ok(()) => Status::Starting,
         Err(Ended::Restart(message)) => Status::Restarting(message),
         Err(Ended::Stop(message)) => Status::Error(message),
     }
@@ -145,11 +160,13 @@ pub enum Follow {
 }
 
 /// `wanted` is whether the mirror runs or will start by itself ([`StatusLine::shows_stop`]), so a
-/// mirror stopped by Stop or an error stays stopped; `before` and `now` are the source monitor and
-/// card display in the monitor list before and after the change.
+/// mirror stopped by Stop or an error stays stopped. `mirror_on` is whether it runs, starts or
+/// waits on its restart timer: then only a changed monitor starts it again, so a device change
+/// (a USB device too) does not skip the restart backoff. `before` and `now` are the source monitor
+/// and card display in the monitor list before and after the change.
 pub fn follow_displays(
     wanted: bool,
-    mirror_running: bool,
+    mirror_on: bool,
     before: [Option<&Monitor>; 2],
     now: [Option<&Monitor>; 2],
 ) -> Follow {
@@ -157,7 +174,7 @@ pub fn follow_displays(
         _ if !wanted => Follow::Nothing,
         [_, None] => Follow::Stop(Status::WaitingForCardDisplay),
         [None, _] => Follow::Stop(Status::WaitingForSourceMonitor),
-        _ if !mirror_running || before != now => Follow::Start,
+        _ if !mirror_on || before != now => Follow::Start,
         _ => Follow::Nothing,
     }
 }
@@ -355,6 +372,9 @@ mod tests {
         fn is_running(&self) -> bool {
             false
         }
+        fn shows_picture(&self) -> bool {
+            false
+        }
         fn take_end(&mut self) -> Option<crate::mirror::Ended> {
             None
         }
@@ -401,7 +421,7 @@ mod tests {
         let mut mirror = StandInMirror::default();
         assert_eq!(
             start_text(&chosen("source", "card"), &mut mirror),
-            "Running"
+            "Starting"
         );
         assert!(mirror.running);
     }
@@ -487,6 +507,7 @@ mod tests {
     #[test]
     fn button_shows_stop_exactly_while_the_mirror_runs_or_will_start_by_itself() {
         let shows_stop = |mirror| StatusLine::new(mirror).shows_stop();
+        assert!(shows_stop(Status::Starting));
         assert!(shows_stop(Status::Running));
         assert!(shows_stop(Status::WaitingForCardDisplay));
         assert!(shows_stop(Status::WaitingForSourceMonitor));
@@ -504,6 +525,15 @@ mod tests {
             Status::Restarting("Could not capture the source monitor.".into())
         );
         assert_eq!(restarted(Status::Running), Status::Running);
+    }
+
+    #[test]
+    fn restarts_wait_one_second_doubling_to_thirty_after_failed_starts() {
+        let waits: Vec<u64> = (0..9)
+            .map(|attempts| restart_delay(attempts).as_secs())
+            .collect();
+        assert_eq!(waits, [0, 1, 2, 4, 8, 16, 30, 30, 30]);
+        assert_eq!(restart_delay(u32::MAX), Duration::from_secs(30));
     }
 
     #[test]

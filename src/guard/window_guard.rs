@@ -8,35 +8,35 @@ use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_MINIMIZEEND,
-    EnumWindows, GA_ROOT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId,
-    InternalGetWindowText, IsIconic, IsWindowVisible, IsZoomed, KillTimer, MSG, OBJID_WINDOW,
-    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SW_SHOWMAXIMIZED,
+    CHILDID_SELF, DispatchMessageW, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
+    EVENT_OBJECT_SHOW, EVENT_SYSTEM_MINIMIZEEND, EnumWindows, GA_ROOT, GWL_EXSTYLE, GetAncestor,
+    GetClassNameW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
+    GetWindowThreadProcessId, InternalGetWindowText, IsIconic, IsWindowVisible, IsZoomed,
+    KillTimer, MSG, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SW_SHOWMAXIMIZED,
     SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetCursorPos, SetTimer,
-    SetWindowPlacement, SetWindowPos, WINDOW_EX_STYLE, WINDOWPLACEMENT, WINEVENT_OUTOFCONTEXT,
-    WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW, WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW,
-    WS_OVERLAPPED,
+    SetWindowPlacement, SetWindowPos, WINDOWPLACEMENT, WINEVENT_OUTOFCONTEXT, WM_APP, WM_TIMER,
+    WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
-use windows::core::{BOOL, w};
+use windows::core::BOOL;
 
 /// How long a window must be still before the guard checks it, so a drag is checked once.
 const SETTLE: Duration = Duration::from_millis(50);
 
 /// Pointer check interval: about 60 times a second.
 const POINTER_INTERVAL_MS: u32 = 16;
+
+/// Thread message to the guard thread: the displays or devices changed.
+const FOLLOW_DISPLAYS: u32 = WM_APP;
 
 /// The guard thread and what it was started with.
 struct Running {
@@ -69,14 +69,10 @@ impl WindowGuard {
         }
     }
 
+    /// Returns once the guard thread is gone, and its hooks and timers with it.
     fn stop(&mut self) {
         if let Some(running) = self.running.take() {
-            // SAFETY: posting to a thread id has no memory effects; a dead thread just fails the post.
-            let posted =
-                unsafe { PostThreadMessageW(running.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
-            if posted.is_ok() {
-                let _ = running.thread.join();
-            }
+            let _ = super::quit_and_join(running.thread);
         }
     }
 }
@@ -139,6 +135,15 @@ impl super::Guard for WindowGuard {
 
     fn take_report(&mut self) -> Option<GuardReport> {
         self.reports.try_iter().last()
+    }
+
+    fn follow_displays(&mut self) {
+        if let Some(running) = &self.running {
+            // SAFETY: posting to a thread id has no memory effects; the guard thread made its queue before it started.
+            let _ = unsafe {
+                PostThreadMessageW(running.thread_id, FOLLOW_DISPLAYS, WPARAM(0), LPARAM(0))
+            };
+        }
     }
 }
 
@@ -206,9 +211,8 @@ fn run(
         hook(EVENT_SYSTEM_MINIMIZEEND),
         hook(EVENT_OBJECT_DESTROY),
     ];
-    let display_window = create_display_window();
-    if hooks.iter().any(HWINEVENTHOOK::is_invalid) || display_window.is_none() {
-        cleanup(&hooks, display_window);
+    if hooks.iter().any(HWINEVENTHOOK::is_invalid) {
+        cleanup(&hooks);
         return;
     }
 
@@ -217,7 +221,7 @@ fn run(
     let _ = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) };
     // SAFETY: plain call returning this thread's id.
     if started.send(unsafe { GetCurrentThreadId() }).is_err() {
-        cleanup(&hooks, display_window);
+        cleanup(&hooks);
         return;
     }
     with_state(|state| {
@@ -235,22 +239,20 @@ fn run(
                     check_settled(state);
                 }
             });
+        } else if message.message == FOLLOW_DISPLAYS && message.hwnd.is_invalid() {
+            with_state(follow_displays);
         } else {
             // SAFETY: message came from GetMessageW on this thread.
             unsafe { DispatchMessageW(&message) };
         }
     }
-    cleanup(&hooks, display_window);
+    cleanup(&hooks);
 }
 
-fn cleanup(hooks: &[HWINEVENTHOOK], display_window: Option<HWND>) {
+fn cleanup(hooks: &[HWINEVENTHOOK]) {
     for &hook in hooks.iter().filter(|hook| !hook.is_invalid()) {
         // SAFETY: the hook was installed by this thread and is removed once.
         let _ = unsafe { UnhookWinEvent(hook) };
-    }
-    if let Some(window) = display_window {
-        // SAFETY: the window was created by this thread.
-        let _ = unsafe { DestroyWindow(window) };
     }
     with_state(|state| {
         for timer in [state.timer, state.pointer_timer] {
@@ -271,51 +273,6 @@ fn with_state(f: impl FnOnce(&mut State)) {
             f(state);
         }
     });
-}
-
-/// A hidden top-level window, because only top-level windows hear about display changes.
-fn create_display_window() -> Option<HWND> {
-    // SAFETY: a null module name returns this executable's handle.
-    let instance = unsafe { GetModuleHandleW(None) }.ok()?;
-    let class = WNDCLASSW {
-        lpfnWndProc: Some(display_window_proc),
-        hInstance: instance.into(),
-        lpszClassName: w!("cardcast window guard"),
-        ..Default::default()
-    };
-    // SAFETY: class points at static strings and a valid window procedure; registering twice only fails.
-    unsafe { RegisterClassW(&class) };
-    // SAFETY: the class was registered above; the window is never shown.
-    unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("cardcast window guard"),
-            w!(""),
-            WS_OVERLAPPED,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            Some(instance.into()),
-            None,
-        )
-    }
-    .ok()
-}
-
-extern "system" fn display_window_proc(
-    window: HWND,
-    message: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if message == WM_DISPLAYCHANGE {
-        with_state(follow_displays);
-    }
-    // SAFETY: forwards the message this procedure received unchanged.
-    unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
 extern "system" fn on_event(

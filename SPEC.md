@@ -86,7 +86,7 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 ## 6. Settings window
 
 - Built with `egui` (`eframe`). It must use no CPU while minimised.
-- Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, Start/Stop button, guard checkbox, and a one-line status (running, waiting for card display, waiting for source monitor, restarting, or the last error in plain words).
+- Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, Start/Stop button, guard checkbox, and a one-line status (starting, running, waiting for card display, waiting for source monitor, restarting, or the last error in plain words).
 - Dropdowns show each monitor's name, resolution and refresh rate.
 - Settings are saved when changed and loaded at launch.
 - The window repaints only on user input or when the mirror or window guard reports a status change.

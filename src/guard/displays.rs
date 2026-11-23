@@ -1,15 +1,15 @@
-//! The display watcher: a hidden top-level window on its own thread that hears every display and device change.
+//! The display watcher: a hidden top-level window on its own thread that hears every display and
+//! device change. It is cardcast's one listener: the settings window follows it and passes each
+//! change on to the guard.
 
 use std::cell::RefCell;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
-    PostThreadMessageW, RegisterClassW, WINDOW_EX_STYLE, WM_DEVICECHANGE, WM_DISPLAYCHANGE,
-    WM_QUIT, WNDCLASSW, WS_OVERLAPPED,
+    RegisterClassW, WINDOW_EX_STYLE, WM_DEVICECHANGE, WM_DISPLAYCHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::w;
 
@@ -21,7 +21,7 @@ thread_local! {
 /// every device change: a monitor's device can go away with no display change (docs/win32-mirror-audio.md).
 pub struct DisplayWatcher {
     /// `None` once dropped.
-    running: Option<(u32, JoinHandle<()>)>,
+    running: Option<JoinHandle<()>>,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the Windows tests"))]
     window: isize,
 }
@@ -32,8 +32,8 @@ impl DisplayWatcher {
         let (started_sender, started) = mpsc::channel();
         let thread = std::thread::spawn(move || run(Box::new(wake), &started_sender));
         match started.recv() {
-            Ok((thread_id, window)) => Ok(Self {
-                running: Some((thread_id, thread)),
+            Ok(window) => Ok(Self {
+                running: Some(thread),
                 window,
             }),
             Err(_) => {
@@ -46,25 +46,18 @@ impl DisplayWatcher {
 
 impl Drop for DisplayWatcher {
     fn drop(&mut self) {
-        if let Some((thread_id, thread)) = self.running.take() {
-            // SAFETY: posting to a thread id has no memory effects; a dead thread just fails the post.
-            let posted = unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
-            if posted.is_ok() {
-                let _ = thread.join();
-            }
+        if let Some(thread) = self.running.take() {
+            let _ = super::quit_and_join(thread);
         }
     }
 }
 
-fn run(wake: Box<dyn Fn()>, started: &mpsc::Sender<(u32, isize)>) {
+fn run(wake: Box<dyn Fn()>, started: &mpsc::Sender<isize>) {
     WAKE.set(Some(wake));
-    // The window creates this thread's message queue, so WM_QUIT can be posted once the id is sent.
     let Some(window) = create_window() else {
         return;
     };
-    // SAFETY: plain call returning this thread's id.
-    let thread_id = unsafe { GetCurrentThreadId() };
-    if started.send((thread_id, window.0 as isize)).is_ok() {
+    if started.send(window.0 as isize).is_ok() {
         let mut message = MSG::default();
         // SAFETY: message is a valid MSG; the loop ends on WM_QUIT (0) or error (-1).
         while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {

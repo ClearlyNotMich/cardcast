@@ -5,8 +5,7 @@ use super::capture::Desktop;
 use super::{Ended, Fit, Mirror, Output, ended, find_output, fit, source_output, start_failed};
 use crate::guard::Monitor;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{
     CloseHandle, E_POINTER, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
@@ -25,15 +24,19 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory2, IDXGIOutput, IDXGISwapChain2,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{GetCurrentThreadId, INFINITE};
+use windows::Win32::System::Threading::INFINITE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, MA_NOACTIVATE, MSG,
-    MsgWaitForMultipleObjects, PM_NOREMOVE, PM_REMOVE, PeekMessageW, PostThreadMessageW,
-    QS_ALLINPUT, RegisterClassW, SW_SHOWNOACTIVATE, SetWindowDisplayAffinity, ShowWindow,
-    WDA_EXCLUDEFROMCAPTURE, WM_MOUSEACTIVATE, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    MsgWaitForMultipleObjects, PM_NOREMOVE, PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW,
+    SW_SHOWNOACTIVATE, SetWindowDisplayAffinity, ShowWindow, WDA_EXCLUDEFROMCAPTURE,
+    WM_MOUSEACTIVATE, WM_QUIT, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
-use windows::core::{Interface, w};
+use windows::core::{Interface, PCWSTR, w};
+
+/// The mirror window's class; `w!` needs a literal, so it repeats
+/// `crate::guard::placement::MIRROR_WINDOW_CLASS`, which the guard exempts. Change both together.
+const CLASS: PCWSTR = w!("cardcast mirror");
 
 /// What the mirror window draws once per refresh: the captured source monitor (`super::capture::Desktop`).
 pub trait Picture {
@@ -51,11 +54,10 @@ pub trait Picture {
 
 /// The mirror thread and what tests read from it.
 struct Running {
-    thread_id: u32,
-    /// The HRESULT the mirror ended with on its own; `None` after WM_QUIT.
-    thread: JoinHandle<Option<i32>>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the Windows tests"))]
-    window: isize,
+    /// How the mirror failed to start or ended on its own; `None` after WM_QUIT.
+    thread: JoinHandle<Option<Ended>>,
+    /// The mirror window once it shows the picture; 0 while the mirror starts.
+    shown: Arc<AtomicIsize>,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the Windows tests"))]
     presents: Arc<AtomicU64>,
 }
@@ -81,51 +83,33 @@ impl Drop for MirrorWindow {
 }
 
 impl Mirror for MirrorWindow {
+    /// Starts the mirror thread and returns: the UI thread never waits for the graphics card.
     fn start(&mut self, source_monitor: &Monitor, card_display: &Monitor) -> Result<(), Ended> {
         self.stop();
-        let (started_sender, started) = mpsc::channel();
+        let shown = Arc::new(AtomicIsize::new(0));
         let presents = Arc::new(AtomicU64::new(0));
         let thread = {
             let (source_monitor, card_display) = (source_monitor.clone(), card_display.clone());
-            let (presents, wake) = (presents.clone(), self.wake.clone());
+            let (shown, presents, wake) = (shown.clone(), presents.clone(), self.wake.clone());
             std::thread::spawn(move || {
-                let code = run(&source_monitor, &card_display, &presents, &started_sender);
-                if code.is_some() {
+                let end = run(&source_monitor, &card_display, &shown, &presents, &*wake);
+                if end.is_some() {
                     wake();
                 }
-                code
+                end
             })
         };
-        match started.recv() {
-            Ok(Ok((thread_id, window))) => {
-                self.running = Some(Running {
-                    thread_id,
-                    thread,
-                    window,
-                    presents,
-                });
-                Ok(())
-            }
-            Ok(Err(failure)) => {
-                let _ = thread.join();
-                Err(failure)
-            }
-            // The mirror thread panicked: a bug, so starting again would fail the same way.
-            Err(_) => {
-                let _ = thread.join();
-                Err(Ended::Stop("The mirror could not start.".into()))
-            }
-        }
+        self.running = Some(Running {
+            thread,
+            shown,
+            presents,
+        });
+        Ok(())
     }
 
     fn stop(&mut self) {
         if let Some(running) = self.running.take() {
-            // SAFETY: posting to a thread id has no memory effects; a dead thread just fails the post.
-            let posted =
-                unsafe { PostThreadMessageW(running.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
-            if posted.is_ok() {
-                let _ = running.thread.join();
-            }
+            let _ = crate::guard::quit_and_join(running.thread);
         }
     }
 
@@ -135,28 +119,38 @@ impl Mirror for MirrorWindow {
             .is_some_and(|running| !running.thread.is_finished())
     }
 
+    fn shows_picture(&self) -> bool {
+        self.running.as_ref().is_some_and(|running| {
+            !running.thread.is_finished() && running.shown.load(Ordering::Acquire) != 0
+        })
+    }
+
     fn take_end(&mut self) -> Option<Ended> {
         if !self.running.as_ref()?.thread.is_finished() {
             return None;
         }
         let running = self.running.take()?;
         // A panicked mirror thread has no HRESULT; E_UNEXPECTED stops the mirror with a code.
-        let code = running
+        running
             .thread
             .join()
-            .unwrap_or(Some(0x8000_FFFF_u32.cast_signed()))?;
-        Some(ended(code))
+            .unwrap_or_else(|_| Some(ended(0x8000_FFFF_u32.cast_signed())))
     }
 }
 
-/// Mirror thread: opens the window, reports its thread id and window, then draws until WM_QUIT.
-/// Returns the HRESULT of a failed draw or present, `None` after WM_QUIT or a failed open.
+/// Mirror thread: opens the window and capture, shows the window, then draws until WM_QUIT.
+/// Returns how it failed to start or why a draw or present failed; `None` after WM_QUIT.
 fn run(
     source_monitor: &Monitor,
     card_display: &Monitor,
+    shown: &AtomicIsize,
     presents: &AtomicU64,
-    started: &Sender<Result<(u32, isize), Ended>>,
-) -> Option<i32> {
+    wake: &dyn Fn(),
+) -> Option<Ended> {
+    let mut message = MSG::default();
+    // SAFETY: message is a valid MSG; PM_NOREMOVE only creates this thread's queue, so Stop can
+    // post WM_QUIT while the mirror still starts; the draw loop then ends at once.
+    let _ = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) };
     let opened = Screen::open(source_monitor, card_display).and_then(|(screen, source)| {
         // SAFETY: plain call returning the context's device.
         let device = unsafe { screen.context.GetDevice() }.map_err(|error| {
@@ -171,26 +165,17 @@ fn run(
     });
     let (screen, mut desktop) = match opened {
         Ok(opened) => opened,
-        Err(failure) => {
-            let _ = started.send(Err(failure));
-            return None;
-        }
+        Err(failure) => return Some(failure),
     };
-    let mut message = MSG::default();
-    // SAFETY: message is a valid MSG; PM_NOREMOVE only creates this thread's queue so WM_QUIT can be posted.
-    let _ = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) };
-    // SAFETY: plain call returning this thread's id.
-    let thread_id = unsafe { GetCurrentThreadId() };
-    if started
-        .send(Ok((thread_id, screen.window.0.0 as isize)))
-        .is_err()
-    {
-        return None;
-    }
+    // Shown only once capture works, so a start that keeps failing never flashes the card display.
+    // SAFETY: plain call on the window this thread created.
+    let _ = unsafe { ShowWindow(screen.window.0, SW_SHOWNOACTIVATE) };
+    shown.store(screen.window.0.0 as isize, Ordering::Release);
+    wake();
     screen
         .draw_until_quit(&mut desktop, presents)
         .err()
-        .map(|error| error.code().0)
+        .map(|error| ended(error.code().0))
 }
 
 /// Destroys the mirror window when dropped.
@@ -224,7 +209,7 @@ struct Screen {
 }
 
 impl Screen {
-    /// Opens the window on the card display and finds the source monitor's output on the same graphics card.
+    /// Opens the hidden window on the card display and finds the source monitor's output on the same graphics card.
     fn open(
         source_monitor: &Monitor,
         card_display: &Monitor,
@@ -334,8 +319,6 @@ impl Screen {
         unsafe { device.CreateRenderTargetView(&back_buffer, None, Some(&mut target)) }
             .map_err(failed("render target"))?;
         let target = target.ok_or_else(|| failed("render target")(E_POINTER.into()))?;
-        // SAFETY: plain call on the window created above.
-        let _ = unsafe { ShowWindow(window.0, SW_SHOWNOACTIVATE) };
         Ok((
             Self {
                 waitable,
@@ -415,14 +398,14 @@ fn outputs(factory: &IDXGIFactory2) -> Vec<Output> {
     outputs
 }
 
-/// The borderless, topmost, no-activate tool window covering `card_display` exactly.
+/// The borderless, topmost, no-activate tool window covering `card_display` exactly; hidden until shown.
 fn create_window(card_display: &Monitor) -> Option<HWND> {
     // SAFETY: a null module name returns this executable's handle.
     let instance = unsafe { GetModuleHandleW(None) }.ok()?;
     let class = WNDCLASSW {
         lpfnWndProc: Some(window_proc),
         hInstance: instance.into(),
-        lpszClassName: w!("cardcast mirror"),
+        lpszClassName: CLASS,
         ..Default::default()
     };
     // SAFETY: class points at static strings and a valid window procedure; registering twice only fails.
@@ -431,8 +414,8 @@ fn create_window(card_display: &Monitor) -> Option<HWND> {
     let window = unsafe {
         CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
-            w!("cardcast mirror"),
-            w!("cardcast mirror"),
+            CLASS,
+            CLASS,
             WS_POPUP,
             card_display.left,
             card_display.top,
@@ -470,7 +453,7 @@ pub fn shown_at() -> Option<(i32, i32)> {
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect};
     // SAFETY: the class name is a static string; no window name is matched.
-    let window = unsafe { FindWindowW(w!("cardcast mirror"), None) }.ok()?;
+    let window = unsafe { FindWindowW(CLASS, None) }.ok()?;
     let mut rect = RECT::default();
     // SAFETY: rect is a valid RECT; a window closed meanwhile only fails the call.
     unsafe { GetWindowRect(window, &mut rect) }.ok()?;

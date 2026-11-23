@@ -9,10 +9,7 @@ use eframe::egui;
 use settings::{Follow, Settings, Status, StatusLine};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
-
-/// How often a restarting mirror is started again, as capture retries after access loss.
-const RESTART_EVERY: Duration = Duration::from_secs(1);
+use std::time::Instant;
 
 /// Opens the settings window; returns when it is closed, which quits cardcast.
 pub fn run() -> eframe::Result {
@@ -38,6 +35,10 @@ struct SettingsWindow {
     status: StatusLine,
     /// When a restarting mirror is next started.
     restart_at: Instant,
+    /// Starts since the mirror last showed the picture; sets the restart backoff.
+    attempts: u32,
+    /// Launch minimises the window once the mirror it started shows the picture.
+    minimise_when_running: bool,
     mirror: Box<dyn Mirror>,
     relay: Box<dyn Relay>,
     guard: Box<dyn Guard>,
@@ -79,6 +80,8 @@ impl SettingsWindow {
             playback_devices,
             status,
             restart_at: Instant::now(),
+            attempts: 0,
+            minimise_when_running: false,
             mirror: mirror::new_mirror(move || mirror_context.request_repaint()),
             relay: audio::new_relay(move || relay_context.request_repaint()),
             guard,
@@ -87,34 +90,47 @@ impl SettingsWindow {
         }
     }
 
-    /// Starts the mirror from saved settings; the window starts minimised if it runs.
+    /// Starts the mirror from saved settings; the window minimises once it runs.
     fn launch(&mut self, context: &egui::Context) {
         if settings::starts_on_launch(&self.settings) {
+            self.minimise_when_running = true;
             self.start();
-            if self.status.mirror == Status::Running {
-                context.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
+            self.follow_mirror(context);
         }
     }
 
     /// The one place the mirror starts: Start, launch, a restart, a changed choice and a monitor
-    /// coming back all call it. Audio starts with it; a running mirror and audio stop first.
+    /// coming back all call it. It starts in the background, so the settings window never waits
+    /// on the graphics card. A running mirror and audio stop first.
     fn start(&mut self) {
         self.mirror.stop();
         self.relay.stop();
-        self.restart_at = Instant::now() + RESTART_EVERY;
+        self.attempts = self.attempts.saturating_add(1);
+        self.restart_at = Instant::now() + settings::restart_delay(self.attempts);
         self.status.set_mirror(settings::start(
             &self.settings,
             &self.monitors,
             &mut *self.mirror,
         ));
+        self.follow_started();
+    }
+
+    /// A starting or restarting mirror that shows the picture runs: audio starts with it, and
+    /// the restart backoff starts over.
+    fn follow_started(&mut self) {
+        if !matches!(self.status.mirror, Status::Starting | Status::Restarting(_))
+            || !self.mirror.shows_picture()
+        {
+            return;
+        }
+        self.status.mirror = Status::Running;
+        self.attempts = 0;
         let card_display = self
             .monitors
             .iter()
             .find(|monitor| self.settings.card_display.as_ref() == Some(&monitor.device_path));
-        if self.status.mirror == Status::Running
-            && let (Some(audio_source), Some(card_display)) =
-                (&self.settings.audio_source, card_display)
+        if let (Some(audio_source), Some(card_display)) =
+            (&self.settings.audio_source, card_display)
         {
             self.relay.start(audio_source, &card_display.name);
         }
@@ -125,26 +141,40 @@ impl SettingsWindow {
     fn stop(&mut self, status: Status) {
         self.mirror.stop();
         self.relay.stop();
+        self.attempts = 0;
         self.status.set_mirror(status);
     }
 
-    /// Follows the mirror ending on its own, and starts a restarting mirror again on a timer.
+    /// Follows the mirror starting, failing to start or ending on its own, and starts a
+    /// restarting mirror again when its backoff timer is due.
     fn follow_mirror(&mut self, context: &egui::Context) {
         match self.mirror.take_end() {
             Some(Ended::Restart(reason)) => {
                 self.status.mirror = Status::Restarting(reason);
-                self.restart_at = Instant::now();
+                self.restart_at = Instant::now() + settings::restart_delay(self.attempts);
             }
             Some(Ended::Stop(reason)) => self.stop(Status::Error(reason)),
             None => {}
         }
-        if matches!(self.status.mirror, Status::Restarting(_)) {
-            let wait = self.restart_at.saturating_duration_since(Instant::now());
-            if wait.is_zero() {
-                self.start();
-                self.status.mirror = settings::restarted(self.status.mirror.clone());
+        self.follow_started();
+        if self.minimise_when_running && self.status.mirror != Status::Starting {
+            self.minimise_when_running = false;
+            if self.status.mirror == Status::Running {
+                context.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
-            if matches!(self.status.mirror, Status::Restarting(_)) {
+        }
+        // A restart that is starting in the background waits for its result, not the timer.
+        if matches!(self.status.mirror, Status::Restarting(_)) && !self.mirror.is_running() {
+            if self.restart_at <= Instant::now() {
+                let restarting = self.status.mirror.clone();
+                self.start();
+                // It keeps saying why it restarts until it shows the picture.
+                self.status.mirror = match settings::restarted(self.status.mirror.clone()) {
+                    Status::Starting => restarting,
+                    status => status,
+                };
+            }
+            if matches!(self.status.mirror, Status::Restarting(_)) && !self.mirror.is_running() {
                 context.request_repaint_after(
                     self.restart_at.saturating_duration_since(Instant::now()),
                 );
@@ -166,7 +196,9 @@ impl SettingsWindow {
 
     /// What every pass does, even while minimised: follow display changes, the mirror and reports.
     fn follow(&mut self, context: &egui::Context) {
+        // The display watcher is the one listener for display and device changes; the guard follows it too.
         if self.displays_changed.swap(false, Ordering::Relaxed) {
+            self.guard.follow_displays();
             self.follow_displays();
         }
         self.follow_mirror(context);
@@ -193,7 +225,7 @@ impl SettingsWindow {
         let (before, now) = (chosen(&self.monitors), chosen(&monitors));
         let follow = settings::follow_displays(
             self.status.shows_stop(),
-            self.mirror.is_running(),
+            self.mirror.is_running() || matches!(self.status.mirror, Status::Restarting(_)),
             before.each_ref().map(Option::as_ref),
             now.each_ref().map(Option::as_ref),
         );
@@ -320,7 +352,7 @@ impl eframe::App for SettingsWindow {
             }
         }
         // Start and a changed choice can leave a restart waiting; `logic` runs it on time from here.
-        if matches!(self.status.mirror, Status::Restarting(_)) {
+        if matches!(self.status.mirror, Status::Restarting(_)) && !self.mirror.is_running() {
             ui.ctx()
                 .request_repaint_after(self.restart_at.saturating_duration_since(Instant::now()));
         }
@@ -332,6 +364,8 @@ mod tests {
     use super::*;
     use crate::guard::GuardReport;
     use crate::mirror::StandInMirror;
+    #[cfg(windows)]
+    use std::time::Duration;
 
     /// Records what the settings window asked of the audio relay, and hands out `reports`.
     #[derive(Default, Clone)]
@@ -354,11 +388,12 @@ mod tests {
         }
     }
 
-    /// Hands out `reports`, latest last, and remembers the card display it was last given.
+    /// Hands out `reports`, latest last, remembers the card display it was last given, and counts display changes.
     #[derive(Default, Clone)]
     struct ReportingGuard(
         std::rc::Rc<std::cell::RefCell<Vec<GuardReport>>>,
         std::rc::Rc<std::cell::RefCell<Option<String>>>,
+        std::rc::Rc<std::cell::RefCell<u32>>,
     );
 
     impl Guard for ReportingGuard {
@@ -367,6 +402,9 @@ mod tests {
         }
         fn take_report(&mut self) -> Option<GuardReport> {
             self.0.borrow_mut().pop()
+        }
+        fn follow_displays(&mut self) {
+            *self.2.borrow_mut() += 1;
         }
     }
 
@@ -395,6 +433,8 @@ mod tests {
             playback_devices: Vec::new(),
             status: StatusLine::new(Status::Stopped),
             restart_at: Instant::now(),
+            attempts: 0,
+            minimise_when_running: false,
             mirror: Box::new(StandInMirror::default()),
             relay: Box::new(RecordingRelay::default()),
             guard: Box::new(ReportingGuard::default()),
@@ -495,6 +535,8 @@ mod tests {
             playback_devices: Vec::new(),
             status: StatusLine::new(Status::Stopped),
             restart_at: Instant::now(),
+            attempts: 0,
+            minimise_when_running: false,
             mirror: mirror::new_mirror(|| {}),
             relay: Box::new(RecordingRelay::default()),
             guard: Box::new(guard.clone()),
@@ -502,6 +544,16 @@ mod tests {
             _display_watcher: display_watcher,
         };
         (window, guard)
+    }
+
+    /// Starts the mirror and follows it until it runs; it starts in the background.
+    #[cfg(windows)]
+    fn start_and_wait(window: &mut SettingsWindow, context: &egui::Context) {
+        window.start();
+        guard::second_monitor::wait_for("the mirror to run", Duration::from_secs(10), || {
+            window.follow(context);
+            window.status.mirror == Status::Running
+        });
     }
 
     #[cfg(windows)]
@@ -515,7 +567,7 @@ mod tests {
         let (source_monitor, card_display) = (monitors[1].clone(), monitors[2].clone());
         let (mut window, _guard) = on_second_monitors(monitors, &source_monitor, &card_display);
         let context = egui::Context::default();
-        window.start();
+        start_and_wait(&mut window, &context);
         assert_eq!(window.status.text(), "Running");
 
         let unplugged = Unplugged::new();
@@ -558,7 +610,7 @@ mod tests {
         let (source_monitor, card_display) = (monitors[1].clone(), monitors[2].clone());
         let (mut window, _guard) = on_second_monitors(monitors, &source_monitor, &card_display);
         let context = egui::Context::default();
-        window.start();
+        start_and_wait(&mut window, &context);
         assert_eq!(window.status.text(), "Running");
 
         let unplugged = Unplugged::monitor(&source_monitor.device_path);
@@ -595,7 +647,8 @@ mod tests {
         };
         let (first, second) = (monitors[1].clone(), monitors[2].clone());
         let (mut window, guard) = on_second_monitors(monitors, &first, &second);
-        window.start();
+        let context = egui::Context::default();
+        start_and_wait(&mut window, &context);
         assert_eq!(window.status.text(), "Running");
         assert_eq!(mirror::shown_at(), Some((second.left, second.top)));
 
@@ -604,6 +657,10 @@ mod tests {
         window.settings.source_monitor = Some(second.device_path.clone());
         window.settings.card_display = Some(first.device_path.clone());
         window.follow_settings(&before);
+        guard::second_monitor::wait_for("the mirror to run", Duration::from_secs(10), || {
+            window.follow(&context);
+            window.status.mirror == Status::Running
+        });
         assert_eq!(window.status.text(), "Running");
         assert!(window.mirror.is_running(), "the mirror did not restart");
         assert_eq!(
@@ -805,6 +862,139 @@ mod tests {
         let monitors = window.monitors.clone();
         window.follow_monitors(monitors);
         assert!(!window.mirror.is_running());
+    }
+
+    #[test]
+    fn failed_restarts_back_off_and_a_running_mirror_resets_the_backoff() {
+        let mut window = window("card");
+        fails_to_start(&mut window, Ended::Restart("secure desktop".into()));
+        window.start();
+        let waits = |window: &SettingsWindow| {
+            window
+                .restart_at
+                .saturating_duration_since(Instant::now())
+                .as_secs_f32()
+        };
+        assert!((0.9..=1.0).contains(&waits(&window)), "{}", waits(&window));
+        fails_to_start(&mut window, Ended::Restart("secure desktop".into()));
+        window.restart_at = Instant::now();
+        window.follow_mirror(&egui::Context::default());
+        assert_eq!(window.status.text(), "secure desktop");
+        assert!((1.9..=2.0).contains(&waits(&window)), "{}", waits(&window));
+        window.restart_at = Instant::now();
+        window.follow_mirror(&egui::Context::default());
+        assert_eq!(window.status.text(), "Running");
+        // It ran, so losing it again restarts it at once.
+        mirror_ends(&mut window, Ended::Restart("lost".into()));
+        window.follow_mirror(&egui::Context::default());
+        assert_eq!(window.status.text(), "Running");
+    }
+
+    #[test]
+    fn a_device_change_does_not_skip_the_restart_timer_but_a_changed_monitor_does() {
+        let mut window = window("card");
+        fails_to_start(&mut window, Ended::Restart("secure desktop".into()));
+        window.start();
+        // A USB device came or went: the monitors are the same.
+        let monitors = window.monitors.clone();
+        window.follow_monitors(monitors);
+        assert!(!window.mirror.is_running(), "the restart timer was skipped");
+        assert_eq!(window.status.text(), "secure desktop");
+        let mut monitors = window.monitors.clone();
+        monitors[1].refresh_hz = 30;
+        window.follow_monitors(monitors);
+        assert!(window.mirror.is_running());
+        assert_eq!(window.status.text(), "Running");
+    }
+
+    #[test]
+    fn a_display_change_reaches_the_guard_and_the_mirror_from_one_listener() {
+        let guard = ReportingGuard::default();
+        let mut window = window("card");
+        window.guard = Box::new(guard.clone());
+        window.displays_changed.store(true, Ordering::Relaxed);
+        window.follow(&egui::Context::default());
+        assert_eq!(*guard.2.borrow(), 1);
+        window.follow(&egui::Context::default());
+        assert_eq!(
+            *guard.2.borrow(),
+            1,
+            "the guard followed a change that did not happen"
+        );
+    }
+
+    /// A mirror that starts in the background: it shows the picture only when the test says so.
+    #[derive(Default, Clone)]
+    struct SlowMirror(std::rc::Rc<std::cell::Cell<(bool, bool)>>);
+
+    impl Mirror for SlowMirror {
+        fn start(&mut self, _source: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
+            self.0.set((true, false));
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.0.set((false, false));
+        }
+        fn is_running(&self) -> bool {
+            self.0.get().0
+        }
+        fn shows_picture(&self) -> bool {
+            self.0.get() == (true, true)
+        }
+        fn take_end(&mut self) -> Option<Ended> {
+            None
+        }
+    }
+
+    #[test]
+    fn mirror_starting_in_the_background_says_so_then_runs_with_audio_and_minimises() {
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        let mirror = SlowMirror::default();
+        window.mirror = Box::new(mirror.clone());
+        assert!(!launched_minimised(&mut window));
+        assert_eq!(window.status.text(), "Starting");
+        assert!(window.status.shows_stop());
+        assert_eq!(
+            *relay.0.borrow(),
+            ["stop"],
+            "audio started before the mirror"
+        );
+        mirror.0.set((true, true));
+        let context = egui::Context::default();
+        window.follow(&context);
+        assert_eq!(window.status.text(), "Running");
+        assert_eq!(
+            relay.0.borrow().last().map(String::as_str),
+            Some("start speakers to card")
+        );
+        let mut output = context.run_ui(egui::RawInput::default(), |_| {});
+        output.textures_delta.clear();
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .contains(&egui::ViewportCommand::Minimized(true)),
+            "launch did not minimise once the mirror ran"
+        );
+    }
+
+    #[test]
+    fn restart_in_the_background_keeps_saying_why_until_the_mirror_runs() {
+        let mut window = window("card");
+        fails_to_start(&mut window, Ended::Restart("secure desktop".into()));
+        window.start();
+        let mirror = SlowMirror::default();
+        window.mirror = Box::new(mirror.clone());
+        window.restart_at = Instant::now();
+        window.follow_mirror(&egui::Context::default());
+        assert!(window.mirror.is_running(), "the restart did not start");
+        assert_eq!(window.status.text(), "secure desktop");
+        // The next pass while it starts must not start it again.
+        mirror.0.set((true, false));
+        window.restart_at = Instant::now();
+        window.follow_mirror(&egui::Context::default());
+        mirror.0.set((true, true));
+        window.follow_mirror(&egui::Context::default());
+        assert_eq!(window.status.text(), "Running");
     }
 
     #[test]

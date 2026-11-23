@@ -183,6 +183,19 @@ fn hdr_shader_matches_the_sdr_maths() {
     }
 }
 
+#[test]
+fn shaders_compile_once_per_process() {
+    let (device, _, _) = device();
+    // Each painter stands for a mirror start or restart.
+    for _ in 0..3 {
+        Painter::new(&device).unwrap();
+    }
+    let compiled = COMPILES.load(std::sync::atomic::Ordering::Relaxed);
+    println!("{compiled} shader compiles");
+    // Three shaders: the vertex shader, copy and HDR.
+    assert_eq!(compiled, 3, "shaders compiled more than once");
+}
+
 extern "system" fn colour_window_proc(
     window: HWND,
     message: u32,

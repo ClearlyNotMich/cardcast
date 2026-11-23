@@ -23,12 +23,17 @@ use crate::guard::Monitor;
 
 /// What the settings window needs from the mirror.
 pub trait Mirror {
-    /// A failure says, in plain words for the status line, whether starting again can fix it.
+    /// Returns at once: the mirror starts in the background, and a failure to start comes from
+    /// `take_end` as if it ended. A failure says, in plain words for the status line, whether
+    /// starting again can fix it.
     fn start(&mut self, source_monitor: &Monitor, card_display: &Monitor) -> Result<(), Ended>;
+    /// Returns once the mirror thread is gone.
     fn stop(&mut self);
-    /// False once stopped, or if the mirror ended on its own (for example a failed present).
+    /// True while it starts or runs; false once stopped, or if it ended on its own (for example a failed present).
     fn is_running(&self) -> bool;
-    /// What to do about the mirror ending on its own; given once, after it ended.
+    /// True once it started and shows the picture, until it is stopped or ends.
+    fn shows_picture(&self) -> bool;
+    /// What to do about the mirror ending on its own or failing to start; given once, after it ended.
     fn take_end(&mut self) -> Option<Ended>;
 }
 
@@ -144,6 +149,10 @@ impl Mirror for StandInMirror {
 
     fn is_running(&self) -> bool {
         self.running && self.end.is_none()
+    }
+
+    fn shows_picture(&self) -> bool {
+        self.is_running()
     }
 
     fn take_end(&mut self) -> Option<Ended> {

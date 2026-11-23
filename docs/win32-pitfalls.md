@@ -13,6 +13,13 @@ Sourced facts for Win32 code that can't be run on Linux. Each section: the fact,
 
 Do: use `SWP_ASYNCWINDOWPOS` / `WPF_ASYNCWINDOWPLACEMENT` and `GetWindowTextW` or `InternalGetWindowText` on other programs' windows. Don't: call `SendMessage` (or `SetWindowPos` without the async flag) on a window from the guard thread.
 
+## Stopping a thread with PostThreadMessage
+
+- `PostThreadMessage` fails unless the target thread has created a message queue. The system creates it on the thread's first call to a User or GDI function; calling `PeekMessage` with `PM_NOREMOVE` forces it. [PostThreadMessageW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-postthreadmessagew)
+- A message queue holds at most 10,000 posted messages; a post to a full queue fails. [PostThreadMessageW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-postthreadmessagew)
+
+Do: stop every message-loop thread with `guard::quit_and_join`, which retries the `WM_QUIT` post until it lands or the thread ended, then joins. Don't: join only when the first post succeeded; a thread still starting has no queue and is left running.
+
 ## Window rect versus visible frame
 
 - Since Vista, `GetWindowRect` may include invisible resize borders. `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)` gives the visible bounds, in screen space. [GetWindowRect](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect), [DWMWINDOWATTRIBUTE](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute)
