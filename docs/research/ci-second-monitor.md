@@ -52,6 +52,11 @@ Resolution and count of virtual monitors come from `vdd_settings.xml` [3][2].
 
 ## 3. Desktop Duplication and D3D11 on that monitor
 
+- Measured since (CI job `second-monitor` in `ci.yml`, tests named `second_monitor_*`): DXGI lists
+  the virtual monitors under their own adapter (1), not the Hyper-V one (0). Duplicating a virtual
+  monitor works, and the mirror starts and presents with one virtual monitor as source monitor and
+  a second (`<count>2</count>` in `vdd_settings.xml`) as card display. Presents are not paced to
+  the virtual monitor's mode (47 a second at 30 Hz). The text below is from before that.
 - Not measured yet. The spike only listed monitors.
 - With no GPU, WARP backs D3D11 up to feature level 11_1 through the Microsoft Basic Render
   Adapter, and is present in DXGI adapter enumeration [14]. The runner's display adapter is the
