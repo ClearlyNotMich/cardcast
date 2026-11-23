@@ -1,0 +1,66 @@
+[package]
+name = "cardcast"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+eframe = "0.37"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Devices_Display",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints.rust]
+# unsafe is opt-in per module (mirror, guard, audio allow it) so it cannot spread to ui or logic.
+unsafe_code = "deny"
+# Every unsafe operation needs its own explicit block, even inside unsafe fns.
+unsafe_op_in_unsafe_fn = "deny"
+# Ignored Windows Result/HRESULTs are bugs.
+unused_must_use = "deny"
+
+[lints.clippy]
+# The default set is the baseline; -D warnings in CI catches the rest.
+all = { level = "deny", priority = -1 }
+# Enforces the SPEC's // SAFETY: comment on every block.
+undocumented_unsafe_blocks = "deny"
+# A panic in a hook thread or message loop silently kills the guard or mirror (allowed in tests via clippy.toml).
+unwrap_used = "deny"
+# Fails CI unless silenced with #[expect(clippy::expect_used, reason = "why it cannot fail")].
+expect_used = "deny"
+# Every #[allow]/#[expect] must say why, so reviewers can judge it.
+allow_attributes_without_reason = "deny"
+# Monitor rectangles mix i32/u32 coordinates; silent truncation puts windows in the wrong place.
+cast_possible_truncation = "deny"
+# Monitor rectangles mix i32/u32 coordinates; a negative coordinate must not wrap silently.
+cast_sign_loss = "deny"
+# Keep casts explicit and visible.
+cast_lossless = "warn"
+# No debug code reaches the .exe.
+dbg_macro = "deny"
+# No placeholder code reaches the .exe.
+todo = "deny"
+# No placeholder code reaches the .exe.
+unimplemented = "deny"

@@ -47,8 +47,8 @@ Terms in bold in `GLOSSARY.md` are used with exactly that meaning here. `docs/ad
 
 The mirror follows the same three steps as OBS's fullscreen projector, and the picture stays on the graphics card throughout.
 
-1. **Capture.** Get the source monitor's picture as a GPU texture. There are two ways, and the capture check in section 9 picks one before the mirror is written:
-   - **Windows Graphics Capture, 8-bit output.** Preferred, because Windows then converts HDR to SDR and draws the mouse pointer into the picture itself. Turning off its yellow capture border needs Windows 11.
+1. **Capture.** Get the source monitor's picture as a GPU texture. There are two ways, and ADR 0002 chose Desktop Duplication (provisional; the section 9 capture check can still overturn it):
+   - **Windows Graphics Capture, 8-bit output.** Preferred, because it can draw the mouse pointer into the picture itself (build 19041+). That Windows converts HDR to SDR well for an 8-bit frame pool is not documented (it may clip), and turning off the yellow capture border needs build 20348+ and may need package identity; the capture check verifies both empirically. See `docs/win32-mirror-audio.md`.
    - **DXGI Desktop Duplication.** What OBS's Display Capture uses by default on a desktop PC, so it is what the reference sender runs today. It needs more code: the mirror must convert HDR to SDR itself, using the monitor's SDR white level, and must draw the mouse pointer itself.
 2. **Window.** Create a borderless, always-on-top window that exactly covers the card display. It must not take focus and must not appear in the taskbar or Alt+Tab.
 3. **Draw.** Once per refresh of the card display, take the newest captured frame, draw it into the window's swap chain scaled to fit with the aspect ratio kept, and present it.
@@ -86,7 +86,7 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 ## 6. Settings window
 
 - Built with `egui` (`eframe`). It must use no CPU while minimised.
-- Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, Start/Stop button, guard checkbox, and a one-line status (running, waiting for card display, or the last error in plain words).
+- Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, Start/Stop button, guard checkbox, and a one-line status (starting, running, waiting for card display, waiting for source monitor, restarting, or the last error in plain words).
 - Dropdowns show each monitor's name, resolution and refresh rate.
 - Settings are saved when changed and loaded at launch.
 - The window repaints only on user input or when the mirror or window guard reports a status change.
@@ -113,7 +113,7 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 
 Code is written on Linux. GitHub Actions builds the Windows `.exe` on every push and attaches it to the run. The project owner downloads it and tests it on the sender in Windows. The mirror and window guard cannot be run on Linux.
 
-CI must pass `cargo fmt --check`, `cargo clippy -- -D warnings` and `cargo test` on Windows and Linux.
+CI must pass `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on Windows and Linux.
 
 v1 contains every part below. Each part is handed over as a test build when it is ready, so problems are found one part at a time; v1 is done when all of them pass together.
 
