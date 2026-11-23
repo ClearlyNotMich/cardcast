@@ -140,6 +140,7 @@ fn created<T>(value: Option<T>) -> windows::core::Result<T> {
 impl Painter {
     pub fn new(device: &ID3D11Device) -> windows::core::Result<Self> {
         let [vertex_code, copy_code, hdr_code] = bytecode()?;
+        let _ = compile(s!("vertex_main"), s!("vs_4_0"));
         let (mut vertex, mut copy, mut hdr, mut sampler, mut blend, mut white) =
             (None, None, None, None, None, None);
         let pointer_blend = D3D11_RENDER_TARGET_BLEND_DESC {
