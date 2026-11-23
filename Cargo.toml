@@ -6,6 +6,20 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+eframe = "0.37"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Devices_Display",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+] }
 
 [lints.rust]
 # unsafe is opt-in per module (mirror, guard, audio allow it) so it cannot spread to ui or logic.

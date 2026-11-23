@@ -5,4 +5,6 @@ mod guard;
 mod mirror;
 mod ui;
 
-fn main() {}
+fn main() -> eframe::Result {
+    ui::run()
+}
