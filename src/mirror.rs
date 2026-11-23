@@ -162,6 +162,24 @@ impl Mirror for StandInMirror {
     }
 }
 
+/// The value `cache` keeps, made by `make` the first time it succeeds. A failure is not kept, so
+/// a passing one (for example out of memory) does not fail every later start. Callers that may
+/// race serialise `make` themselves.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows capture calls it")
+)]
+pub fn kept_once_made<T, E>(
+    cache: &std::sync::OnceLock<T>,
+    make: impl FnOnce() -> Result<T, E>,
+) -> Result<&T, E> {
+    if let Some(kept) = cache.get() {
+        return Ok(kept);
+    }
+    let made = make()?;
+    Ok(cache.get_or_init(|| made))
+}
+
 /// Where a picture lands inside the card display, in pixels of the card display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Fit {
@@ -360,6 +378,24 @@ mod tests {
         }
         // DXGI_ERROR_DEVICE_REMOVED needs a fresh device, so the mirror ends and restarts.
         assert!(!recreate_capture_in_place(0x887A_0005_u32.cast_signed()));
+    }
+
+    #[test]
+    fn a_failure_is_not_kept_so_the_next_start_tries_again() {
+        let cache = std::sync::OnceLock::new();
+        let made = std::cell::Cell::new(0);
+        let make = |result: Result<u32, i32>| {
+            made.set(made.get() + 1);
+            result
+        };
+        // E_OUTOFMEMORY can pass.
+        assert_eq!(
+            kept_once_made(&cache, || make(Err(0x8007_000E_u32.cast_signed()))),
+            Err(0x8007_000E_u32.cast_signed())
+        );
+        assert_eq!(kept_once_made(&cache, || make(Ok(7))), Ok(&7));
+        assert_eq!(kept_once_made(&cache, || make(Ok(8))), Ok(&7));
+        assert_eq!(made.get(), 2, "made again after it was kept");
     }
 
     #[test]

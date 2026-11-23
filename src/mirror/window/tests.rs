@@ -100,6 +100,39 @@ fn start_returns_before_the_mirror_opens_the_graphics_card() {
 }
 
 #[test]
+fn stop_while_starting_never_shows_the_mirror_window() {
+    let _duplicating = duplicating();
+    let card_display = card_display();
+    let mut mirror = MirrorWindow::new(|| {});
+    mirror.start(&card_display, &card_display).unwrap();
+    let shown = mirror.running.as_ref().unwrap().shown.clone();
+    let stopping = Instant::now();
+    mirror.stop();
+    println!("stop during the start took {:?}", stopping.elapsed());
+    assert_eq!(
+        shown.load(Ordering::Acquire),
+        0,
+        "the mirror window was shown after Stop"
+    );
+}
+
+#[test]
+fn a_mirror_thread_that_panics_wakes_the_settings_window() {
+    let woken = Arc::new(AtomicU64::new(0));
+    let thread = {
+        let woken = woken.clone();
+        std::thread::spawn(move || {
+            let _wake = WakeOnEnd(Arc::new(move || {
+                woken.fetch_add(1, Ordering::Relaxed);
+            }));
+            panic!("a bug in the mirror thread");
+        })
+    };
+    assert!(thread.join().is_err());
+    assert_eq!(woken.load(Ordering::Relaxed), 1, "the panic woke nobody");
+}
+
+#[test]
 fn stop_while_starting_leaves_no_mirror_thread_or_window_behind() {
     let _duplicating = duplicating();
     let card_display = card_display();

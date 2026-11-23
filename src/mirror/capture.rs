@@ -84,23 +84,24 @@ pub struct Painter {
 #[cfg(test)]
 static COMPILES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The vertex, copy and HDR shaders' bytecode, or the HRESULT compiling them failed with.
-type Bytecode = Result<[Vec<u8>; 3], windows::core::HRESULT>;
-
-/// Compiles the shaders on first use only: every mirror start and restart reuses the bytecode,
-/// so a restart costs the sender no `D3DCompile`. A failure is kept too, since it would repeat.
+/// Compiles the shaders once they are first needed: every later mirror start and restart reuses
+/// the bytecode, so a restart costs the sender no `D3DCompile`. A failure is not kept, so the
+/// next start tries again.
 fn bytecode() -> windows::core::Result<&'static [Vec<u8>; 3]> {
-    static BYTECODE: std::sync::OnceLock<Bytecode> = std::sync::OnceLock::new();
-    BYTECODE
-        .get_or_init(|| {
-            Ok([
-                compile(s!("vertex_main"), s!("vs_4_0"))?,
-                compile(s!("copy_main"), s!("ps_4_0"))?,
-                compile(s!("hdr_main"), s!("ps_4_0"))?,
-            ])
-        })
-        .as_ref()
-        .map_err(|&code| code.into())
+    static BYTECODE: std::sync::OnceLock<[Vec<u8>; 3]> = std::sync::OnceLock::new();
+    // Two mirrors only start at once in the tests; this keeps them to one compile too.
+    static COMPILING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _compiling = COMPILING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    super::kept_once_made(&BYTECODE, || {
+        Ok::<_, windows::core::HRESULT>([
+            compile(s!("vertex_main"), s!("vs_4_0"))?,
+            compile(s!("copy_main"), s!("ps_4_0"))?,
+            compile(s!("hdr_main"), s!("ps_4_0"))?,
+        ])
+    })
+    .map_err(windows::core::Error::from)
 }
 
 fn compile(entry: PCSTR, target: PCSTR) -> Result<Vec<u8>, windows::core::HRESULT> {

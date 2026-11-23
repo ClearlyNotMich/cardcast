@@ -115,6 +115,12 @@ impl SettingsWindow {
         self.follow_started();
     }
 
+    /// Start and a dropdown change: the user changed something, so the restart backoff starts over.
+    fn start_by_user(&mut self) {
+        self.attempts = 0;
+        self.start();
+    }
+
     /// A starting or restarting mirror that shows the picture runs: audio starts with it, and
     /// the restart backoff starts over.
     fn follow_started(&mut self) {
@@ -242,7 +248,7 @@ impl SettingsWindow {
     fn follow_settings(&mut self, before: &Settings) {
         update_guard(&mut *self.guard, &self.settings);
         if settings::restarts_on_change(self.status.shows_stop(), before, &self.settings) {
-            self.start();
+            self.start_by_user();
         }
     }
 
@@ -336,7 +342,7 @@ impl eframe::App for SettingsWindow {
                         self.stop(Status::Stopped);
                     }
                 } else if ui.button("Start").clicked() {
-                    self.start();
+                    self.start_by_user();
                 }
                 ui.checkbox(&mut self.settings.guard_enabled, "Guard");
             });
@@ -364,7 +370,6 @@ mod tests {
     use super::*;
     use crate::guard::GuardReport;
     use crate::mirror::StandInMirror;
-    #[cfg(windows)]
     use std::time::Duration;
 
     /// Records what the settings window asked of the audio relay, and hands out `reports`.
@@ -891,6 +896,22 @@ mod tests {
     }
 
     #[test]
+    fn a_dropdown_change_starts_the_backoff_over() {
+        let mut window = window("card");
+        fails_to_start(&mut window, Ended::Restart("secure desktop".into()));
+        window.start();
+        // As after a few failed restarts.
+        window.attempts = 5;
+        fails_to_start(&mut window, Ended::Restart("secure desktop".into()));
+        let before = window.settings.clone();
+        window.settings.audio_source = Some("headset".into());
+        window.follow_settings(&before);
+        assert_eq!(window.status.text(), "secure desktop");
+        let wait = window.restart_at.saturating_duration_since(Instant::now());
+        assert!(wait <= Duration::from_secs(1), "{wait:?}");
+    }
+
+    #[test]
     fn a_device_change_does_not_skip_the_restart_timer_but_a_changed_monitor_does() {
         let mut window = window("card");
         fails_to_start(&mut window, Ended::Restart("secure desktop".into()));
@@ -925,11 +946,16 @@ mod tests {
 
     /// A mirror that starts in the background: it shows the picture only when the test says so.
     #[derive(Default, Clone)]
-    struct SlowMirror(std::rc::Rc<std::cell::Cell<(bool, bool)>>);
+    /// `.0` is (running, shows the picture); `.1` counts starts.
+    struct SlowMirror(
+        std::rc::Rc<std::cell::Cell<(bool, bool)>>,
+        std::rc::Rc<std::cell::Cell<u32>>,
+    );
 
     impl Mirror for SlowMirror {
         fn start(&mut self, _source: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
             self.0.set((true, false));
+            self.1.set(self.1.get() + 1);
             Ok(())
         }
         fn stop(&mut self) {
@@ -989,9 +1015,10 @@ mod tests {
         assert!(window.mirror.is_running(), "the restart did not start");
         assert_eq!(window.status.text(), "secure desktop");
         // The next pass while it starts must not start it again.
-        mirror.0.set((true, false));
         window.restart_at = Instant::now();
         window.follow_mirror(&egui::Context::default());
+        assert_eq!(mirror.1.get(), 1, "a starting restart was started again");
+        assert_eq!(window.status.text(), "secure desktop");
         mirror.0.set((true, true));
         window.follow_mirror(&egui::Context::default());
         assert_eq!(window.status.text(), "Running");

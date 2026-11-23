@@ -92,11 +92,8 @@ impl Mirror for MirrorWindow {
             let (source_monitor, card_display) = (source_monitor.clone(), card_display.clone());
             let (shown, presents, wake) = (shown.clone(), presents.clone(), self.wake.clone());
             std::thread::spawn(move || {
-                let end = run(&source_monitor, &card_display, &shown, &presents, &*wake);
-                if end.is_some() {
-                    wake();
-                }
-                end
+                let _wake = WakeOnEnd(wake.clone());
+                run(&source_monitor, &card_display, &shown, &presents, &*wake)
             })
         };
         self.running = Some(Running {
@@ -138,6 +135,23 @@ impl Mirror for MirrorWindow {
     }
 }
 
+/// Wakes the settings window when the mirror thread ends, however it ends (a panic too), so the
+/// status line never stays at "Starting" or "Running" while minimised.
+struct WakeOnEnd(Arc<dyn Fn() + Send + Sync>);
+
+impl Drop for WakeOnEnd {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+/// Whether Stop posted WM_QUIT to this thread; the message stays for the draw loop.
+fn quitting() -> bool {
+    let mut message = MSG::default();
+    // SAFETY: message is a valid MSG; PM_NOREMOVE leaves the queue as it is.
+    unsafe { PeekMessageW(&mut message, None, WM_QUIT, WM_QUIT, PM_NOREMOVE) }.as_bool()
+}
+
 /// Mirror thread: opens the window and capture, shows the window, then draws until WM_QUIT.
 /// Returns how it failed to start or why a draw or present failed; `None` after WM_QUIT.
 fn run(
@@ -151,7 +165,11 @@ fn run(
     // SAFETY: message is a valid MSG; PM_NOREMOVE only creates this thread's queue, so Stop can
     // post WM_QUIT while the mirror still starts; the draw loop then ends at once.
     let _ = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) };
+    // Stop during the start skips what is left of it, and never shows the window.
     let opened = Screen::open(source_monitor, card_display).and_then(|(screen, source)| {
+        if quitting() {
+            return Ok(None);
+        }
         // SAFETY: plain call returning the context's device.
         let device = unsafe { screen.context.GetDevice() }.map_err(|error| {
             start_failed(
@@ -161,10 +179,12 @@ fn run(
             )
         })?;
         let desktop = Desktop::open(&device, &source, &source_monitor.device_path)?;
-        Ok((screen, desktop))
+        Ok(Some((screen, desktop)))
     });
     let (screen, mut desktop) = match opened {
-        Ok(opened) => opened,
+        Ok(Some(opened)) if !quitting() => opened,
+        Ok(_) => return None,
+        Err(_) if quitting() => return None,
         Err(failure) => return Some(failure),
     };
     // Shown only once capture works, so a start that keeps failing never flashes the card display.
