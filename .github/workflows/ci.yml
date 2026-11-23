@@ -45,7 +45,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      # No save: the job loads a third-party driver before the cache would be saved.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
       # Build before the driver is installed, so nothing the driver touches is compiled.
       - run: cargo test --no-run
       - name: Install the virtual display driver (VirtualDrivers/Virtual-Display-Driver 24.10.27)

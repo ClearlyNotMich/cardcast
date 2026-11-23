@@ -2,7 +2,8 @@
 //! The child is this test binary re-run on the ignored `test_window_process` test.
 
 use super::*;
-use crate::guard::{Guard as _, Monitor, second_monitor};
+use crate::guard::second_monitor::{self, wait_for};
+use crate::guard::{Guard as _, Monitor};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -131,15 +132,6 @@ fn work_area() -> Rect {
     rect(info.rcWork)
 }
 
-/// Polls until `done` holds, because the guard's moves are posted to the window's program.
-fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !done() {
-        assert!(start.elapsed() < CALL_LIMIT, "timed out waiting: {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
 fn foreground() -> isize {
     // SAFETY: plain call returning a handle.
     unsafe { GetForegroundWindow() }.0 as isize
@@ -150,7 +142,7 @@ fn maximise_keeps_window_maximised_with_restore_rect_from_issue_12() {
     let test = TestWindow::spawn(true);
     // SAFETY: plain call on a window that exists until `test` drops.
     let _ = unsafe { ShowWindow(test.window, SW_SHOWMAXIMIZED) };
-    wait_for("window maximised", || {
+    wait_for("window maximised", CALL_LIMIT, || {
         // SAFETY: plain flag read.
         unsafe { IsZoomed(test.window) }.as_bool()
     });
@@ -166,7 +158,7 @@ fn maximise_keeps_window_maximised_with_restore_rect_from_issue_12() {
     maximise(test.window, restore);
 
     // #12: the restore rect, read back through workspace coordinates, is the one the guard chose.
-    wait_for("restore rect set", || {
+    wait_for("restore rect set", CALL_LIMIT, || {
         read_window(test.window).is_some_and(|(state, _)| state.restore == restore)
     });
     let (state, _) = read_window(test.window).unwrap();
@@ -192,7 +184,7 @@ fn move_window_puts_frame_on_target_without_changing_foreground() {
     let (state, window_rect) = read_window(test.window).unwrap();
     move_window(test.window, state.frame, window_rect, target);
 
-    wait_for("frame on target", || {
+    wait_for("frame on target", CALL_LIMIT, || {
         read_window(test.window).is_some_and(|(state, _)| state.frame == target)
     });
     assert_eq!(foreground(), before, "moving changed the foreground window");
@@ -288,7 +280,7 @@ fn second_monitor_window_moved_onto_the_card_display_is_returned() {
     let test = TestWindow::spawn(true);
     let before = foreground();
     move_onto(test.window, card_display);
-    wait_for("window returned to the primary monitor", || {
+    wait_for("window returned to the primary monitor", CALL_LIMIT, || {
         on(primary, frame(test.window))
     });
     assert_eq!(
@@ -307,7 +299,7 @@ fn second_monitor_window_on_the_card_display_at_guard_start_is_returned() {
     let test = TestWindow::spawn(true);
     move_onto(test.window, card_display);
     let _guard = guard_on(card_display, primary);
-    wait_for("window returned to the primary monitor", || {
+    wait_for("window returned to the primary monitor", CALL_LIMIT, || {
         on(primary, frame(test.window))
     });
 }
@@ -322,13 +314,13 @@ fn second_monitor_maximised_window_stays_maximised_on_return() {
     move_onto(test.window, card_display);
     // SAFETY: plain call on a window that exists until `test` drops.
     let _ = unsafe { ShowWindow(test.window, SW_SHOWMAXIMIZED) };
-    wait_for("window maximised on the card display", || {
+    wait_for("window maximised on the card display", CALL_LIMIT, || {
         // SAFETY: plain flag read.
         unsafe { IsZoomed(test.window) }.as_bool() && on(card_display, frame(test.window))
     });
     let before = foreground();
     let _guard = guard_on(card_display, primary);
-    wait_for("window returned to the primary monitor", || {
+    wait_for("window returned to the primary monitor", CALL_LIMIT, || {
         on(primary, frame(test.window))
     });
     let (state, _) = read_window(test.window).unwrap();
@@ -368,7 +360,9 @@ fn second_monitor_pointer_is_put_back_off_the_card_display() {
     std::thread::sleep(Duration::from_millis(200));
     // SAFETY: as above.
     unsafe { SetCursorPos(card_display.left + 100, card_display.top + 100) }.unwrap();
-    wait_for("pointer back at its last off-card position", || {
-        pointer() == off_card
-    });
+    wait_for(
+        "pointer back at its last off-card position",
+        CALL_LIMIT,
+        || pointer() == off_card,
+    );
 }

@@ -288,18 +288,17 @@ pub mod second_monitor {
 
     const ENV: &str = "CARDCAST_SECOND_MONITOR";
 
-    /// The primary monitor then the others, or `None` (the test skips) outside that job or with fewer than `count`.
+    /// The primary monitor then the others, or `None` (the test skips) outside that job.
+    /// Panics in that job with fewer than `count`, so a missing monitor fails the test instead of skipping it.
     pub fn monitors(count: usize) -> Option<Vec<Monitor>> {
-        if std::env::var_os(ENV).is_none() {
-            eprintln!("skipped: {ENV} is not set");
-            return None;
-        }
+        std::env::var_os(ENV)?;
         let mut monitors = super::monitors().unwrap_or_else(|error| panic!("{error}"));
         monitors.sort_by_key(|monitor| !monitor.primary);
-        if monitors.len() < count || !monitors[0].primary {
-            eprintln!("skipped: needs {count} monitors, one of them primary");
-            return None;
-        }
+        assert!(
+            monitors.len() >= count && monitors[0].primary,
+            "{ENV} is set but needs {count} monitors, one of them primary; found {}",
+            monitors.len()
+        );
         Some(monitors)
     }
 
@@ -343,7 +342,7 @@ pub mod second_monitor {
         let start = Instant::now();
         while !done() {
             assert!(start.elapsed() < limit, "timed out waiting for {what}");
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }

@@ -137,10 +137,10 @@ fn second_monitor_mirror_starts_on_it_and_presents() {
     std::thread::sleep(Duration::from_secs(2));
     let counted = presents.load(Ordering::Relaxed) - at_start;
     let per_second = counted as f64 / start.elapsed().as_secs_f64();
-    // No upper bound: a virtual monitor has no vertical blank, and the runner measured 47 presents a second at 30 Hz.
+    // Loose upper bound: a virtual monitor has no vertical blank, and the runner measured 47 presents a second at 30 Hz.
     let refresh = f64::from(card_display.refresh_hz);
     assert!(
-        per_second >= refresh * 0.5,
+        (refresh * 0.5..refresh * 8.0).contains(&per_second),
         "{per_second:.1} presents per second on a {refresh} Hz card display"
     );
     assert!(mirror.is_running(), "the mirror ended on its own");
