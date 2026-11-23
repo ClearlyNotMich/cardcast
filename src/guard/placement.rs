@@ -42,7 +42,7 @@ pub enum Placement {
     },
     /// The window keeps landing on the card display; leave it there and report it.
     GiveUp,
-    /// A given-up window left the card display (moved, minimised or hidden); it is guarded again.
+    /// A given-up window was seen off the card display after an event (for example moved away); it is guarded again.
     Handled,
 }
 
@@ -70,7 +70,7 @@ impl Rect {
 }
 
 /// Returns allowed per window per minute before the guard leaves the window alone.
-const RETURNS_PER_MINUTE: usize = 3;
+pub(super) const RETURNS_PER_MINUTE: usize = 3;
 
 /// Recent returns per window, so the guard never fights a program in a loop.
 #[derive(Debug, Default)]

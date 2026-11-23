@@ -3,7 +3,7 @@
 mod settings;
 
 use crate::audio::{self, AudioDevice, Relay, RelayReport};
-use crate::guard::{self, Guard, GuardReport, Monitor};
+use crate::guard::{self, Guard, Monitor};
 use crate::mirror::{self, Ended, Mirror};
 use eframe::egui;
 use settings::{Follow, Settings, Status, StatusLine};
@@ -153,10 +153,8 @@ impl SettingsWindow {
 
     /// Takes the guard's and relay's latest reports into the status line.
     fn follow_reports(&mut self) {
-        match self.guard.take_report() {
-            Some(GuardReport::Notice(notice)) => self.status.guard = Some(notice),
-            Some(GuardReport::Clear) => self.status.guard = None,
-            None => {}
+        if let Some(report) = self.guard.take_report() {
+            self.status.follow_guard(report);
         }
         match self.relay.take_report() {
             Some(RelayReport::Failing(problem)) => self.status.audio = Some(problem),
@@ -299,7 +297,7 @@ impl eframe::App for SettingsWindow {
             });
             ui.label(self.status.text());
             if self.status.guard.is_some() && ui.button("Dismiss guard notice").clicked() {
-                self.status.guard = None;
+                self.status.dismiss_guard_notice();
             }
         });
         if self.settings != before {
@@ -314,6 +312,7 @@ impl eframe::App for SettingsWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guard::GuardReport;
     use crate::mirror::StandInMirror;
 
     /// Records what the settings window asked of the audio relay, and hands out `reports`.

@@ -1,6 +1,6 @@
 //! Settings model: saved choices, start-up refusal rules and the status line. No Windows calls.
 
-use crate::guard::Monitor;
+use crate::guard::{GuardReport, Monitor};
 use crate::mirror::Mirror;
 
 /// What the mirror is doing; it alone decides the Start/Stop button.
@@ -34,6 +34,8 @@ pub struct StatusLine {
     pub audio: Option<String>,
     /// The guard's notice; kept until the guard clears it or the user dismisses it.
     pub guard: Option<String>,
+    /// The notice the user dismissed; the guard re-sends it after every display change.
+    dismissed_guard: Option<String>,
     /// The display watcher could not start; kept until cardcast restarts.
     pub displays: Option<String>,
     /// A settings or monitor-list problem; cleared on Start and Stop.
@@ -46,6 +48,7 @@ impl StatusLine {
             mirror,
             audio: None,
             guard: None,
+            dismissed_guard: None,
             displays: None,
             other: None,
         }
@@ -56,6 +59,25 @@ impl StatusLine {
         self.mirror = mirror;
         self.audio = None;
         self.other = None;
+    }
+
+    /// Takes the guard's report, unless it repeats the notice the user dismissed.
+    pub fn follow_guard(&mut self, report: GuardReport) {
+        match report {
+            GuardReport::Notice(notice) if self.dismissed_guard.as_ref() == Some(&notice) => {}
+            GuardReport::Notice(notice) => {
+                self.dismissed_guard = None;
+                self.guard = Some(notice);
+            }
+            GuardReport::Clear => {
+                self.dismissed_guard = None;
+                self.guard = None;
+            }
+        }
+    }
+
+    pub fn dismiss_guard_notice(&mut self) {
+        self.dismissed_guard = self.guard.take();
     }
 
     pub fn text(&self) -> String {
@@ -376,6 +398,24 @@ mod tests {
     }
 
     #[test]
+    fn dismissed_guard_notice_stays_dismissed_until_the_guard_says_something_else() {
+        let mut line = StatusLine::new(Status::Running);
+        let notice = || GuardReport::Notice("given up".into());
+        line.follow_guard(notice());
+        line.dismiss_guard_notice();
+        // A display change re-sends the same notice.
+        line.follow_guard(notice());
+        assert_eq!(line.text(), "Running");
+        line.follow_guard(GuardReport::Notice("other".into()));
+        assert_eq!(line.text(), "Running | other");
+        line.dismiss_guard_notice();
+        line.follow_guard(GuardReport::Clear);
+        // The window was handled; giving up on it again is news.
+        line.follow_guard(GuardReport::Notice("other".into()));
+        assert_eq!(line.text(), "Running | other");
+    }
+
+    #[test]
     fn start_and_stop_keep_the_guard_and_display_watcher_notices() {
         let mut line = StatusLine {
             mirror: Status::Running,
@@ -383,6 +423,7 @@ mod tests {
             guard: Some("guard".into()),
             displays: Some("displays".into()),
             other: Some("other".into()),
+            ..StatusLine::new(Status::Running)
         };
         assert_eq!(line.text(), "Running | audio | guard | displays | other");
         line.set_mirror(Status::Stopped);
