@@ -163,7 +163,7 @@ fn second_monitor_card_display_on_another_graphics_card_is_refused() {
     let source_monitor = &monitors[0];
     let Some(card_display) = monitors
         .iter()
-        .find(|monitor| adapter(monitor) == adapter(source_monitor) && false)
+        .find(|monitor| adapter(monitor) != adapter(source_monitor))
     else {
         panic!("no monitor on a graphics card other than the primary monitor's");
     };
