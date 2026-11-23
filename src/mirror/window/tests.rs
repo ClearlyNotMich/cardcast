@@ -151,7 +151,6 @@ fn second_monitor_card_display_on_another_graphics_card_is_refused() {
     let Some(monitors) = crate::guard::second_monitor::monitors(2) else {
         return;
     };
-    let (source_monitor, card_display) = (&monitors[0], &monitors[1]);
     // SAFETY: plain factory creation.
     let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }.unwrap();
     let outputs = outputs(&factory);
@@ -160,10 +159,14 @@ fn second_monitor_card_display_on_another_graphics_card_is_refused() {
             .unwrap()
             .adapter
     };
-    if adapter(source_monitor) == adapter(card_display) {
-        eprintln!("skipped: the primary and second monitor share a graphics card");
-        return;
-    }
+    // The job's primary monitor sits on the runner's own graphics card, the virtual monitors on the virtual one.
+    let source_monitor = &monitors[0];
+    let Some(card_display) = monitors
+        .iter()
+        .find(|monitor| adapter(monitor) != adapter(source_monitor))
+    else {
+        panic!("no monitor on a graphics card other than the primary monitor's");
+    };
     let _duplicating = duplicating();
     let mut mirror = MirrorWindow::new(|| {});
     let refused = mirror.start(source_monitor, card_display).unwrap_err();
