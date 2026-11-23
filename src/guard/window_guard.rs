@@ -428,8 +428,12 @@ fn check(state: &mut State, window: HWND, now: Instant) {
             return;
         }
     };
+    move_window(window, window_state.frame, window_rect, target);
+}
+
+/// Moves the window so its visible frame lands on `target`, without waiting on its program.
+fn move_window(window: HWND, frame: Rect, window_rect: Rect, target: Rect) {
     // The window rectangle includes invisible resize borders around the visible frame; keep them.
-    let frame = window_state.frame;
     let x = target.left - (frame.left - window_rect.left);
     let y = target.top - (frame.top - window_rect.top);
     let width = (target.right - target.left) + (window_rect.right - window_rect.left)
@@ -600,3 +604,6 @@ fn find_monitors(state: &State) -> Option<(Rect, Rect)> {
         rect(info(send_windows_to)?.rcWork),
     ))
 }
+
+#[cfg(test)]
+mod tests;
