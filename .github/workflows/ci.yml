@@ -24,3 +24,11 @@ jobs:
         with:
           name: cardcast-exe
           path: target/release/cardcast.exe
+      - if: runner.os == 'Windows'
+        name: Check embedded DPI manifest
+        shell: pwsh
+        run: |
+          $mt = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\mt.exe" | Sort-Object FullName | Select-Object -Last 1
+          & $mt.FullName -nologo "-inputresource:target\release\cardcast.exe;#1" "-out:extracted.manifest"
+          if ($LASTEXITCODE -ne 0) { throw "no manifest embedded in cardcast.exe" }
+          if (-not (Select-String -Path extracted.manifest -SimpleMatch -Quiet 'PerMonitorV2')) { throw "embedded manifest lacks PerMonitorV2 DPI awareness" }
