@@ -483,9 +483,11 @@ fn second_monitor_settings_window_moved_onto_the_card_display_is_returned_but_th
     move_onto(mirror.window, card_display);
     let settings = OwnWindow::spawn(w!("cardcast test settings window"));
     move_onto(settings.window, card_display);
-    wait_for("settings window returned to the primary monitor", || {
-        on(primary, frame(settings.window))
-    });
+    wait_for(
+        "settings window returned to the primary monitor",
+        CALL_LIMIT,
+        || on(primary, frame(settings.window)),
+    );
     assert!(
         on(card_display, frame(mirror.window)),
         "the mirror window was moved"
