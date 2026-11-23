@@ -1,4 +1,4 @@
-//! The display watcher: a hidden top-level window on its own thread that hears every display change.
+//! The display watcher: a hidden top-level window on its own thread that hears every display and device change.
 
 use std::cell::RefCell;
 use std::sync::mpsc;
@@ -8,8 +8,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, MSG,
-    PostThreadMessageW, RegisterClassW, WINDOW_EX_STYLE, WM_DISPLAYCHANGE, WM_QUIT, WNDCLASSW,
-    WS_OVERLAPPED,
+    PostThreadMessageW, RegisterClassW, WINDOW_EX_STYLE, WM_DEVICECHANGE, WM_DISPLAYCHANGE,
+    WM_QUIT, WNDCLASSW, WS_OVERLAPPED,
 };
 use windows::core::w;
 
@@ -17,7 +17,8 @@ thread_local! {
     static WAKE: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
 }
 
-/// Calls its `wake` after every display change (a monitor plugged, unplugged or changing mode).
+/// Calls its `wake` after every display change (a monitor plugged, unplugged or changing mode) and
+/// every device change: a monitor's device can go away with no display change (docs/win32-mirror-audio.md).
 pub struct DisplayWatcher {
     /// `None` once dropped.
     running: Option<(u32, JoinHandle<()>)>,
@@ -75,7 +76,7 @@ fn run(wake: Box<dyn Fn()>, started: &mpsc::Sender<(u32, isize)>) {
     let _ = unsafe { DestroyWindow(window) };
 }
 
-/// Hidden, because only top-level windows hear about display changes.
+/// Hidden, because only top-level windows hear about display and device changes.
 fn create_window() -> Option<HWND> {
     // SAFETY: a null module name returns this executable's handle.
     let instance = unsafe { GetModuleHandleW(None) }.ok()?;
@@ -113,7 +114,7 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_DISPLAYCHANGE {
+    if message == WM_DISPLAYCHANGE || message == WM_DEVICECHANGE {
         WAKE.with_borrow(|wake| {
             if let Some(wake) = wake {
                 wake();
@@ -133,7 +134,7 @@ mod tests {
     use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW};
 
     #[test]
-    fn display_change_wakes_the_settings_window() {
+    fn display_and_device_changes_wake_the_settings_window() {
         let wakes = Arc::new(AtomicU32::new(0));
         let watcher = {
             let wakes = wakes.clone();
@@ -145,11 +146,13 @@ mod tests {
         let window = HWND(watcher.window as *mut _);
         // SAFETY: the window is alive until the watcher drops; WM_DISPLAYCHANGE carries no pointers.
         unsafe { PostMessageW(Some(window), WM_DISPLAYCHANGE, WPARAM(32), LPARAM(0)) }.unwrap();
+        // SAFETY: as above; DBT_DEVNODES_CHANGED (7) carries no pointer either.
+        unsafe { PostMessageW(Some(window), WM_DEVICECHANGE, WPARAM(7), LPARAM(0)) }.unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while wakes.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+        while wakes.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
         drop(watcher);
         // SAFETY: IsWindow accepts any handle.
         assert!(!unsafe { IsWindow(Some(window)) }.as_bool());
