@@ -13,6 +13,7 @@ Cardcast mirrors a screen from the sender onto the card display, so a second PC 
 
 - Code is written on Linux. Mirror and window guard only run on Windows, so they can't be run here.
 - Before every push: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
+- Check the Windows-only code on Linux before pushing: `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings` (one-time: `rustup target add x86_64-pc-windows-msvc`).
 - GitHub Actions builds the Windows `.exe` on every push. The owner tests it on the sender.
 - Keep decisions in plain functions with no Windows calls (for example "where does this window go"), so they can be unit-tested on Linux.
 

@@ -36,8 +36,10 @@ all = { level = "deny", priority = -1 }
 undocumented_unsafe_blocks = "deny"
 # A panic in a hook thread or message loop silently kills the guard or mirror (allowed in tests via clippy.toml).
 unwrap_used = "deny"
-# Allowed only with a message stating why it cannot fail.
-expect_used = "warn"
+# Fails CI unless silenced with #[expect(clippy::expect_used, reason = "why it cannot fail")].
+expect_used = "deny"
+# Every #[allow]/#[expect] must say why, so reviewers can judge it.
+allow_attributes_without_reason = "deny"
 # Monitor rectangles mix i32/u32 coordinates; silent truncation puts windows in the wrong place.
 cast_possible_truncation = "deny"
 # Monitor rectangles mix i32/u32 coordinates; a negative coordinate must not wrap silently.
