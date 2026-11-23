@@ -29,7 +29,7 @@ The live copy of the source monitor shown fullscreen on the card display.
 _Avoid_: Projector, stream, clone, duplicate
 
 **Window guard**:
-The rule that no window may stay on the card display; any window that lands there is returned to the primary monitor.
+The rule that no window may stay on the card display; any window that lands there is returned to the "send windows to" monitor, which defaults to the primary monitor.
 _Avoid_: Window lock, window mover
 
 **Pointer guard**:
