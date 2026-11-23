@@ -47,7 +47,7 @@ Terms in bold in `GLOSSARY.md` are used with exactly that meaning here. `docs/ad
 
 The mirror follows the same three steps as OBS's fullscreen projector, and the picture stays on the graphics card throughout.
 
-1. **Capture.** Get the source monitor's picture as a GPU texture. There are two ways, and the capture check in section 9 picks one before the mirror is written:
+1. **Capture.** Get the source monitor's picture as a GPU texture. There are two ways, and ADR 0002 chose Desktop Duplication (provisional; the section 9 capture check can still overturn it):
    - **Windows Graphics Capture, 8-bit output.** Preferred, because it can draw the mouse pointer into the picture itself (build 19041+). That Windows converts HDR to SDR well for an 8-bit frame pool is not documented (it may clip), and turning off the yellow capture border needs build 20348+ and may need package identity; the capture check verifies both empirically. See `docs/win32-mirror-audio.md`.
    - **DXGI Desktop Duplication.** What OBS's Display Capture uses by default on a desktop PC, so it is what the reference sender runs today. It needs more code: the mirror must convert HDR to SDR itself, using the monitor's SDR white level, and must draw the mouse pointer itself.
 2. **Window.** Create a borderless, always-on-top window that exactly covers the card display. It must not take focus and must not appear in the taskbar or Alt+Tab.
