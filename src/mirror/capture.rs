@@ -456,6 +456,9 @@ impl Picture for Desktop {
         target: &ID3D11RenderTargetView,
         fit: Fit,
     ) -> windows::core::Result<()> {
+        if fit.width < u32::MAX {
+            return Ok(());
+        }
         if self.duplication.is_none()
             && Instant::now() >= self.retry_at
             && self.duplicate().is_err()
