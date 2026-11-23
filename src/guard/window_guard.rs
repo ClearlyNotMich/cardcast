@@ -23,10 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GetAncestor, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowPlacement,
     GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed,
     KillTimer, MSG, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
-    SW_SHOWMAXIMIZED, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
-    SetCursorPos, SetTimer, SetWindowPlacement, SetWindowPos, WINDOW_EX_STYLE, WINDOWPLACEMENT,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW,
-    WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER,
+    SWP_NOZORDER, SetCursorPos, SetTimer, SetWindowPlacement, SetWindowPos, WINDOW_EX_STYLE,
+    WINDOWPLACEMENT, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_QUIT,
+    WM_TIMER, WNDCLASSW, WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{BOOL, w};
 
@@ -466,10 +466,14 @@ fn maximise(window: HWND, restore: Rect) {
         right: restore.right - x,
         bottom: restore.bottom - y,
     };
-    placement.showCmd = SW_SHOWMAXIMIZED.0 as u32;
     placement.flags = WPF_ASYNCWINDOWPLACEMENT;
-    // SAFETY: placement is a WINDOWPLACEMENT with length set; WPF_ASYNCWINDOWPLACEMENT posts the request, so a hung program cannot block this thread.
-    let _ = unsafe { SetWindowPlacement(window, &placement) };
+    // An already maximised window stays on its monitor when only its restore position changes,
+    // so restore it onto `restore` first, then maximise it there (measured on the CI runner).
+    for show in [SW_SHOWNOACTIVATE, SW_SHOWMAXIMIZED] {
+        placement.showCmd = show.0.cast_unsigned();
+        // SAFETY: placement is a WINDOWPLACEMENT with length set; WPF_ASYNCWINDOWPLACEMENT posts the request, so a hung program cannot block this thread.
+        let _ = unsafe { SetWindowPlacement(window, &placement) };
+    }
 }
 
 fn window_placement(window: HWND) -> Option<WINDOWPLACEMENT> {
