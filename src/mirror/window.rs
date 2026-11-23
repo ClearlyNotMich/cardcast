@@ -339,11 +339,12 @@ impl Screen {
             }
             // SAFETY: the waitable handle stays open while self lives.
             let woke = unsafe {
-                MsgWaitForMultipleObjects(Some(&[self.waitable.0]), false, 0, QS_ALLINPUT)
+                MsgWaitForMultipleObjects(Some(&[self.waitable.0]), false, INFINITE, QS_ALLINPUT)
             };
-            let _ = (woke, WAIT_OBJECT_0, INFINITE);
-            self.draw(picture)?;
-            presents.fetch_add(1, Ordering::Relaxed);
+            if woke == WAIT_OBJECT_0 {
+                self.draw(picture)?;
+                presents.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -355,7 +356,7 @@ impl Screen {
         }
         picture.draw(&self.context, &self.target, fit(picture.size(), self.size))?;
         // SAFETY: plain present; sync interval 1 waits for the card display's next refresh.
-        unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)) }.ok()
+        unsafe { self.swap_chain.Present(1, DXGI_PRESENT(0)) }.ok()
     }
 }
 
