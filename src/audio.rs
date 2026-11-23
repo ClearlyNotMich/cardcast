@@ -69,3 +69,53 @@ pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
     }
     Ok(devices)
 }
+
+#[cfg(all(test, windows))]
+mod probe {
+    #[test]
+    fn probe_runner_audio_endpoints() {
+        use windows::Win32::Media::Audio::{
+            DEVICE_STATEMASK_ALL, IMMDeviceEnumerator, MMDeviceEnumerator, eAll,
+        };
+        use windows::Win32::System::Com::{
+            CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+        };
+        let mut out = format!("active render: {:?}\n", super::playback_devices());
+        // SAFETY: test probe.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        // SAFETY: test probe.
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.unwrap();
+        // SAFETY: test probe.
+        let all = unsafe {
+            enumerator.EnumAudioEndpoints(
+                eAll,
+                windows::Win32::Media::Audio::DEVICE_STATE(DEVICE_STATEMASK_ALL),
+            )
+        }
+        .unwrap();
+        // SAFETY: test probe.
+        let count = unsafe { all.GetCount() }.unwrap();
+        for index in 0..count {
+            // SAFETY: test probe.
+            let device = unsafe { all.Item(index) }.unwrap();
+            // SAFETY: test probe.
+            let state = unsafe { device.GetState() }.unwrap();
+            // SAFETY: test probe.
+            let id = unsafe { device.GetId().unwrap().to_string() };
+            out.push_str(&format!("all: {id:?} state {state:?}\n"));
+        }
+        out.push_str(&format!(
+            "default render: {:?}",
+            // SAFETY: test probe.
+            unsafe {
+                enumerator.GetDefaultAudioEndpoint(
+                    windows::Win32::Media::Audio::eRender,
+                    windows::Win32::Media::Audio::eConsole,
+                )
+            }
+            .map(|_| ())
+        ));
+        panic!("PROBE\n{out}");
+    }
+}
