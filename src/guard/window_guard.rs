@@ -1,6 +1,7 @@
-//! The window guard: out-of-context window event hooks on their own thread.
+//! The window guard and pointer guard: out-of-context window event hooks and a pointer timer on their own thread.
 
 use super::placement::{Placement, Rect, ReturnHistory, WindowState};
+use super::pointer::PointerHistory;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -19,17 +20,20 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWi
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_MINIMIZEEND, EnumWindows, GA_ROOT,
-    GWL_EXSTYLE, GetAncestor, GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, KillTimer, MSG, OBJID_WINDOW,
-    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SWP_ASYNCWINDOWPOS,
-    SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetTimer, SetWindowPos, WINDOW_EX_STYLE,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    GWL_EXSTYLE, GetAncestor, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, KillTimer, MSG,
+    OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetCursorPos, SetTimer,
+    SetWindowPos, WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{BOOL, w};
 
 /// How long a window must be still before the guard checks it, so a drag is checked once.
 const SETTLE: Duration = Duration::from_millis(50);
+
+/// Pointer check interval: about 60 times a second.
+const POINTER_INTERVAL_MS: u32 = 16;
 
 /// The guard thread and what it was started with.
 struct Running {
@@ -136,6 +140,8 @@ struct State {
     pending: HashMap<isize, Instant>,
     timer: usize,
     history: ReturnHistory,
+    pointer_timer: usize,
+    pointer_history: PointerHistory,
     reports: Sender<String>,
     wake: std::sync::Arc<dyn Fn() + Send + Sync>,
 }
@@ -158,6 +164,8 @@ fn run(
         pending: HashMap::new(),
         timer: 0,
         history: ReturnHistory::default(),
+        pointer_timer: 0,
+        pointer_history: PointerHistory::default(),
         reports,
         wake,
     };
@@ -197,11 +205,21 @@ fn run(
         cleanup(&hooks, display_window);
         return;
     }
-    with_state(sweep);
+    with_state(|state| {
+        // SAFETY: a thread timer with no window posts WM_TIMER to this thread's queue.
+        state.pointer_timer = unsafe { SetTimer(None, 0, POINTER_INTERVAL_MS, None) };
+        sweep(state);
+    });
     // SAFETY: message is a valid MSG; the loop ends on WM_QUIT (0) or error (-1).
     while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
         if message.message == WM_TIMER && message.hwnd.is_invalid() {
-            with_state(check_settled);
+            with_state(|state| {
+                if message.wParam.0 == state.pointer_timer {
+                    check_pointer(state);
+                } else {
+                    check_settled(state);
+                }
+            });
         } else {
             // SAFETY: message came from GetMessageW on this thread.
             unsafe { DispatchMessageW(&message) };
@@ -220,9 +238,11 @@ fn cleanup(hooks: &[HWINEVENTHOOK], display_window: Option<HWND>) {
         let _ = unsafe { DestroyWindow(window) };
     }
     with_state(|state| {
-        if state.timer != 0 {
-            // SAFETY: the thread timer was created by this thread.
-            let _ = unsafe { KillTimer(None, state.timer) };
+        for timer in [state.timer, state.pointer_timer] {
+            if timer != 0 {
+                // SAFETY: the thread timer was created by this thread.
+                let _ = unsafe { KillTimer(None, timer) };
+            }
         }
     });
 }
@@ -310,6 +330,30 @@ extern "system" fn on_event(
             state.timer = unsafe { SetTimer(None, 0, 25, None) };
         }
     });
+}
+
+/// Puts the pointer back off the card display; a pointer confined by a game never gets there.
+fn check_pointer(state: &mut State) {
+    let Some((card_display, send_windows_to)) = state.monitors else {
+        return;
+    };
+    let mut pointer = POINT::default();
+    // SAFETY: pointer is a valid POINT; this fails only on a secure desktop, where the guard does nothing.
+    if unsafe { GetCursorPos(&mut pointer) }.is_err() {
+        return;
+    }
+    let fallback = (
+        (send_windows_to.left + send_windows_to.right) / 2,
+        (send_windows_to.top + send_windows_to.bottom) / 2,
+    );
+    if let Some((x, y)) =
+        state
+            .pointer_history
+            .place((pointer.x, pointer.y), card_display, fallback)
+    {
+        // SAFETY: plain call; moving the pointer has no memory effects.
+        let _ = unsafe { SetCursorPos(x, y) };
+    }
 }
 
 fn check_settled(state: &mut State) {
