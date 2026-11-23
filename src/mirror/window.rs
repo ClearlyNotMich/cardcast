@@ -1,14 +1,15 @@
 //! The mirror window: a borderless, topmost, no-activate window covering the card display,
 //! drawn once per refresh through a flip-model swap chain on its own thread.
 
-use super::{Fit, Mirror, Output, find_output, fit};
+use super::capture::Desktop;
+use super::{Fit, Mirror, Output, find_output, fit, source_output};
 use crate::guard::Monitor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
@@ -21,7 +22,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory2, IDXGISwapChain2,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory2, IDXGIOutput, IDXGISwapChain2,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentThreadId, INFINITE};
@@ -34,7 +35,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{Interface, w};
 
-/// What the mirror window draws once per refresh. #7 swaps the test pattern for captured frames.
+/// What the mirror window draws once per refresh: the captured source monitor (`super::capture::Desktop`).
 pub trait Picture {
     /// Size of the newest picture in pixels, for the aspect fit.
     fn size(&self) -> (u32, u32);
@@ -46,51 +47,6 @@ pub trait Picture {
         target: &ID3D11RenderTargetView,
         fit: Fit,
     ) -> windows::core::Result<()>;
-}
-
-/// Colour bars, so the owner can check the card display end to end before capture exists.
-struct TestPattern;
-
-impl Picture for TestPattern {
-    fn size(&self) -> (u32, u32) {
-        (1920, 1080)
-    }
-
-    fn draw(
-        &mut self,
-        context: &ID3D11DeviceContext1,
-        target: &ID3D11RenderTargetView,
-        fit: Fit,
-    ) -> windows::core::Result<()> {
-        const BARS: [[f32; 4]; 8] = [
-            [1.0, 1.0, 1.0, 1.0],
-            [1.0, 1.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0, 1.0],
-            [0.0, 1.0, 0.0, 1.0],
-            [1.0, 0.0, 1.0, 1.0],
-            [1.0, 0.0, 0.0, 1.0],
-            [0.0, 0.0, 1.0, 1.0],
-            [0.25, 0.25, 0.25, 1.0],
-        ];
-        let edge = |bar: usize| {
-            let bar = u64::try_from(bar).unwrap_or(0);
-            let offset = u64::from(fit.width) * bar / 8;
-            i32::try_from(u64::from(fit.left) + offset).unwrap_or(i32::MAX)
-        };
-        let top = i32::try_from(fit.top).unwrap_or(0);
-        let bottom = i32::try_from(fit.top + fit.height).unwrap_or(0);
-        for (bar, colour) in BARS.iter().enumerate() {
-            let rect = RECT {
-                left: edge(bar),
-                top,
-                right: edge(bar + 1),
-                bottom,
-            };
-            // SAFETY: target is a live render target view of this context's device.
-            unsafe { context.ClearView(target, colour, Some(&[rect])) };
-        }
-        Ok(())
-    }
 }
 
 /// The mirror thread and what tests read from it.
@@ -115,14 +71,16 @@ impl Drop for MirrorWindow {
 }
 
 impl Mirror for MirrorWindow {
-    fn start(&mut self, _source_monitor: &Monitor, card_display: &Monitor) -> Result<(), String> {
+    fn start(&mut self, source_monitor: &Monitor, card_display: &Monitor) -> Result<(), String> {
         self.stop();
         let (started_sender, started) = mpsc::channel();
         let presents = Arc::new(AtomicU64::new(0));
         let thread = {
-            let card_display = card_display.clone();
+            let (source_monitor, card_display) = (source_monitor.clone(), card_display.clone());
             let presents = presents.clone();
-            std::thread::spawn(move || run(&card_display, &presents, &started_sender))
+            std::thread::spawn(move || {
+                run(&source_monitor, &card_display, &presents, &started_sender);
+            })
         };
         match started.recv() {
             Ok(Ok((thread_id, window))) => {
@@ -159,12 +117,20 @@ impl Mirror for MirrorWindow {
 
 /// Mirror thread: opens the window, reports its thread id and window, then draws until WM_QUIT.
 fn run(
+    source_monitor: &Monitor,
     card_display: &Monitor,
     presents: &AtomicU64,
     started: &Sender<Result<(u32, isize), String>>,
 ) {
-    let screen = match Screen::open(card_display) {
-        Ok(screen) => screen,
+    let opened = Screen::open(source_monitor, card_display).and_then(|(screen, source)| {
+        // SAFETY: plain call returning the context's device.
+        let device = unsafe { screen.context.GetDevice() }
+            .map_err(|_| "Could not start the mirror (Direct3D device).".to_owned())?;
+        let desktop = Desktop::open(&device, &source, &source_monitor.device_path)?;
+        Ok((screen, desktop))
+    });
+    let (screen, mut desktop) = match opened {
+        Ok(opened) => opened,
         Err(message) => {
             let _ = started.send(Err(message));
             return;
@@ -182,7 +148,7 @@ fn run(
         return;
     }
     // shortcut: a lost device or failed present just closes the window; #7 adds recovery and reporting.
-    let _ = screen.draw_until_quit(&mut TestPattern, presents);
+    let _ = screen.draw_until_quit(&mut desktop, presents);
 }
 
 /// Destroys the mirror window when dropped.
@@ -216,7 +182,11 @@ struct Screen {
 }
 
 impl Screen {
-    fn open(card_display: &Monitor) -> Result<Self, String> {
+    /// Opens the window on the card display and finds the source monitor's output on the same graphics card.
+    fn open(
+        source_monitor: &Monitor,
+        card_display: &Monitor,
+    ) -> Result<(Self, IDXGIOutput), String> {
         let monitors = crate::guard::monitors()?;
         // SAFETY: plain factory creation.
         let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }
@@ -224,6 +194,7 @@ impl Screen {
         let outputs = outputs(&factory);
         let output = find_output(&card_display.device_path, &monitors, &outputs)
             .ok_or("The card display is not connected to any graphics card.")?;
+        let source = source_output(&source_monitor.device_path, output, &monitors, &outputs)?;
         let card_display = monitors
             .iter()
             .find(|monitor| monitor.device_path == card_display.device_path)
@@ -233,6 +204,9 @@ impl Screen {
         // SAFETY: the index came from EnumAdapters1 on this factory just above.
         let adapter = unsafe { factory.EnumAdapters1(output.adapter) }
             .map_err(|_| failed("graphics card"))?;
+        // SAFETY: the index came from EnumOutputs on this adapter in `outputs`.
+        let source = unsafe { adapter.EnumOutputs(source.output) }
+            .map_err(|_| "The source monitor is not connected.".to_owned())?;
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         // SAFETY: out pointers are valid locals; an explicit adapter needs D3D_DRIVER_TYPE_UNKNOWN.
@@ -297,14 +271,17 @@ impl Screen {
         let target = target.ok_or_else(|| failed("render target"))?;
         // SAFETY: plain call on the window created above.
         let _ = unsafe { ShowWindow(window.0, SW_SHOWNOACTIVATE) };
-        Ok(Self {
-            waitable,
-            target,
-            swap_chain,
-            context,
-            size,
-            window,
-        })
+        Ok((
+            Self {
+                waitable,
+                target,
+                swap_chain,
+                context,
+                size,
+                window,
+            },
+            source,
+        ))
     }
 
     /// Pumps messages and draws a frame each time the swap chain is ready for one, until WM_QUIT.

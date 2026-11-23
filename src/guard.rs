@@ -122,13 +122,17 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
     ])
 }
 
-/// Active monitors from the Windows display configuration, keyed by device path.
+/// Active display paths and modes from `QueryDisplayConfig`.
 #[cfg(windows)]
-pub fn monitors() -> Result<Vec<Monitor>, String> {
+fn display_config() -> Result<
+    (
+        Vec<windows::Win32::Devices::Display::DISPLAYCONFIG_PATH_INFO>,
+        Vec<windows::Win32::Devices::Display::DISPLAYCONFIG_MODE_INFO>,
+    ),
+    String,
+> {
     use windows::Win32::Devices::Display::{
-        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME,
-        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
-        DISPLAYCONFIG_TARGET_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, GetDisplayConfigBufferSizes,
         QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
     };
 
@@ -155,20 +159,69 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
     .ok()
     .map_err(|_| failed("display configuration"))?;
     paths.truncate(path_count as usize);
+    modes.truncate(mode_count as usize);
+    Ok((paths, modes))
+}
 
-    let header_size = u32::try_from(size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>())
-        .map_err(|_| failed("header size"))?;
+/// The path's monitor device path and friendly name, or `None` if Windows cannot name its target.
+#[cfg(windows)]
+fn device_path(
+    path: &windows::Win32::Devices::Display::DISPLAYCONFIG_PATH_INFO,
+) -> Option<(String, String)> {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME, DISPLAYCONFIG_TARGET_DEVICE_NAME,
+        DisplayConfigGetDeviceInfo,
+    };
+    let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
+    target.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+    target.header.size = u32::try_from(size_of::<DISPLAYCONFIG_TARGET_DEVICE_NAME>()).ok()?;
+    target.header.adapterId = path.targetInfo.adapterId;
+    target.header.id = path.targetInfo.id;
+    // SAFETY: header is the first field of a correctly sized DISPLAYCONFIG_TARGET_DEVICE_NAME, as size says.
+    if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } != 0 {
+        return None;
+    }
+    Some((
+        wide_to_string(&target.monitorDevicePath),
+        wide_to_string(&target.monitorFriendlyDeviceName),
+    ))
+}
+
+/// The monitor's SDR white level (`DISPLAYCONFIG_SDR_WHITE_LEVEL.SDRWhiteLevel`, 1000 = 80 nits).
+#[cfg(windows)]
+pub fn sdr_white_level(monitor_device_path: &str) -> Option<u32> {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL, DISPLAYCONFIG_SDR_WHITE_LEVEL,
+        DisplayConfigGetDeviceInfo,
+    };
+    let (paths, _) = display_config().ok()?;
+    let path = paths.iter().find(|path| {
+        device_path(path).is_some_and(|(device_path, _)| device_path == monitor_device_path)
+    })?;
+    let mut level = DISPLAYCONFIG_SDR_WHITE_LEVEL::default();
+    level.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+    level.header.size = u32::try_from(size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>()).ok()?;
+    level.header.adapterId = path.targetInfo.adapterId;
+    level.header.id = path.targetInfo.id;
+    // SAFETY: header is the first field of a correctly sized DISPLAYCONFIG_SDR_WHITE_LEVEL, as size says.
+    (unsafe { DisplayConfigGetDeviceInfo(&mut level.header) } == 0).then_some(level.SDRWhiteLevel)
+}
+
+/// Active monitors from the Windows display configuration, keyed by device path.
+#[cfg(windows)]
+pub fn monitors() -> Result<Vec<Monitor>, String> {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+        DisplayConfigGetDeviceInfo,
+    };
+
+    let failed = |what: &str| format!("Could not list monitors ({what}).");
+    let (paths, modes) = display_config()?;
     let mut monitors = Vec::new();
     for (index, path) in paths.iter().enumerate() {
-        let mut target = DISPLAYCONFIG_TARGET_DEVICE_NAME::default();
-        target.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
-        target.header.size = header_size;
-        target.header.adapterId = path.targetInfo.adapterId;
-        target.header.id = path.targetInfo.id;
-        // SAFETY: header is the first field of a correctly sized DISPLAYCONFIG_TARGET_DEVICE_NAME, as size says.
-        if unsafe { DisplayConfigGetDeviceInfo(&mut target.header) } != 0 {
+        let Some((device_path, name)) = device_path(path) else {
             continue;
-        }
+        };
         let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
         source.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
         source.header.size = u32::try_from(size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>())
@@ -187,9 +240,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         // SAFETY: the mode a path's source index points to is a source mode.
         let source_mode = unsafe { mode.Anonymous.sourceMode };
         let rate = path.targetInfo.refreshRate;
-        let name = wide_to_string(&target.monitorFriendlyDeviceName);
         monitors.push(Monitor {
-            device_path: wide_to_string(&target.monitorDevicePath),
+            device_path,
             gdi_name: wide_to_string(&source.viewGdiDeviceName),
             name: if name.is_empty() {
                 format!("Monitor {}", index + 1)

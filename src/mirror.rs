@@ -7,6 +7,16 @@
 )]
 
 #[cfg(windows)]
+mod capture;
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows capture calls it; its tests run everywhere"
+    )
+)]
+mod pointer;
+#[cfg(windows)]
 mod window;
 
 use crate::guard::Monitor;
@@ -120,9 +130,109 @@ pub fn find_output<'a>(
         .find(|output| output.gdi_name.eq_ignore_ascii_case(&monitor.gdi_name))
 }
 
+/// The DXGI output to duplicate for the source monitor. Desktop Duplication needs a device on the
+/// source's graphics card, and SPEC section 1 puts the card display on that same card, so the
+/// card display's device is reused and the picture is never copied between graphics cards.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows mirror window calls it")
+)]
+pub fn source_output<'a>(
+    device_path: &str,
+    card_display: &Output,
+    monitors: &[Monitor],
+    outputs: &'a [Output],
+) -> Result<&'a Output, &'static str> {
+    let output = find_output(device_path, monitors, outputs)
+        .ok_or("The source monitor is not connected to any graphics card.")?;
+    if output.adapter == card_display.adapter {
+        Ok(output)
+    } else {
+        Err(
+            "The source monitor and the card display are on different graphics cards. Plug both into the same one.",
+        )
+    }
+}
+
+/// What the HDR shader multiplies linear scRGB by so the monitor's SDR white becomes 1.0.
+/// `sdr_white_level` is `DISPLAYCONFIG_SDR_WHITE_LEVEL.SDRWhiteLevel`: 1000 means 80 nits, scRGB 1.0.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows mirror calls it")
+)]
+pub fn white_scale(sdr_white_level: u32) -> f32 {
+    if sdr_white_level == 0 {
+        1.0
+    } else {
+        1000.0 / sdr_white_level as f32
+    }
+}
+
+/// The HDR shader's maths for one channel: linear scRGB to an sRGB-encoded SDR value in 0..=1.
+/// The shader in `mirror::capture` must match it; a Windows test checks that it does.
+#[cfg(test)]
+pub fn sdr_from_hdr(linear: f32, white_scale: f32) -> f32 {
+    let value = (linear * white_scale).clamp(0.0, 1.0);
+    if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sdr_white_becomes_full_white() {
+        // 200 nits SDR white is scRGB 2.5 and SDRWhiteLevel 2500.
+        assert!((sdr_from_hdr(2.5, white_scale(2500)) - 1.0).abs() < 1e-6);
+        assert!((sdr_from_hdr(1.0, white_scale(1000)) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn half_sdr_white_is_srgb_encoded() {
+        // Linear 0.5 encodes to sRGB 0.7354.
+        assert!((sdr_from_hdr(1.25, white_scale(2500)) - 0.7354).abs() < 1e-3);
+    }
+
+    #[test]
+    fn hdr_highlights_and_out_of_gamut_values_clip() {
+        assert!((sdr_from_hdr(12.5, white_scale(2500)) - 1.0).abs() < 1e-6);
+        assert_eq!(sdr_from_hdr(-0.2, white_scale(2500)), 0.0);
+    }
+
+    #[test]
+    fn missing_white_level_falls_back_to_80_nits() {
+        assert_eq!(white_scale(0), 1.0);
+    }
+
+    #[test]
+    fn source_monitor_on_the_card_displays_graphics_card_is_duplicated() {
+        let monitors = [
+            monitor("source", r"\\.\DISPLAY1"),
+            monitor("card", r"\\.\DISPLAY2"),
+        ];
+        let outputs = [output(0, 0, r"\\.\DISPLAY1"), output(0, 1, r"\\.\DISPLAY2")];
+        assert_eq!(
+            source_output("source", &outputs[1], &monitors, &outputs),
+            Ok(&outputs[0])
+        );
+    }
+
+    #[test]
+    fn source_monitor_on_another_graphics_card_is_refused() {
+        let monitors = [
+            monitor("source", r"\\.\DISPLAY1"),
+            monitor("card", r"\\.\DISPLAY2"),
+        ];
+        let outputs = [output(0, 0, r"\\.\DISPLAY1"), output(1, 0, r"\\.\DISPLAY2")];
+        let refused = source_output("source", &outputs[1], &monitors, &outputs);
+        assert!(refused.unwrap_err().contains("different graphics cards"));
+        let unplugged = source_output("gone", &outputs[1], &monitors, &outputs);
+        assert!(unplugged.unwrap_err().contains("not connected"));
+    }
 
     fn at(left: u32, top: u32, width: u32, height: u32) -> Fit {
         Fit {

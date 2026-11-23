@@ -1,7 +1,9 @@
 //! Checks the mirror window on the runner's desktop; its only monitor stands in for the card display.
 
 use super::*;
+use crate::mirror::capture::duplicating;
 use std::time::{Duration, Instant};
+use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, GetForegroundWindow, GetWindowDisplayAffinity, GetWindowLongPtrW,
     GetWindowRect, IsWindow, WS_CAPTION, WS_THICKFRAME,
@@ -32,6 +34,7 @@ fn foreground() -> isize {
 
 #[test]
 fn mirror_window_covers_the_card_display_with_its_styles() {
+    let _duplicating = duplicating();
     let card_display = card_display();
     let before = foreground();
     let mirror = started(&card_display);
@@ -82,6 +85,7 @@ fn mirror_window_covers_the_card_display_with_its_styles() {
 
 #[test]
 fn mirror_window_presents_at_the_refresh_rate() {
+    let _duplicating = duplicating();
     let card_display = card_display();
     let mirror = started(&card_display);
     let presents = &mirror.running.as_ref().unwrap().presents;
@@ -99,6 +103,7 @@ fn mirror_window_presents_at_the_refresh_rate() {
 
 #[test]
 fn stop_closes_the_mirror_window() {
+    let _duplicating = duplicating();
     let mut mirror = started(&card_display());
     let window = window(&mirror);
     mirror.stop();
