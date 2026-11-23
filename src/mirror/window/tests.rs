@@ -112,3 +112,38 @@ fn stop_closes_the_mirror_window() {
     // SAFETY: IsWindow accepts any handle.
     assert!(!unsafe { IsWindow(Some(window)) }.as_bool());
 }
+
+#[test]
+fn second_monitor_mirror_starts_on_it_and_presents_at_its_refresh_rate() {
+    let Some((source_monitor, card_display)) = crate::guard::second_monitor::monitors() else {
+        return;
+    };
+    let _duplicating = duplicating();
+    // SAFETY: plain factory creation.
+    let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }.unwrap();
+    // Shown if the test fails: which graphics card owns which monitor.
+    println!("monitors: {:#?}", crate::guard::monitors());
+    println!("outputs: {:#?}", outputs(&factory));
+    let mut mirror = MirrorWindow::default();
+    mirror.start(&source_monitor, &card_display).unwrap();
+    let mut rect = RECT::default();
+    // SAFETY: rect is a valid RECT; the window lives until `mirror` drops.
+    unsafe { GetWindowRect(window(&mirror), &mut rect) }.unwrap();
+    assert_eq!(
+        (rect.left, rect.top),
+        (card_display.left, card_display.top),
+        "mirror window is not on the card display"
+    );
+    let presents = &mirror.running.as_ref().unwrap().presents;
+    std::thread::sleep(Duration::from_millis(500));
+    let (start, at_start) = (Instant::now(), presents.load(Ordering::Relaxed));
+    std::thread::sleep(Duration::from_secs(2));
+    let counted = presents.load(Ordering::Relaxed) - at_start;
+    let per_second = counted as f64 / start.elapsed().as_secs_f64();
+    let refresh = f64::from(card_display.refresh_hz);
+    assert!(
+        per_second <= refresh * 1.1 + 1.0 && per_second >= refresh * 0.5,
+        "{per_second:.1} presents per second on a {refresh} Hz card display"
+    );
+    assert!(mirror.is_running(), "the mirror ended on its own");
+}

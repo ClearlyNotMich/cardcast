@@ -391,4 +391,75 @@ mod tests {
         assert!(window.mirror.is_running());
         assert_eq!(*relay.0.borrow(), ["stop"]);
     }
+
+    /// As `logic` does on every pass.
+    #[cfg(windows)]
+    fn follow_if_changed(window: &mut SettingsWindow) {
+        if window.displays_changed.swap(false, Ordering::Relaxed) {
+            window.follow_displays();
+        }
+    }
+
+    /// The settings window as `run` builds it, with the real mirror and display watcher.
+    #[cfg(windows)]
+    #[test]
+    fn second_monitor_unplug_waits_for_the_card_display_and_replug_brings_the_mirror_back() {
+        use guard::second_monitor::{Unplugged, wait_for};
+        use std::time::Duration;
+        let Some((source_monitor, card_display)) = guard::second_monitor::monitors() else {
+            return;
+        };
+        let displays_changed = Arc::new(AtomicBool::new(false));
+        let display_watcher = {
+            let displays_changed = displays_changed.clone();
+            guard::DisplayWatcher::new(move || displays_changed.store(true, Ordering::Relaxed))
+        };
+        let mut window = SettingsWindow {
+            settings: Settings {
+                source_monitor: Some(source_monitor.device_path),
+                card_display: Some(card_display.device_path.clone()),
+                ..Settings::default()
+            },
+            monitors: guard::monitors().unwrap(),
+            playback_devices: Vec::new(),
+            status: Status::Stopped,
+            mirror: mirror::new_mirror(),
+            relay: Box::new(RecordingRelay::default()),
+            guard: Box::new(NoGuard),
+            wanted: false,
+            displays_changed,
+            _display_watcher: display_watcher,
+        };
+        window.start();
+        assert_eq!(window.status.text(), "Running");
+
+        let unplugged = Unplugged::new();
+        wait_for("the card display to go", Duration::from_secs(15), || {
+            follow_if_changed(&mut window);
+            !window.mirror.is_running()
+        });
+        assert_eq!(window.status.text(), "Waiting for card display");
+
+        drop(unplugged);
+        wait_for("the mirror to come back", Duration::from_secs(30), || {
+            follow_if_changed(&mut window);
+            window.mirror.is_running()
+        });
+        assert_eq!(window.status.text(), "Running");
+        let back = window
+            .monitors
+            .iter()
+            .find(|monitor| monitor.device_path == card_display.device_path)
+            .unwrap();
+        println!(
+            "card display {} came back as {}",
+            card_display.gdi_name, back.gdi_name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        follow_if_changed(&mut window);
+        assert!(
+            window.mirror.is_running(),
+            "the mirror ended after the replug"
+        );
+    }
 }

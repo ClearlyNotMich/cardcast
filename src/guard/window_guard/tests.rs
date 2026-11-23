@@ -2,11 +2,12 @@
 //! The child is this test binary re-run on the ignored `test_window_process` test.
 
 use super::*;
+use crate::guard::{Guard as _, Monitor, second_monitor};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SendMessageTimeoutW, ShowWindow,
-    TranslateMessage, WM_NULL, WS_OVERLAPPEDWINDOW,
+    GetForegroundWindow, SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SWP_NOSIZE, SendMessageTimeoutW,
+    ShowWindow, TranslateMessage, WM_NULL, WS_OVERLAPPEDWINDOW,
 };
 
 const CHILD_MODE: &str = "CARDCAST_TEST_WINDOW";
@@ -231,4 +232,133 @@ fn guard_calls_on_a_hung_window_return_in_time() {
     });
     let title = finished.recv_timeout(CALL_LIMIT).unwrap();
     assert_eq!(title, TITLE);
+}
+
+/// A running window guard sending windows from `card_display` to `send_windows_to`.
+fn guard_on(card_display: &Monitor, send_windows_to: &Monitor) -> WindowGuard {
+    let mut guard = WindowGuard::new(|| {});
+    guard.update(
+        true,
+        Some(&card_display.device_path),
+        Some(&send_windows_to.device_path),
+    );
+    guard
+}
+
+/// Whether the centre of `frame` is on `monitor`.
+fn on(monitor: &Monitor, frame: Rect) -> bool {
+    let (x, y) = (
+        (frame.left + frame.right) / 2,
+        (frame.top + frame.bottom) / 2,
+    );
+    let right = monitor.left + i32::try_from(monitor.width).unwrap();
+    let bottom = monitor.top + i32::try_from(monitor.height).unwrap();
+    (monitor.left..right).contains(&x) && (monitor.top..bottom).contains(&y)
+}
+
+fn frame(window: HWND) -> Rect {
+    read_window(window).unwrap().0.frame
+}
+
+/// Moves `window` onto `monitor` the way a user would, keeping its size.
+fn move_onto(window: HWND, monitor: &Monitor) {
+    // SAFETY: a plain move of a window that is alive and pumping in the child process.
+    unsafe {
+        SetWindowPos(
+            window,
+            None,
+            monitor.left + 50,
+            monitor.top + 50,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    }
+    .unwrap();
+    assert!(on(monitor, frame(window)), "the window did not move there");
+}
+
+#[test]
+fn second_monitor_window_moved_onto_the_card_display_is_returned() {
+    let Some((primary, card_display)) = second_monitor::monitors() else {
+        return;
+    };
+    let _guard = guard_on(&card_display, &primary);
+    let test = TestWindow::spawn(true);
+    let before = foreground();
+    move_onto(test.window, &card_display);
+    wait_for("window returned to the primary monitor", || {
+        on(&primary, frame(test.window))
+    });
+    assert_eq!(
+        foreground(),
+        before,
+        "returning changed the foreground window"
+    );
+}
+
+#[test]
+fn second_monitor_window_on_the_card_display_at_guard_start_is_returned() {
+    let Some((primary, card_display)) = second_monitor::monitors() else {
+        return;
+    };
+    let test = TestWindow::spawn(true);
+    move_onto(test.window, &card_display);
+    let _guard = guard_on(&card_display, &primary);
+    wait_for("window returned to the primary monitor", || {
+        on(&primary, frame(test.window))
+    });
+}
+
+#[test]
+fn second_monitor_maximised_window_stays_maximised_on_return() {
+    let Some((primary, card_display)) = second_monitor::monitors() else {
+        return;
+    };
+    let test = TestWindow::spawn(true);
+    move_onto(test.window, &card_display);
+    // SAFETY: plain call on a window that exists until `test` drops.
+    let _ = unsafe { ShowWindow(test.window, SW_SHOWMAXIMIZED) };
+    wait_for("window maximised on the card display", || {
+        // SAFETY: plain flag read.
+        unsafe { IsZoomed(test.window) }.as_bool() && on(&card_display, frame(test.window))
+    });
+    let _guard = guard_on(&card_display, &primary);
+    wait_for("window returned to the primary monitor", || {
+        on(&primary, frame(test.window))
+    });
+    let (state, _) = read_window(test.window).unwrap();
+    assert!(
+        state.maximised,
+        "the returned window is no longer maximised"
+    );
+    assert!(
+        on(&primary, state.restore),
+        "restore position left on the card display"
+    );
+}
+
+fn pointer() -> (i32, i32) {
+    let mut pointer = POINT::default();
+    // SAFETY: pointer is a valid POINT.
+    unsafe { GetCursorPos(&mut pointer) }.unwrap();
+    (pointer.x, pointer.y)
+}
+
+#[test]
+fn second_monitor_pointer_is_put_back_off_the_card_display() {
+    let Some((primary, card_display)) = second_monitor::monitors() else {
+        return;
+    };
+    let _guard = guard_on(&card_display, &primary);
+    let off_card = (primary.left + 100, primary.top + 100);
+    // SAFETY: plain call; moving the pointer has no memory effects.
+    unsafe { SetCursorPos(off_card.0, off_card.1) }.unwrap();
+    // Let the pointer guard see the off-card position.
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: as above.
+    unsafe { SetCursorPos(card_display.left + 100, card_display.top + 100) }.unwrap();
+    wait_for("pointer back at its last off-card position", || {
+        pointer() == off_card
+    });
 }

@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11DeviceContext,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT;
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1};
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, UpdateWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -28,11 +28,42 @@ fn device() -> (ID3D11Device, ID3D11DeviceContext1, IDXGIOutput) {
     let adapter = unsafe { factory.EnumAdapters1(0) }.unwrap();
     // SAFETY: as above.
     let output = unsafe { adapter.EnumOutputs(0) }.unwrap();
+    device_on(&adapter, output)
+}
+
+/// The output showing the monitor with GDI name `gdi_name`, on whichever graphics card owns it.
+fn output_named(gdi_name: &str) -> (IDXGIAdapter1, IDXGIOutput) {
+    // SAFETY: plain factory creation.
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.unwrap();
+    for adapter_index in 0.. {
+        // SAFETY: plain enumeration; it fails past the last graphics card, and so does the test.
+        let adapter = unsafe { factory.EnumAdapters1(adapter_index) }
+            .unwrap_or_else(|_| panic!("no output shows {gdi_name}"));
+        for output_index in 0.. {
+            // SAFETY: as above, per output.
+            let Ok(output) = (unsafe { adapter.EnumOutputs(output_index) }) else {
+                break;
+            };
+            // SAFETY: plain description read.
+            let name = unsafe { output.GetDesc() }.unwrap().DeviceName;
+            if crate::guard::wide_to_string(&name).eq_ignore_ascii_case(gdi_name) {
+                return (adapter, output);
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// A device on `adapter`, returned with `output`.
+fn device_on(
+    adapter: &IDXGIAdapter1,
+    output: IDXGIOutput,
+) -> (ID3D11Device, ID3D11DeviceContext1, IDXGIOutput) {
     let (mut device, mut context) = (None, None);
     // SAFETY: out pointers are valid locals; an explicit adapter needs D3D_DRIVER_TYPE_UNKNOWN.
     unsafe {
         D3D11CreateDevice(
-            &adapter,
+            adapter,
             D3D_DRIVER_TYPE_UNKNOWN,
             Default::default(),
             D3D11_CREATE_DEVICE_BGRA_SUPPORT,
@@ -226,23 +257,44 @@ impl Drop for ColourWindow {
 fn duplicating_the_monitor_draws_its_colour() {
     let _duplicating = duplicating();
     let monitor = crate::guard::monitors().unwrap().remove(0);
+    let (device, context, output) = device();
+    duplicate_and_check_colour(&monitor, &device, &context, &output);
+}
+
+#[test]
+fn second_monitor_duplicating_it_draws_its_colour() {
+    let Some((_, second)) = crate::guard::second_monitor::monitors() else {
+        return;
+    };
+    let _duplicating = duplicating();
+    let (adapter, output) = output_named(&second.gdi_name);
+    let (device, context, output) = device_on(&adapter, output);
+    duplicate_and_check_colour(&second, &device, &context, &output);
+}
+
+/// Covers `monitor` with a colour, duplicates `output` (that monitor's) and checks the colour arrives.
+fn duplicate_and_check_colour(
+    monitor: &crate::guard::Monitor,
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext1,
+    output: &IDXGIOutput,
+) {
     // Keep the pointer away from the pixel that is checked.
     // SAFETY: plain call.
     let _ = unsafe { SetCursorPos(monitor.left, monitor.top) };
     // RGB(200, 40, 120); COLORREF is 0x00BBGGRR.
-    let window = ColourWindow::cover(&monitor, COLORREF(0x0078_28c8));
-    let (device, context, output) = device();
-    let mut desktop = Desktop::open(&device, &output, &monitor.device_path).unwrap();
+    let window = ColourWindow::cover(monitor, COLORREF(0x0078_28c8));
+    let mut desktop = Desktop::open(device, output, &monitor.device_path).unwrap();
     let size = (monitor.width, monitor.height);
-    let (texture, target) = render_target(&device, size);
+    let (texture, target) = render_target(device, size);
     let centre = (size.0 / 2, size.1 / 2);
     let mut got = [0; 4];
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         window.pump();
         let fit = crate::mirror::fit(desktop.size(), size);
-        desktop.draw(&context, &target, fit).unwrap();
-        got = pixel(&device, &context, &texture, centre);
+        desktop.draw(context, &target, fit).unwrap();
+        got = pixel(device, context, &texture, centre);
         if got[..3] == [120, 40, 200] {
             break;
         }
