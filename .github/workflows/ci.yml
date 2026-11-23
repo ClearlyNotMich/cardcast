@@ -54,48 +54,8 @@ jobs:
       - name: Install the virtual display driver (VirtualDrivers/Virtual-Display-Driver 24.10.27)
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          Invoke-WebRequest https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/24.10.27/VirtualDisplayDriver-x64.zip -OutFile vdd.zip
-          if ((Get-FileHash vdd.zip -Algorithm SHA256).Hash -ne 'B7A36F341F2A0CE43CC2AFE7894D30DD8FEF7B6F60EF9491AAB2EF77663A42FD') { throw 'sha256 mismatch' }
-          Expand-Archive vdd.zip -DestinationPath vdd
-          $pkg = "$PWD\vdd\VirtualDisplayDriver"
-          Import-Certificate "$pkg\Virtual_Display_Driver.cer" -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-          Import-Certificate "$pkg\Virtual_Display_Driver.cer" -CertStoreLocation Cert:\LocalMachine\TrustedPublisher | Out-Null
-          New-Item -ItemType Directory C:\VirtualDisplayDriver -Force | Out-Null
-          # Two virtual monitors on one virtual graphics card: a source monitor and a card display.
-          (Get-Content "$pkg\vdd_settings.xml") -replace '<count>1</count>', '<count>2</count>' | Set-Content C:\VirtualDisplayDriver\vdd_settings.xml
-          Add-Type -TypeDefinition @'
-          using System; using System.Runtime.InteropServices;
-          public static class Dev {
-            [StructLayout(LayoutKind.Sequential)] public struct SP_DEVINFO_DATA { public int cbSize; public Guid ClassGuid; public int DevInst; public IntPtr Reserved; }
-            [DllImport("setupapi.dll", SetLastError=true)] static extern IntPtr SetupDiCreateDeviceInfoList(ref Guid g, IntPtr h);
-            [DllImport("setupapi.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool SetupDiCreateDeviceInfoW(IntPtr s, string name, ref Guid g, string desc, IntPtr h, int flags, ref SP_DEVINFO_DATA d);
-            [DllImport("setupapi.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool SetupDiSetDeviceRegistryPropertyW(IntPtr s, ref SP_DEVINFO_DATA d, int prop, byte[] buf, int size);
-            [DllImport("setupapi.dll", SetLastError=true)] static extern bool SetupDiCallClassInstaller(int fn, IntPtr s, ref SP_DEVINFO_DATA d);
-            [DllImport("newdev.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool UpdateDriverForPlugAndPlayDevicesW(IntPtr h, string hwid, string inf, int flags, out bool reboot);
-            public static string Install(string hwid, string inf) {
-              Guid g = new Guid("4d36e968-e325-11ce-bfc1-08002be10318");
-              IntPtr s = SetupDiCreateDeviceInfoList(ref g, IntPtr.Zero);
-              var d = new SP_DEVINFO_DATA(); d.cbSize = Marshal.SizeOf(d);
-              if (!SetupDiCreateDeviceInfoW(s, "Display", ref g, null, IntPtr.Zero, 1, ref d)) return "create " + Marshal.GetLastWin32Error();
-              byte[] b = System.Text.Encoding.Unicode.GetBytes(hwid + "\0\0");
-              if (!SetupDiSetDeviceRegistryPropertyW(s, ref d, 1, b, b.Length)) return "hwid " + Marshal.GetLastWin32Error();
-              if (!SetupDiCallClassInstaller(0x19, s, ref d)) return "register " + Marshal.GetLastWin32Error();
-              bool r; if (!UpdateDriverForPlugAndPlayDevicesW(IntPtr.Zero, hwid, inf, 1, out r)) return "update " + Marshal.GetLastWin32Error();
-              return "ok reboot=" + r;
-            }
-          }
-          '@
-          $result = [Dev]::Install('Root\MttVDD', "$pkg\MttVDD.inf")
-          if ($result -ne 'ok reboot=False') { throw "driver install: $result" }
-          Add-Type -AssemblyName System.Windows.Forms
-          $deadline = (Get-Date).AddSeconds(60)
-          while ([System.Windows.Forms.Screen]::AllScreens.Count -lt 3) {
-            if ((Get-Date) -gt $deadline) { throw 'the two virtual monitors did not appear' }
-            Start-Sleep -Milliseconds 500
-          }
-          [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { "$($_.DeviceName) $($_.Bounds) primary=$($_.Primary)" }
-          $id = (Get-PnpDevice | Where-Object HardwareID -contains 'Root\MttVDD').InstanceId
+          # Broken on purpose: no driver installed, the variable still set.
+          $id = 'none'
           "CARDCAST_SECOND_MONITOR=$id" >> $env:GITHUB_ENV
       # One at a time: the tests share the monitors, and one unplugs the second monitor.
       - run: cargo test second_monitor -- --test-threads=1
