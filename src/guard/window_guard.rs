@@ -21,12 +21,12 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWi
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_MINIMIZEEND,
-    EnumWindows, GA_ROOT, GWL_EXSTYLE, GetAncestor, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    GetWindowPlacement, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, IsZoomed, KillTimer, MSG, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW,
-    PostThreadMessageW, RegisterClassW, SW_SHOWMAXIMIZED, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE,
-    SWP_NOOWNERZORDER, SWP_NOZORDER, SetCursorPos, SetTimer, SetWindowPlacement, SetWindowPos,
-    WINDOW_EX_STYLE, WINDOWPLACEMENT, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    EnumWindows, GA_ROOT, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowThreadProcessId,
+    InternalGetWindowText, IsIconic, IsWindowVisible, IsZoomed, KillTimer, MSG, OBJID_WINDOW,
+    PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW, SW_SHOWMAXIMIZED,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetCursorPos, SetTimer,
+    SetWindowPlacement, SetWindowPos, WINDOW_EX_STYLE, WINDOWPLACEMENT, WINEVENT_OUTOFCONTEXT,
     WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW, WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW,
     WS_OVERLAPPED,
 };
@@ -196,7 +196,7 @@ fn run(
                 Some(on_event),
                 0,
                 0,
-                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                WINEVENT_OUTOFCONTEXT,
             )
         }
     };
@@ -564,7 +564,7 @@ fn read_window(window: HWND) -> Option<(WindowState, Rect)> {
             hidden: !IsWindowVisible(window).as_bool(),
             cloaked,
             tool: GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW.0 as isize != 0,
-            own: process_id == GetCurrentProcessId(),
+            mirror: placement::is_mirror(process_id == GetCurrentProcessId(), &class_name(window)),
         }
     };
     Some((state, rect(window_rect)))
@@ -579,10 +579,18 @@ fn rect(rect: RECT) -> Rect {
     }
 }
 
+fn class_name(window: HWND) -> String {
+    let mut name = [0u16; 256];
+    // SAFETY: name is a writable buffer; reads the class without messaging the window.
+    let length = unsafe { GetClassNameW(window, &mut name) };
+    let length = usize::try_from(length).unwrap_or(0);
+    String::from_utf16_lossy(&name[..length])
+}
+
 fn window_title(window: HWND) -> String {
     let mut title = [0u16; 256];
-    // SAFETY: title is a writable buffer; for another program's window this reads cached text without messaging it.
-    let length = unsafe { GetWindowTextW(window, &mut title) };
+    // SAFETY: title is a writable buffer; reads the stored caption without messaging, even for cardcast's own windows.
+    let length = unsafe { InternalGetWindowText(window, &mut title) };
     let length = usize::try_from(length).unwrap_or(0);
     String::from_utf16_lossy(&title[..length])
 }

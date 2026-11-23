@@ -165,13 +165,26 @@ pub fn starts_on_launch(settings: &Settings) -> bool {
 }
 
 /// The user's choices. Monitors are stored by their display-configuration device path.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub source_monitor: Option<String>,
     pub card_display: Option<String>,
     pub send_windows_to: Option<String>,
     pub audio_source: Option<String>,
     pub guard_enabled: bool,
+}
+
+impl Default for Settings {
+    /// The guard is on: it does nothing until the card display is chosen.
+    fn default() -> Self {
+        Self {
+            source_monitor: None,
+            card_display: None,
+            send_windows_to: None,
+            audio_source: None,
+            guard_enabled: true,
+        }
+    }
 }
 
 impl Settings {
@@ -265,6 +278,13 @@ mod tests {
             guard_enabled: true,
         };
         assert_eq!(Settings::from_text(&saved.to_text()), saved);
+    }
+
+    #[test]
+    fn guard_is_on_in_a_fresh_settings_file() {
+        assert!(Settings::default().guard_enabled);
+        assert!(Settings::from_text("").guard_enabled);
+        assert!(!Settings::from_text("guard_enabled=false\n").guard_enabled);
     }
 
     fn monitor(device_path: &str, primary: bool) -> Monitor {
