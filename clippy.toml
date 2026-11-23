@@ -1,1 +1,6 @@
 allow-unwrap-in-tests = true
+disallowed-macros = [
+    { path = "std::debug_assert", reason = "gone in release; CODING_STANDARDS rule 3: use assert! if soundness depends on it" },
+    { path = "std::debug_assert_eq", reason = "gone in release; CODING_STANDARDS rule 3: use assert_eq! if soundness depends on it" },
+    { path = "std::debug_assert_ne", reason = "gone in release; CODING_STANDARDS rule 3: use assert_ne! if soundness depends on it" },
+]
