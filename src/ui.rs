@@ -97,10 +97,12 @@ impl SettingsWindow {
         }
     }
 
-    /// The one place the mirror starts: Start, launch and the card display coming back all call it.
-    /// Audio starts with it.
+    /// The one place the mirror starts: Start, launch, a restart, a changed choice and a monitor
+    /// coming back all call it. Audio starts with it; a running mirror and audio stop first.
     fn start(&mut self) {
+        self.mirror.stop();
         self.relay.stop();
+        self.restart_at = Instant::now() + RESTART_EVERY;
         self.status.set_mirror(settings::start(
             &self.settings,
             &self.monitors,
@@ -141,7 +143,6 @@ impl SettingsWindow {
             if wait.is_zero() {
                 self.start();
                 self.status.mirror = settings::restarted(self.status.mirror.clone());
-                self.restart_at = Instant::now() + RESTART_EVERY;
             }
             if matches!(self.status.mirror, Status::Restarting(_)) {
                 context.request_repaint_after(
@@ -172,7 +173,7 @@ impl SettingsWindow {
         self.follow_reports();
     }
 
-    /// Re-reads the monitors after a display change and follows the card display.
+    /// Re-reads the monitors after a display change and follows the source monitor and card display.
     fn follow_displays(&mut self) {
         match guard::monitors() {
             Ok(monitors) => self.follow_monitors(monitors),
@@ -181,23 +182,35 @@ impl SettingsWindow {
     }
 
     fn follow_monitors(&mut self, monitors: Vec<Monitor>) {
-        let card = |monitors: &[Monitor]| {
-            monitors
-                .iter()
-                .find(|monitor| self.settings.card_display.as_ref() == Some(&monitor.device_path))
-                .cloned()
+        let chosen = |monitors: &'_ [Monitor]| {
+            [&self.settings.source_monitor, &self.settings.card_display].map(|chosen| {
+                monitors
+                    .iter()
+                    .find(|monitor| chosen.as_ref() == Some(&monitor.device_path))
+                    .cloned()
+            })
         };
-        let follow = settings::follow_card_display(
+        let (before, now) = (chosen(&self.monitors), chosen(&monitors));
+        let follow = settings::follow_displays(
             self.status.shows_stop(),
             self.mirror.is_running(),
-            card(&self.monitors).as_ref(),
-            card(&monitors).as_ref(),
+            before.each_ref().map(Option::as_ref),
+            now.each_ref().map(Option::as_ref),
         );
         self.monitors = monitors;
         match follow {
             Follow::Start => self.start(),
-            Follow::Stop => self.stop(Status::WaitingForCardDisplay),
+            Follow::Stop(status) => self.stop(status),
             Follow::Nothing => {}
+        }
+    }
+
+    /// Applies changed choices at once: the guard takes them, and a mirror that runs or will
+    /// start by itself restarts on the new monitors and audio source.
+    fn follow_settings(&mut self, before: &Settings) {
+        update_guard(&mut *self.guard, &self.settings);
+        if settings::restarts_on_change(self.status.shows_stop(), before, &self.settings) {
+            self.start();
         }
     }
 
@@ -301,10 +314,15 @@ impl eframe::App for SettingsWindow {
             }
         });
         if self.settings != before {
-            update_guard(&mut *self.guard, &self.settings);
+            self.follow_settings(&before);
             if let Err(error) = self.settings.save() {
                 self.status.other = Some(error);
             }
+        }
+        // Start and a changed choice can leave a restart waiting; `logic` runs it on time from here.
+        if matches!(self.status.mirror, Status::Restarting(_)) {
+            ui.ctx()
+                .request_repaint_after(self.restart_at.saturating_duration_since(Instant::now()));
         }
     }
 }
@@ -336,12 +354,17 @@ mod tests {
         }
     }
 
-    /// Hands out `reports`, latest last.
+    /// Hands out `reports`, latest last, and remembers the card display it was last given.
     #[derive(Default, Clone)]
-    struct ReportingGuard(std::rc::Rc<std::cell::RefCell<Vec<GuardReport>>>);
+    struct ReportingGuard(
+        std::rc::Rc<std::cell::RefCell<Vec<GuardReport>>>,
+        std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    );
 
     impl Guard for ReportingGuard {
-        fn update(&mut self, _enabled: bool, _card: Option<&str>, _send_windows_to: Option<&str>) {}
+        fn update(&mut self, _enabled: bool, card: Option<&str>, _send_windows_to: Option<&str>) {
+            *self.1.borrow_mut() = card.map(str::to_owned);
+        }
         fn take_report(&mut self) -> Option<GuardReport> {
             self.0.borrow_mut().pop()
         }
@@ -445,16 +468,14 @@ mod tests {
         assert_eq!(*relay.0.borrow(), ["stop"]);
     }
 
-    /// The settings window as `run` builds it, with the real mirror and display watcher.
+    /// The settings window as `run` builds it, with the real mirror and display watcher, mirroring
+    /// `source_monitor` onto `card_display`, and the guard it was handed.
     #[cfg(windows)]
-    #[test]
-    fn second_monitor_unplug_waits_for_the_card_display_and_replug_brings_the_mirror_back() {
-        use guard::second_monitor::{Unplugged, wait_for};
-        // The two virtual monitors share a graphics card, as SPEC section 1 needs.
-        let Some(monitors) = guard::second_monitor::monitors(3) else {
-            return;
-        };
-        let (source_monitor, card_display) = (monitors[1].clone(), monitors[2].clone());
+    fn on_second_monitors(
+        monitors: Vec<Monitor>,
+        source_monitor: &Monitor,
+        card_display: &Monitor,
+    ) -> (SettingsWindow, ReportingGuard) {
         let displays_changed = Arc::new(AtomicBool::new(false));
         let display_watcher = {
             let displays_changed = displays_changed.clone();
@@ -463,9 +484,10 @@ mod tests {
                     .unwrap(),
             )
         };
-        let mut window = SettingsWindow {
+        let guard = ReportingGuard::default();
+        let window = SettingsWindow {
             settings: Settings {
-                source_monitor: Some(source_monitor.device_path),
+                source_monitor: Some(source_monitor.device_path.clone()),
                 card_display: Some(card_display.device_path.clone()),
                 ..Settings::default()
             },
@@ -475,10 +497,23 @@ mod tests {
             restart_at: Instant::now(),
             mirror: mirror::new_mirror(|| {}),
             relay: Box::new(RecordingRelay::default()),
-            guard: Box::new(ReportingGuard::default()),
+            guard: Box::new(guard.clone()),
             displays_changed,
             _display_watcher: display_watcher,
         };
+        (window, guard)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn second_monitor_unplug_waits_for_the_card_display_and_replug_brings_the_mirror_back() {
+        use guard::second_monitor::{Unplugged, wait_for};
+        // The two virtual monitors share a graphics card, as SPEC section 1 needs.
+        let Some(monitors) = guard::second_monitor::monitors(3) else {
+            return;
+        };
+        let (source_monitor, card_display) = (monitors[1].clone(), monitors[2].clone());
+        let (mut window, _guard) = on_second_monitors(monitors, &source_monitor, &card_display);
         let context = egui::Context::default();
         window.start();
         assert_eq!(window.status.text(), "Running");
@@ -513,6 +548,76 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn second_monitor_source_monitor_unplug_says_so_and_replug_brings_the_mirror_back() {
+        use guard::second_monitor::{Unplugged, wait_for};
+        let Some(monitors) = guard::second_monitor::monitors(3) else {
+            return;
+        };
+        let (source_monitor, card_display) = (monitors[1].clone(), monitors[2].clone());
+        let (mut window, _guard) = on_second_monitors(monitors, &source_monitor, &card_display);
+        let context = egui::Context::default();
+        window.start();
+        assert_eq!(window.status.text(), "Running");
+
+        let unplugged = Unplugged::monitor(&source_monitor.device_path);
+        wait_for(
+            "Waiting for source monitor",
+            Duration::from_secs(15),
+            || {
+                window.follow(&context);
+                window.status.mirror == Status::WaitingForSourceMonitor
+            },
+        );
+        assert!(!window.mirror.is_running(), "the mirror still runs");
+        assert!(window.status.shows_stop(), "the mirror won't come back");
+
+        drop(unplugged);
+        wait_for("the mirror to come back", Duration::from_secs(30), || {
+            window.follow(&context);
+            window.mirror.is_running() && window.status.mirror == Status::Running
+        });
+        std::thread::sleep(Duration::from_secs(1));
+        window.follow(&context);
+        assert!(
+            window.mirror.is_running(),
+            "the mirror ended after the replug"
+        );
+        assert_eq!(window.status.text(), "Running");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn second_monitor_dropdown_change_while_running_moves_the_mirror_and_the_guard_at_once() {
+        let Some(monitors) = guard::second_monitor::monitors(3) else {
+            return;
+        };
+        let (first, second) = (monitors[1].clone(), monitors[2].clone());
+        let (mut window, guard) = on_second_monitors(monitors, &first, &second);
+        window.start();
+        assert_eq!(window.status.text(), "Running");
+        assert_eq!(mirror::shown_at(), Some((second.left, second.top)));
+
+        // Swap them: the old source monitor becomes the card display.
+        let before = window.settings.clone();
+        window.settings.source_monitor = Some(second.device_path.clone());
+        window.settings.card_display = Some(first.device_path.clone());
+        window.follow_settings(&before);
+        assert_eq!(window.status.text(), "Running");
+        assert!(window.mirror.is_running(), "the mirror did not restart");
+        assert_eq!(
+            mirror::shown_at(),
+            Some((first.left, first.top)),
+            "the mirror window is not on the new card display"
+        );
+        assert_eq!(
+            guard.1.borrow().as_deref(),
+            Some(first.device_path.as_str()),
+            "the guard guards another card display than the mirror shows on"
+        );
+    }
+
     #[test]
     fn audio_problem_keeps_the_stop_button_and_clears_when_audio_recovers() {
         let (mut window, relay) = with_relay(window("card"), Some("speakers"));
@@ -535,7 +640,112 @@ mod tests {
         window.mirror = Box::new(StandInMirror {
             running: true,
             end: Some(end),
+            fail_start: None,
         });
+    }
+
+    fn fails_to_start(window: &mut SettingsWindow, failure: Ended) {
+        window.mirror = Box::new(StandInMirror {
+            fail_start: Some(failure),
+            ..StandInMirror::default()
+        });
+    }
+
+    #[test]
+    fn transient_capture_failure_at_launch_is_retried_without_clicks() {
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        fails_to_start(&mut window, Ended::Restart("secure desktop".into()));
+        assert!(!launched_minimised(&mut window));
+        assert_eq!(window.status.text(), "secure desktop");
+        assert!(window.status.shows_stop());
+        assert!(!window.mirror.is_running());
+        // The retry waits for the restart timer.
+        window.follow_mirror(&egui::Context::default());
+        assert!(!window.mirror.is_running());
+        window.restart_at = Instant::now();
+        window.follow_mirror(&egui::Context::default());
+        assert!(window.mirror.is_running());
+        assert_eq!(window.status.text(), "Running");
+        assert_eq!(
+            relay.0.borrow().last().map(String::as_str),
+            Some("start speakers to card")
+        );
+    }
+
+    #[test]
+    fn permanent_capture_failure_at_launch_stops() {
+        let mut window = window("card");
+        fails_to_start(&mut window, Ended::Stop("driver too old".into()));
+        window.launch(&egui::Context::default());
+        assert_eq!(window.status.text(), "driver too old");
+        assert!(!window.status.shows_stop());
+        window.restart_at = Instant::now();
+        window.follow_mirror(&egui::Context::default());
+        assert!(!window.mirror.is_running());
+        assert_eq!(window.status.text(), "driver too old");
+    }
+
+    #[test]
+    fn source_monitor_lost_says_so_and_the_mirror_returns_with_it() {
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        window.start();
+        let all = window.monitors.clone();
+        let without_source = vec![all[1].clone()];
+        window.follow_monitors(without_source);
+        assert!(!window.mirror.is_running());
+        assert_eq!(window.status.text(), "Waiting for source monitor");
+        assert!(window.status.shows_stop());
+        assert_eq!(relay.0.borrow().last().map(String::as_str), Some("stop"));
+        window.follow_monitors(all);
+        assert!(window.mirror.is_running());
+        assert_eq!(window.status.text(), "Running");
+        assert_eq!(
+            relay.0.borrow().last().map(String::as_str),
+            Some("start speakers to card")
+        );
+    }
+
+    #[test]
+    fn dropdown_change_while_running_moves_the_mirror_audio_and_guard_at_once() {
+        let guard = ReportingGuard::default();
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        window.guard = Box::new(guard.clone());
+        window.monitors.push(monitor("card 2", false));
+        window.start();
+        let before = window.settings.clone();
+        window.settings.card_display = Some("card 2".into());
+        window.follow_settings(&before);
+        assert!(window.mirror.is_running());
+        assert_eq!(window.status.text(), "Running");
+        assert_eq!(
+            relay.0.borrow().last().map(String::as_str),
+            Some("start speakers to card 2")
+        );
+        assert_eq!(guard.1.borrow().as_deref(), Some("card 2"));
+    }
+
+    #[test]
+    fn refused_dropdown_change_stops_the_running_mirror() {
+        let mut window = window("card");
+        window.start();
+        let before = window.settings.clone();
+        window.settings.card_display = Some("source".into());
+        window.follow_settings(&before);
+        assert!(!window.mirror.is_running());
+        assert_eq!(
+            window.status.text(),
+            "The source monitor and the card display must be different monitors."
+        );
+    }
+
+    #[test]
+    fn dropdown_change_leaves_a_stopped_mirror_stopped() {
+        let mut window = window("card");
+        let before = window.settings.clone();
+        window.settings.source_monitor = Some("card".into());
+        window.follow_settings(&before);
+        assert!(!window.mirror.is_running());
+        assert_eq!(window.status.text(), "Stopped");
     }
 
     #[test]

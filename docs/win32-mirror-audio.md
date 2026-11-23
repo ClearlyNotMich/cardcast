@@ -46,6 +46,9 @@ Do: copy the frame into your own texture, then release it before the next acquir
 - `GetFramePointerShape` and the other frame calls return the same error. [GetFramePointerShape](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_2/nf-dxgi1_2-idxgioutputduplication-getframepointershape)
 - Re-creating can fail with `E_ACCESSDENIED` (only `LOCAL_SYSTEM` can read the secure desktop) or `DXGI_ERROR_UNSUPPORTED` (unsupported mode); the app can then wait for a mode change and retry. [DuplicateOutput1](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgioutput5-duplicateoutput1)
 
+- `DuplicateOutput1` also returns `DXGI_ERROR_NOT_CURRENTLY_AVAILABLE` when the most processes allowed already duplicate the output, and `DXGI_ERROR_SESSION_DISCONNECTED` while the session is disconnected; both can pass. `E_INVALIDARG` means the device is not on the output's graphics card. [DuplicateOutput1](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_5/nf-dxgi1_5-idxgioutput5-duplicateoutput1)
+- No Microsoft page lists every code a monitor or graphics card going away can return. cardcast therefore restarts the mirror on any HRESULT except those of a bug or a missing capability (`E_OUTOFMEMORY`, `E_NOINTERFACE`, `E_NOTIMPL`, `E_POINTER`, `E_UNEXPECTED`); see `mirror::ended` and issue #20.
+
 Do: on `ACCESS_LOST`, drop the duplication and retry creation on a timer until it succeeds. Don't: treat `E_ACCESSDENIED` during a prompt as fatal.
 
 ## DXGI Desktop Duplication: pointer

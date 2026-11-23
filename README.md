@@ -37,11 +37,11 @@ The settings window has these controls. Each monitor dropdown shows the monitor'
 - **Audio source**: the playback device whose sound goes to the capture card.
 - **Start / Stop**: starts or stops the mirror. Audio starts and stops with it.
 - **Guard**: turns the window guard and the pointer guard on and off together. On by default; it does nothing until the card display is chosen. The guard works whether or not the mirror is running.
-- **Status line**: shows "Running", "Waiting for card display", "Stopped", or the last error in plain words, followed by any audio or guard problem. A mirror stopped by an error stays stopped until you press Start.
+- **Status line**: shows "Running", "Waiting for card display", "Waiting for source monitor", "Stopped", or the last error in plain words, followed by any audio or guard problem. While the button shows Stop, the mirror runs or starts again by itself; a mirror stopped by an error stays stopped until you press Start.
 
-Choices are saved when you change them. On launch the mirror starts by itself, and the window starts minimised if it does. Closing the window quits cardcast.
+Choices are saved when you change them. Changing the source monitor, card display or audio source while the mirror runs or waits restarts it on the new choice at once. On launch the mirror starts by itself, and the window starts minimised if it does. Closing the window quits cardcast.
 
-If the capture card is unplugged, the mirror stops and waits. When it is plugged back in, the mirror and audio resume by themselves.
+If the capture card or the source monitor is unplugged, the mirror stops and the status line says which one it waits for. When it is plugged back in, the mirror and audio resume by themselves.
 
 ## Window guard and pointer guard
 
@@ -67,7 +67,7 @@ To choose which programs go to the capture card, use Windows' own per-app sound 
 - Changing the SDR content brightness slider in Windows while the mirror runs has no effect until the mirror is restarted.
 - A rotated (portrait) source monitor shows un-rotated in the mirror.
 - Pointer pixels that normally invert the screen are drawn black, so such a pointer can vanish on dark scenes.
-- If the mirror loses the graphics card (driver update or reset, mode change), it restarts by itself every second until it runs again. Any other failure stops it with the reason in the status line; press Start to try again.
+- If the mirror can't start or is interrupted for a reason that can pass (a monitor or graphics card going away, a driver reset, a mode change, a permission prompt), it tries again every second and the status line says why. A failure that can't pass (Windows or the graphics driver too old, the source monitor and card display on different graphics cards, a fault in cardcast) stops it with the reason; press Start to try again.
 - The primary monitor is taken to be the one at the top-left corner (0,0) of the Windows desktop. Not yet confirmed on the sender.
 - The card display's sound output is found by matching its name to the monitor's name. Not yet confirmed on the sender or on any capture card.
 

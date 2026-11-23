@@ -1,7 +1,7 @@
 //! Settings model: saved choices, start-up refusal rules and the status line. No Windows calls.
 
 use crate::guard::{GuardReport, Monitor};
-use crate::mirror::Mirror;
+use crate::mirror::{Ended, Mirror};
 
 /// What the mirror is doing; it alone decides the Start/Stop button.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,7 +9,8 @@ pub enum Status {
     Stopped,
     Running,
     WaitingForCardDisplay,
-    /// The mirror ended on its own and is being started again; why, in plain words.
+    WaitingForSourceMonitor,
+    /// The mirror failed to start or ended on its own and is being started again; why, in plain words.
     Restarting(String),
     /// The mirror is stopped by this error, in plain words.
     Error(String),
@@ -21,6 +22,7 @@ impl Status {
             Self::Stopped => "Stopped".into(),
             Self::Running => "Running".into(),
             Self::WaitingForCardDisplay => "Waiting for card display".into(),
+            Self::WaitingForSourceMonitor => "Waiting for source monitor".into(),
             Self::Restarting(message) | Self::Error(message) => message.clone(),
         }
     }
@@ -123,11 +125,12 @@ pub fn start(settings: &Settings, monitors: &[Monitor], mirror: &mut dyn Mirror)
         return Status::Error("The card display can't be the primary monitor.".into());
     }
     let Some(source_monitor) = find(source_path) else {
-        return Status::Error("The source monitor is not connected.".into());
+        return Status::WaitingForSourceMonitor;
     };
     match mirror.start(source_monitor, card_display) {
         Ok(()) => Status::Running,
-        Err(message) => Status::Error(message),
+        Err(Ended::Restart(message)) => Status::Restarting(message),
+        Err(Ended::Stop(message)) => Status::Error(message),
     }
 }
 
@@ -135,28 +138,37 @@ pub fn start(settings: &Settings, monitors: &[Monitor], mirror: &mut dyn Mirror)
 #[derive(Debug, PartialEq, Eq)]
 pub enum Follow {
     Nothing,
-    /// (Re)start it: the card display came back or changed, or the mirror ended on its own.
+    /// (Re)start it: a monitor came back or changed, or the mirror ended on its own.
     Start,
-    /// Stop it and wait: the card display is gone.
-    Stop,
+    /// Stop it with this waiting status: the source monitor or card display is gone.
+    Stop(Status),
 }
 
 /// `wanted` is whether the mirror runs or will start by itself ([`StatusLine::shows_stop`]), so a
-/// mirror stopped by Stop or an error stays stopped; `before` and `now` are the card display in the
-/// monitor list before and after the change.
-pub fn follow_card_display(
+/// mirror stopped by Stop or an error stays stopped; `before` and `now` are the source monitor and
+/// card display in the monitor list before and after the change.
+pub fn follow_displays(
     wanted: bool,
     mirror_running: bool,
-    before: Option<&Monitor>,
-    now: Option<&Monitor>,
+    before: [Option<&Monitor>; 2],
+    now: [Option<&Monitor>; 2],
 ) -> Follow {
     match now {
         _ if !wanted => Follow::Nothing,
-        None if mirror_running => Follow::Stop,
-        None => Follow::Nothing,
-        Some(card) if !mirror_running || before != Some(card) => Follow::Start,
-        Some(_) => Follow::Nothing,
+        [_, None] => Follow::Stop(Status::WaitingForCardDisplay),
+        [None, _] => Follow::Stop(Status::WaitingForSourceMonitor),
+        _ if !mirror_running || before != now => Follow::Start,
+        _ => Follow::Nothing,
     }
+}
+
+/// A changed source monitor, card display or audio source restarts a mirror that runs or will
+/// start by itself, so it follows the choice at once, as the guard does.
+pub fn restarts_on_change(wanted: bool, before: &Settings, after: &Settings) -> bool {
+    wanted
+        && (before.source_monitor != after.source_monitor
+            || before.card_display != after.card_display
+            || before.audio_source != after.audio_source)
 }
 
 /// Saved settings start the mirror at launch once both monitors were chosen.
@@ -266,7 +278,7 @@ fn settings_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mirror::StandInMirror;
+    use crate::mirror::{Ended, StandInMirror};
 
     #[test]
     fn settings_survive_save_and_load() {
@@ -333,11 +345,11 @@ mod tests {
         }
     }
 
-    struct FailingMirror;
+    struct FailingMirror(Ended);
 
     impl Mirror for FailingMirror {
-        fn start(&mut self, _source: &Monitor, _card_display: &Monitor) -> Result<(), String> {
-            Err("Could not capture the source monitor.".into())
+        fn start(&mut self, _source: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
+            Err(self.0.clone())
         }
         fn stop(&mut self) {}
         fn is_running(&self) -> bool {
@@ -395,11 +407,33 @@ mod tests {
     }
 
     #[test]
-    fn mirror_error_reaches_the_status_line() {
-        assert_eq!(
-            start_text(&chosen("source", "card"), &mut FailingMirror),
-            "Could not capture the source monitor."
+    fn start_waits_when_source_monitor_is_unplugged() {
+        let status = start(
+            &chosen("gone", "card"),
+            &sender_monitors(),
+            &mut StandInMirror::default(),
         );
+        assert_eq!(status.text(), "Waiting for source monitor");
+        assert!(StatusLine::new(status).shows_stop());
+    }
+
+    #[test]
+    fn transient_mirror_failure_at_start_keeps_the_stop_button_to_retry() {
+        let failure =
+            "Could not capture the source monitor. (Desktop Duplication, error 0x80070005)";
+        let mut mirror = FailingMirror(Ended::Restart(failure.into()));
+        let status = start(&chosen("source", "card"), &sender_monitors(), &mut mirror);
+        assert_eq!(status, Status::Restarting(failure.into()));
+        assert!(StatusLine::new(status).shows_stop());
+    }
+
+    #[test]
+    fn permanent_mirror_failure_at_start_stops_with_its_reason() {
+        let failure = "Could not start the mirror: the graphics driver is too old. Update it. (Direct3D 11.1)";
+        let mut mirror = FailingMirror(Ended::Stop(failure.into()));
+        let status = start(&chosen("source", "card"), &sender_monitors(), &mut mirror);
+        assert_eq!(status, Status::Error(failure.into()));
+        assert!(!StatusLine::new(status).shows_stop());
     }
 
     #[test]
@@ -455,6 +489,7 @@ mod tests {
         let shows_stop = |mirror| StatusLine::new(mirror).shows_stop();
         assert!(shows_stop(Status::Running));
         assert!(shows_stop(Status::WaitingForCardDisplay));
+        assert!(shows_stop(Status::WaitingForSourceMonitor));
         assert!(shows_stop(Status::Restarting("lost".into())));
         assert!(!shows_stop(Status::Stopped));
         assert!(!shows_stop(Status::Error("failed".into())));
@@ -476,61 +511,130 @@ mod tests {
         assert_eq!(Status::Stopped.text(), "Stopped");
     }
 
+    /// The source monitor and card display as the monitor list holds them.
+    fn both<'a>(source: &'a Monitor, card: &'a Monitor) -> [Option<&'a Monitor>; 2] {
+        [Some(source), Some(card)]
+    }
+
     #[test]
-    fn mirror_stops_when_the_card_display_is_unplugged() {
-        let card = monitor("card", false);
+    fn mirror_stops_and_waits_when_the_card_display_is_unplugged() {
+        let (source, card) = (monitor("source", false), monitor("card", false));
         assert_eq!(
-            follow_card_display(true, true, Some(&card), None),
-            Follow::Stop
+            follow_displays(true, true, both(&source, &card), [Some(&source), None]),
+            Follow::Stop(Status::WaitingForCardDisplay)
+        );
+        // Both gone, as when their graphics card goes: the card display is named first.
+        assert_eq!(
+            follow_displays(true, true, both(&source, &card), [None, None]),
+            Follow::Stop(Status::WaitingForCardDisplay)
         );
     }
 
     #[test]
-    fn mirror_starts_when_the_card_display_comes_back() {
-        let card = monitor("card", false);
+    fn mirror_stops_and_waits_when_the_source_monitor_is_unplugged() {
+        let (source, card) = (monitor("source", false), monitor("card", false));
         assert_eq!(
-            follow_card_display(true, false, None, Some(&card)),
+            follow_displays(true, true, both(&source, &card), [None, Some(&card)]),
+            Follow::Stop(Status::WaitingForSourceMonitor)
+        );
+        // Already stopped (restarting, or waiting for the card display, which came back).
+        assert_eq!(
+            follow_displays(true, false, [None, None], [None, Some(&card)]),
+            Follow::Stop(Status::WaitingForSourceMonitor)
+        );
+    }
+
+    #[test]
+    fn mirror_starts_when_the_missing_monitor_comes_back() {
+        let (source, card) = (monitor("source", false), monitor("card", false));
+        assert_eq!(
+            follow_displays(true, false, [Some(&source), None], both(&source, &card)),
+            Follow::Start
+        );
+        assert_eq!(
+            follow_displays(true, false, [None, Some(&card)], both(&source, &card)),
             Follow::Start
         );
     }
 
     #[test]
-    fn mirror_restarts_when_the_card_display_changes_or_the_mirror_ended() {
-        let card = monitor("card", false);
-        let moved = Monitor {
+    fn mirror_restarts_when_either_monitor_changes_or_the_mirror_ended() {
+        let (source, card) = (monitor("source", false), monitor("card", false));
+        let moved = |monitor: &Monitor| Monitor {
             left: 1920,
-            ..card.clone()
+            ..monitor.clone()
         };
         assert_eq!(
-            follow_card_display(true, true, Some(&card), Some(&moved)),
+            follow_displays(
+                true,
+                true,
+                both(&source, &card),
+                both(&source, &moved(&card))
+            ),
             Follow::Start
         );
         assert_eq!(
-            follow_card_display(true, false, Some(&card), Some(&card)),
+            follow_displays(
+                true,
+                true,
+                both(&source, &card),
+                both(&moved(&source), &card)
+            ),
+            Follow::Start
+        );
+        assert_eq!(
+            follow_displays(true, false, both(&source, &card), both(&source, &card)),
             Follow::Start
         );
     }
 
     #[test]
     fn running_mirror_is_left_alone_when_another_monitor_changes() {
-        let card = monitor("card", false);
+        let (source, card) = (monitor("source", false), monitor("card", false));
         assert_eq!(
-            follow_card_display(true, true, Some(&card), Some(&card)),
-            Follow::Nothing
-        );
-        assert_eq!(
-            follow_card_display(true, false, None, None),
+            follow_displays(true, true, both(&source, &card), both(&source, &card)),
             Follow::Nothing
         );
     }
 
     #[test]
-    fn stopped_mirror_ignores_the_card_display() {
-        let card = monitor("card", false);
+    fn stopped_mirror_ignores_the_monitors() {
+        let (source, card) = (monitor("source", false), monitor("card", false));
         assert_eq!(
-            follow_card_display(false, false, None, Some(&card)),
+            follow_displays(false, false, [None, None], both(&source, &card)),
             Follow::Nothing
         );
+        assert_eq!(
+            follow_displays(false, false, both(&source, &card), [None, None]),
+            Follow::Nothing
+        );
+    }
+
+    #[test]
+    fn a_changed_monitor_or_audio_choice_restarts_a_wanted_mirror() {
+        let before = Settings {
+            audio_source: Some("speakers".into()),
+            ..chosen("source", "card")
+        };
+        let changed = [
+            chosen("other", "card"),
+            chosen("source", "other"),
+            Settings {
+                audio_source: Some("headset".into()),
+                ..before.clone()
+            },
+        ];
+        for after in &changed {
+            assert!(restarts_on_change(true, &before, after), "{after:?}");
+            assert!(!restarts_on_change(false, &before, after), "{after:?}");
+        }
+        // The guard's own choices don't touch the mirror.
+        let guard_only = Settings {
+            send_windows_to: Some("primary".into()),
+            guard_enabled: false,
+            ..before.clone()
+        };
+        assert!(!restarts_on_change(true, &before, &guard_only));
     }
 
     #[test]

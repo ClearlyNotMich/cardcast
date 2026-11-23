@@ -2,14 +2,14 @@
 //! drawn once per refresh through a flip-model swap chain on its own thread.
 
 use super::capture::Desktop;
-use super::{Ended, Fit, Mirror, Output, ended, find_output, fit, source_output};
+use super::{Ended, Fit, Mirror, Output, ended, find_output, fit, source_output, start_failed};
 use crate::guard::Monitor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
+    CloseHandle, E_POINTER, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
@@ -81,7 +81,7 @@ impl Drop for MirrorWindow {
 }
 
 impl Mirror for MirrorWindow {
-    fn start(&mut self, source_monitor: &Monitor, card_display: &Monitor) -> Result<(), String> {
+    fn start(&mut self, source_monitor: &Monitor, card_display: &Monitor) -> Result<(), Ended> {
         self.stop();
         let (started_sender, started) = mpsc::channel();
         let presents = Arc::new(AtomicU64::new(0));
@@ -106,13 +106,14 @@ impl Mirror for MirrorWindow {
                 });
                 Ok(())
             }
-            Ok(Err(message)) => {
+            Ok(Err(failure)) => {
                 let _ = thread.join();
-                Err(message)
+                Err(failure)
             }
+            // The mirror thread panicked: a bug, so starting again would fail the same way.
             Err(_) => {
                 let _ = thread.join();
-                Err("The mirror could not start.".into())
+                Err(Ended::Stop("The mirror could not start.".into()))
             }
         }
     }
@@ -154,21 +155,24 @@ fn run(
     source_monitor: &Monitor,
     card_display: &Monitor,
     presents: &AtomicU64,
-    started: &Sender<Result<(u32, isize), String>>,
+    started: &Sender<Result<(u32, isize), Ended>>,
 ) -> Option<i32> {
     let opened = Screen::open(source_monitor, card_display).and_then(|(screen, source)| {
         // SAFETY: plain call returning the context's device.
-        let device = unsafe { screen.context.GetDevice() }.map_err(|_| {
-            "Could not start the mirror: the graphics card did not respond. (Direct3D device)"
-                .to_owned()
+        let device = unsafe { screen.context.GetDevice() }.map_err(|error| {
+            start_failed(
+                "Could not start the mirror: the graphics card did not respond.",
+                "Direct3D device",
+                error.code().0,
+            )
         })?;
         let desktop = Desktop::open(&device, &source, &source_monitor.device_path)?;
         Ok((screen, desktop))
     });
     let (screen, mut desktop) = match opened {
         Ok(opened) => opened,
-        Err(message) => {
-            let _ = started.send(Err(message));
+        Err(failure) => {
+            let _ = started.send(Err(failure));
             return None;
         }
     };
@@ -224,29 +228,42 @@ impl Screen {
     fn open(
         source_monitor: &Monitor,
         card_display: &Monitor,
-    ) -> Result<(Self, IDXGIOutput), String> {
-        let monitors = crate::guard::monitors()?;
+    ) -> Result<(Self, IDXGIOutput), Ended> {
+        // A monitor missing here may be mid-replug, so each "not connected" is retried.
+        let monitors = crate::guard::monitors().map_err(Ended::Restart)?;
         // SAFETY: plain factory creation.
-        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }.map_err(|_| {
-            "Could not start the mirror: Windows graphics did not respond. (DXGI factory)"
-                .to_owned()
+        let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }.map_err(|error| {
+            start_failed(
+                "Could not start the mirror: Windows graphics did not respond.",
+                "DXGI factory",
+                error.code().0,
+            )
         })?;
         let outputs = outputs(&factory);
-        let output = find_output(&card_display.device_path, &monitors, &outputs)
-            .ok_or("The card display is not connected to any graphics card.")?;
+        let output =
+            find_output(&card_display.device_path, &monitors, &outputs).ok_or_else(|| {
+                Ended::Restart("The card display is not connected to any graphics card.".into())
+            })?;
         let source = source_output(&source_monitor.device_path, output, &monitors, &outputs)?;
         let card_display = monitors
             .iter()
             .find(|monitor| monitor.device_path == card_display.device_path)
-            .ok_or("The card display is not connected.")?;
-        let failed =
-            |what: &str| format!("Could not start the mirror on the card display. ({what})");
+            .ok_or_else(|| Ended::Restart("The card display is not connected.".into()))?;
+        let failed = |what: &'static str| {
+            move |error: windows::core::Error| {
+                start_failed(
+                    "Could not start the mirror on the card display.",
+                    what,
+                    error.code().0,
+                )
+            }
+        };
         // SAFETY: the index came from EnumAdapters1 on this factory just above.
-        let adapter = unsafe { factory.EnumAdapters1(output.adapter) }
-            .map_err(|_| failed("graphics card"))?;
+        let adapter =
+            unsafe { factory.EnumAdapters1(output.adapter) }.map_err(failed("graphics card"))?;
         // SAFETY: the index came from EnumOutputs on this adapter in `outputs`.
         let source = unsafe { adapter.EnumOutputs(source.output) }
-            .map_err(|_| "The source monitor is not connected.".to_owned())?;
+            .map_err(|_| Ended::Restart("The source monitor is not connected.".into()))?;
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         // SAFETY: out pointers are valid locals; an explicit adapter needs D3D_DRIVER_TYPE_UNKNOWN.
@@ -263,16 +280,21 @@ impl Screen {
                 Some(&mut context),
             )
         }
-        .map_err(|_| failed("Direct3D device"))?;
+        .map_err(failed("Direct3D device"))?;
         let (Some(device), Some(context)) = (device, context) else {
-            return Err(failed("Direct3D device"));
+            return Err(failed("Direct3D device")(E_POINTER.into()));
         };
         let context: ID3D11DeviceContext1 = context.cast().map_err(|_| {
-            "Could not start the mirror: the graphics driver is too old. Update it. (Direct3D 11.1)"
-                .to_owned()
+            Ended::Stop(
+                "Could not start the mirror: the graphics driver is too old. Update it. (Direct3D 11.1)"
+                    .into(),
+            )
         })?;
 
-        let window = Window(create_window(card_display).ok_or_else(|| failed("window"))?);
+        // A window that can't be made on the card display is likely one leaving: retried.
+        let window = Window(create_window(card_display).ok_or_else(|| {
+            Ended::Restart("Could not start the mirror on the card display. (window)".into())
+        })?);
         let size = (card_display.width, card_display.height);
         let description = DXGI_SWAP_CHAIN_DESC1 {
             Width: size.0,
@@ -296,22 +318,22 @@ impl Screen {
         let swap_chain: IDXGISwapChain2 =
             unsafe { factory.CreateSwapChainForHwnd(&device, window.0, &description, None, None) }
                 .and_then(|swap_chain| swap_chain.cast())
-                .map_err(|_| failed("swap chain"))?;
+                .map_err(failed("swap chain"))?;
         // SAFETY: the swap chain was created with the waitable-object flag, which these calls need.
         let waitable = unsafe {
             swap_chain
                 .SetMaximumFrameLatency(1)
-                .map_err(|_| failed("frame latency"))?;
+                .map_err(failed("frame latency"))?;
             Waitable(swap_chain.GetFrameLatencyWaitableObject())
         };
         // SAFETY: buffer 0 of a flip-model swap chain is the current back buffer.
         let back_buffer: ID3D11Texture2D =
-            unsafe { swap_chain.GetBuffer(0) }.map_err(|_| failed("back buffer"))?;
+            unsafe { swap_chain.GetBuffer(0) }.map_err(failed("back buffer"))?;
         let mut target = None;
         // SAFETY: back_buffer belongs to device; target is a valid out pointer.
         unsafe { device.CreateRenderTargetView(&back_buffer, None, Some(&mut target)) }
-            .map_err(|_| failed("render target"))?;
-        let target = target.ok_or_else(|| failed("render target"))?;
+            .map_err(failed("render target"))?;
+        let target = target.ok_or_else(|| failed("render target")(E_POINTER.into()))?;
         // SAFETY: plain call on the window created above.
         let _ = unsafe { ShowWindow(window.0, SW_SHOWNOACTIVATE) };
         Ok((
@@ -440,6 +462,19 @@ extern "system" fn window_proc(
     }
     // SAFETY: forwards the message this procedure received unchanged.
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
+}
+
+/// Top-left corner of the mirror window, if one is open; for the settings window's Windows tests.
+#[cfg(test)]
+pub fn shown_at() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect};
+    // SAFETY: the class name is a static string; no window name is matched.
+    let window = unsafe { FindWindowW(w!("cardcast mirror"), None) }.ok()?;
+    let mut rect = RECT::default();
+    // SAFETY: rect is a valid RECT; a window closed meanwhile only fails the call.
+    unsafe { GetWindowRect(window, &mut rect) }.ok()?;
+    Some((rect.left, rect.top))
 }
 
 #[cfg(test)]

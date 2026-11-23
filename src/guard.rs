@@ -311,20 +311,39 @@ pub mod second_monitor {
         Some(monitors)
     }
 
-    /// Unplugs the virtual monitors by disabling their graphics card; they are plugged back in on drop.
-    pub struct Unplugged;
+    /// A device disabled with `pnputil`, as if unplugged; it is plugged back in on drop.
+    pub struct Unplugged(String);
 
     impl Unplugged {
+        /// Unplugs both virtual monitors by disabling their graphics card.
         pub fn new() -> Self {
-            assert!(pnputil("/disable-device"), "pnputil /disable-device failed");
-            Self
+            Self::device(std::env::var(ENV).unwrap_or_default())
+        }
+
+        /// Unplugs one monitor by disabling its PnP device, found from its device path
+        /// (`\\?\DISPLAY#MTT1337#5&1&UID256#{guid}` is `DISPLAY\MTT1337\5&1&UID256`), since its
+        /// `\\.\DISPLAYn` name changes on replug.
+        pub fn monitor(device_path: &str) -> Self {
+            let path = device_path.trim_start_matches(r"\\?\");
+            let instance = path
+                .rsplit_once('#')
+                .map_or(path, |(instance, _guid)| instance);
+            Self::device(instance.replace('#', r"\"))
+        }
+
+        fn device(id: String) -> Self {
+            assert!(
+                pnputil("/disable-device", &id),
+                "pnputil /disable-device {id} failed"
+            );
+            Self(id)
         }
     }
 
     impl Drop for Unplugged {
         /// Never panics: it also runs while a failed test unwinds, and leaves the monitor connected for the next test.
         fn drop(&mut self) {
-            if !pnputil("/enable-device") {
+            if !pnputil("/enable-device", &self.0) {
                 return;
             }
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -336,12 +355,9 @@ pub mod second_monitor {
         }
     }
 
-    fn pnputil(action: &str) -> bool {
-        let Ok(device) = std::env::var(ENV) else {
-            return false;
-        };
+    fn pnputil(action: &str, device: &str) -> bool {
         Command::new("pnputil")
-            .args([action, &device])
+            .args([action, device])
             .status()
             .is_ok_and(|status| status.success())
     }

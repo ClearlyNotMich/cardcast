@@ -4,7 +4,7 @@
 
 use super::pointer::{pointer_image, pointer_viewport};
 use super::window::Picture;
-use super::{Fit, white_scale};
+use super::{Ended, Fit, recreate_capture_in_place, start_failed, white_scale};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -318,24 +318,33 @@ impl Desktop {
         device: &ID3D11Device,
         output: &IDXGIOutput,
         device_path: &str,
-    ) -> Result<Self, String> {
-        let failed = |what: &str| format!("Could not capture the source monitor. ({what})");
+    ) -> Result<Self, Ended> {
+        let failed = |what: &'static str| {
+            move |error: windows::core::Error| {
+                start_failed(
+                    "Could not capture the source monitor.",
+                    what,
+                    error.code().0,
+                )
+            }
+        };
         let mut desktop = Self {
             device: device.clone(),
-            output: output.cast().map_err(
-                |_| "Could not capture the source monitor: it needs Windows 10 1803 or later.",
-            )?,
+            output: output.cast().map_err(|_| {
+                Ended::Stop(
+                    "Could not capture the source monitor: it needs Windows 10 1803 or later."
+                        .into(),
+                )
+            })?,
             device_path: device_path.to_owned(),
-            painter: Painter::new(device).map_err(|_| failed("shaders"))?,
+            painter: Painter::new(device).map_err(failed("shaders"))?,
             duplication: None,
             retry_at: Instant::now(),
             white_scale: 1.0,
             frame: None,
             pointer: Pointer::default(),
         };
-        desktop
-            .duplicate()
-            .map_err(|error| failed(&format!("Desktop Duplication: {}", error.message())))?;
+        desktop.duplicate().map_err(failed("Desktop Duplication"))?;
         Ok(desktop)
     }
 
@@ -456,11 +465,15 @@ impl Picture for Desktop {
         target: &ID3D11RenderTargetView,
         fit: Fit,
     ) -> windows::core::Result<()> {
-        if self.duplication.is_none()
-            && Instant::now() >= self.retry_at
-            && self.duplicate().is_err()
-        {
-            self.retry_at = Instant::now() + RETRY;
+        if self.duplication.is_none() && Instant::now() >= self.retry_at {
+            match self.duplicate() {
+                Ok(()) => {}
+                Err(error) if recreate_capture_in_place(error.code().0) => {
+                    self.retry_at = Instant::now() + RETRY;
+                }
+                // Ends the mirror; `super::ended` decides whether it restarts.
+                Err(error) => return Err(error),
+            }
         }
         if self.next_frame(context).is_err() {
             // Access lost (desktop switch, mode change, fullscreen change): re-create on a timer.

@@ -23,8 +23,8 @@ use crate::guard::Monitor;
 
 /// What the settings window needs from the mirror.
 pub trait Mirror {
-    /// Errors are plain words for the status line.
-    fn start(&mut self, source_monitor: &Monitor, card_display: &Monitor) -> Result<(), String>;
+    /// A failure says, in plain words for the status line, whether starting again can fix it.
+    fn start(&mut self, source_monitor: &Monitor, card_display: &Monitor) -> Result<(), Ended>;
     fn stop(&mut self);
     /// False once stopped, or if the mirror ended on its own (for example a failed present).
     fn is_running(&self) -> bool;
@@ -32,13 +32,28 @@ pub trait Mirror {
     fn take_end(&mut self) -> Option<Ended>;
 }
 
-/// What the settings window does after the mirror ended on its own, with the status text.
+/// What the settings window does after the mirror failed to start or ended on its own, with the status text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ended {
-    /// Start it again, like capture re-creates the duplication after access loss.
+    /// Start it again on a timer, like capture re-creates the duplication after access loss.
     Restart(String),
     /// Leave it stopped; starting again would fail the same way.
     Stop(String),
+}
+
+/// Whether a fresh start can fix a failure with this HRESULT. Only a bug or a missing capability
+/// is permanent: a monitor or graphics card going away fails in ways no document lists in full,
+/// and stopping on one would leave the mirror off after a replug (SPEC section 9).
+fn transient(code: i32) -> bool {
+    // E_OUTOFMEMORY, E_NOINTERFACE, E_NOTIMPL, E_POINTER and E_UNEXPECTED (a panicked mirror thread).
+    const PERMANENT: [u32; 5] = [
+        0x8007_000E,
+        0x8000_4002,
+        0x8000_4001,
+        0x8000_4003,
+        0x8000_FFFF,
+    ];
+    !PERMANENT.contains(&code.cast_unsigned())
 }
 
 /// Decides from the HRESULT that ended the mirror thread whether a fresh start can fix it.
@@ -47,23 +62,42 @@ pub enum Ended {
     allow(dead_code, reason = "only the Windows mirror window calls it")
 )]
 pub fn ended(code: i32) -> Ended {
-    // DXGI_ERROR_DEVICE_REMOVED, _DEVICE_HUNG, _DEVICE_RESET, _DRIVER_INTERNAL_ERROR and
-    // _ACCESS_LOST: the graphics device or output went away (driver update, TDR, mode change).
-    const GONE: [u32; 5] = [
-        0x887A_0005,
-        0x887A_0006,
-        0x887A_0007,
-        0x887A_0020,
-        0x887A_0026,
-    ];
-    let code = code.cast_unsigned();
-    if GONE.contains(&code) {
-        Ended::Restart("The mirror lost the graphics card; restarting it.".into())
+    let shown = code.cast_unsigned();
+    if transient(code) {
+        Ended::Restart(format!(
+            "The mirror was interrupted; restarting it. (error 0x{shown:08X})"
+        ))
     } else {
         Ended::Stop(format!(
-            "The mirror stopped unexpectedly. Press Start to try again. (error 0x{code:08X})"
+            "The mirror stopped unexpectedly. Press Start to try again. (error 0x{shown:08X})"
         ))
     }
+}
+
+/// A start that failed at `what` with this HRESULT: `message` with both, retried unless permanent.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows mirror window calls it")
+)]
+pub fn start_failed(message: &str, what: &str, code: i32) -> Ended {
+    let message = format!("{message} ({what}, error 0x{:08X})", code.cast_unsigned());
+    if transient(code) {
+        Ended::Restart(message)
+    } else {
+        Ended::Stop(message)
+    }
+}
+
+/// Whether capture re-creates its duplication on a timer instead of ending the mirror: after a
+/// desktop switch or mode change (`DXGI_ERROR_ACCESS_LOST`, then `E_ACCESSDENIED` on the secure
+/// desktop or `DXGI_ERROR_UNSUPPORTED` in a mode it can't duplicate). Anything else ends the
+/// mirror so `ended` decides, and the status line stops saying "Running" over a frozen frame.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows capture calls it")
+)]
+pub fn recreate_capture_in_place(code: i32) -> bool {
+    [0x887A_0026_u32, 0x8007_0005, 0x887A_0004].contains(&code.cast_unsigned())
 }
 
 /// The mirror window on the card display; `wake` asks the settings window to repaint when it ends on its own.
@@ -72,23 +106,34 @@ pub fn new_mirror(wake: impl Fn() + Send + Sync + 'static) -> Box<dyn Mirror> {
     Box::new(window::MirrorWindow::new(wake))
 }
 
+/// Top-left corner of the mirror window, if one is open; for the settings window's Windows tests.
+#[cfg(all(test, windows))]
+pub fn shown_at() -> Option<(i32, i32)> {
+    window::shown_at()
+}
+
 /// The mirror cannot run on Linux, so the settings window gets the stand-in.
 #[cfg(not(windows))]
 pub fn new_mirror(_wake: impl Fn() + Send + Sync + 'static) -> Box<dyn Mirror> {
     Box::new(StandInMirror::default())
 }
 
-/// Stand-in for Linux and tests; it remembers whether it was started, and `end` ends it on its own.
+/// Stand-in for Linux and tests; it remembers whether it was started, `end` ends it on its own,
+/// and `fail_start` fails the next start.
 #[cfg(any(test, not(windows)))]
 #[derive(Debug, Default)]
 pub struct StandInMirror {
     pub running: bool,
     pub end: Option<Ended>,
+    pub fail_start: Option<Ended>,
 }
 
 #[cfg(any(test, not(windows)))]
 impl Mirror for StandInMirror {
-    fn start(&mut self, _source_monitor: &Monitor, _card_display: &Monitor) -> Result<(), String> {
+    fn start(&mut self, _source_monitor: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
+        if let Some(failure) = self.fail_start.take() {
+            return Err(failure);
+        }
         self.running = true;
         Ok(())
     }
@@ -191,15 +236,16 @@ pub fn source_output<'a>(
     card_display: &Output,
     monitors: &[Monitor],
     outputs: &'a [Output],
-) -> Result<&'a Output, &'static str> {
-    let output = find_output(device_path, monitors, outputs)
-        .ok_or("The source monitor is not connected to any graphics card.")?;
+) -> Result<&'a Output, Ended> {
+    let output = find_output(device_path, monitors, outputs).ok_or_else(|| {
+        Ended::Restart("The source monitor is not connected to any graphics card.".into())
+    })?;
     if output.adapter == card_display.adapter {
         Ok(output)
     } else {
-        Err(
-            "The source monitor and the card display are on different graphics cards. Plug both into the same one.",
-        )
+        Err(Ended::Stop(
+            "The source monitor and the card display are on different graphics cards. Plug both into the same one.".into(),
+        ))
     }
 }
 
@@ -234,26 +280,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_lost_graphics_card_restarts_the_mirror() {
-        // DXGI_ERROR_DEVICE_REMOVED and DXGI_ERROR_DEVICE_RESET.
-        for code in [0x887A_0005_u32, 0x887A_0007] {
+    fn a_lost_monitor_graphics_card_or_desktop_restarts_the_mirror() {
+        // DXGI_ERROR_DEVICE_REMOVED, _DEVICE_RESET, _ACCESS_LOST, E_ACCESSDENIED (secure desktop),
+        // DXGI_ERROR_UNSUPPORTED (mode), _NOT_CURRENTLY_AVAILABLE, _SESSION_DISCONNECTED, and
+        // E_INVALIDARG (an output that moved to another graphics card during a replug).
+        for code in [
+            0x887A_0005_u32,
+            0x887A_0007,
+            0x887A_0026,
+            0x8007_0005,
+            0x887A_0004,
+            0x887A_0022,
+            0x887A_0028,
+            0x8007_0057,
+        ] {
             assert_eq!(
                 ended(code.cast_signed()),
-                Ended::Restart("The mirror lost the graphics card; restarting it.".into())
+                Ended::Restart(format!(
+                    "The mirror was interrupted; restarting it. (error 0x{code:08X})"
+                ))
             );
         }
     }
 
     #[test]
-    fn any_other_failure_stops_the_mirror_with_its_code() {
-        // E_OUTOFMEMORY.
+    fn a_bug_or_missing_capability_stops_the_mirror_with_its_code() {
+        // E_OUTOFMEMORY, E_NOINTERFACE, E_NOTIMPL, E_POINTER and E_UNEXPECTED (a panic).
+        for code in [
+            0x8007_000E_u32,
+            0x8000_4002,
+            0x8000_4001,
+            0x8000_4003,
+            0x8000_FFFF,
+        ] {
+            assert_eq!(
+                ended(code.cast_signed()),
+                Ended::Stop(format!(
+                    "The mirror stopped unexpectedly. Press Start to try again. (error 0x{code:08X})"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_start_keeps_its_words_and_is_retried_unless_permanent() {
+        // DXGI_ERROR_DEVICE_REMOVED, then E_NOINTERFACE.
         assert_eq!(
-            ended(0x8007_000E_u32.cast_signed()),
-            Ended::Stop(
-                "The mirror stopped unexpectedly. Press Start to try again. (error 0x8007000E)"
-                    .into()
-            )
+            start_failed(
+                "Could not start the mirror.",
+                "swap chain",
+                0x887A_0005_u32.cast_signed()
+            ),
+            Ended::Restart("Could not start the mirror. (swap chain, error 0x887A0005)".into())
         );
+        assert_eq!(
+            start_failed(
+                "Could not start the mirror.",
+                "swap chain",
+                0x8000_4002_u32.cast_signed()
+            ),
+            Ended::Stop("Could not start the mirror. (swap chain, error 0x80004002)".into())
+        );
+    }
+
+    #[test]
+    fn capture_is_recreated_in_place_only_after_a_desktop_or_mode_change() {
+        // DXGI_ERROR_ACCESS_LOST, E_ACCESSDENIED and DXGI_ERROR_UNSUPPORTED retry in place.
+        for code in [0x887A_0026_u32, 0x8007_0005, 0x887A_0004] {
+            assert!(recreate_capture_in_place(code.cast_signed()));
+        }
+        // DXGI_ERROR_DEVICE_REMOVED needs a fresh device, so the mirror ends and restarts.
+        assert!(!recreate_capture_in_place(0x887A_0005_u32.cast_signed()));
     }
 
     #[test]
@@ -300,10 +397,19 @@ mod tests {
             monitor("card", r"\\.\DISPLAY2"),
         ];
         let outputs = [output(0, 0, r"\\.\DISPLAY1"), output(1, 0, r"\\.\DISPLAY2")];
-        let refused = source_output("source", &outputs[1], &monitors, &outputs);
-        assert!(refused.unwrap_err().contains("different graphics cards"));
-        let unplugged = source_output("gone", &outputs[1], &monitors, &outputs);
-        assert!(unplugged.unwrap_err().contains("not connected"));
+        assert_eq!(
+            source_output("source", &outputs[1], &monitors, &outputs),
+            Err(Ended::Stop(
+                "The source monitor and the card display are on different graphics cards. Plug both into the same one.".into()
+            ))
+        );
+        // Gone during a replug: it may come back, so the start is retried.
+        assert_eq!(
+            source_output("gone", &outputs[1], &monitors, &outputs),
+            Err(Ended::Restart(
+                "The source monitor is not connected to any graphics card.".into()
+            ))
+        );
     }
 
     fn at(left: u32, top: u32, width: u32, height: u32) -> Fit {
