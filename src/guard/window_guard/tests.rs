@@ -9,6 +9,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, SMTO_ABORTIFHUNG, SW_SHOWNOACTIVATE, SWP_NOSIZE, SendMessageTimeoutW,
     ShowWindow, TranslateMessage, WM_NULL, WS_OVERLAPPEDWINDOW,
 };
+use windows::core::PCWSTR;
 
 const CHILD_MODE: &str = "CARDCAST_TEST_WINDOW";
 const TITLE: &str = "cardcast test window";
@@ -409,6 +410,94 @@ fn second_monitor_give_up_notice_clears_when_the_windows_process_is_killed() {
     wait_for_report(&mut guard, "the notice to clear", |report| {
         *report == GuardReport::Clear
     });
+}
+
+/// A window of this process, like cardcast's settings or mirror window, pumped on its own thread.
+struct OwnWindow {
+    thread_id: u32,
+    window: HWND,
+}
+
+impl OwnWindow {
+    fn spawn(class_name: PCWSTR) -> Self {
+        let class_name = class_name.0 as usize;
+        let (sender, created) = mpsc::channel();
+        std::thread::spawn(move || {
+            let class_name = PCWSTR(class_name as *const u16);
+            // SAFETY: a null module name returns this executable's handle.
+            let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(test_window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            // SAFETY: class points at a static string and a valid window procedure; registering twice only fails.
+            unsafe { RegisterClassW(&class) };
+            // SAFETY: the class was registered above.
+            let window = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    class_name,
+                    class_name,
+                    WS_OVERLAPPEDWINDOW,
+                    200,
+                    150,
+                    640,
+                    480,
+                    None,
+                    None,
+                    Some(instance.into()),
+                    None,
+                )
+            }
+            .unwrap();
+            // SAFETY: window was created above on this thread.
+            let _ = unsafe { ShowWindow(window, SW_SHOWNOACTIVATE) };
+            // SAFETY: plain call returning this thread's id.
+            let _ = sender.send((unsafe { GetCurrentThreadId() }, window.0 as isize));
+            let mut message = MSG::default();
+            // SAFETY: message is a valid MSG; the loop ends on the WM_QUIT posted on drop.
+            while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+                // SAFETY: message came from GetMessageW on this thread.
+                unsafe { DispatchMessageW(&message) };
+            }
+            // SAFETY: the window was created by this thread.
+            let _ = unsafe { DestroyWindow(window) };
+        });
+        let (thread_id, window) = created.recv().unwrap();
+        Self {
+            thread_id,
+            window: HWND(window as *mut _),
+        }
+    }
+}
+
+impl Drop for OwnWindow {
+    fn drop(&mut self) {
+        // SAFETY: posting to a thread id has no memory effects.
+        let _ = unsafe { PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+#[test]
+fn second_monitor_settings_window_moved_onto_the_card_display_is_returned_but_the_mirror_stays() {
+    let Some(monitors) = second_monitor::monitors(2) else {
+        return;
+    };
+    let (primary, card_display) = (&monitors[0], &monitors[1]);
+    let _guard = guard_on(card_display, primary);
+    let mirror = OwnWindow::spawn(w!("cardcast mirror"));
+    move_onto(mirror.window, card_display);
+    let settings = OwnWindow::spawn(w!("cardcast test settings window"));
+    move_onto(settings.window, card_display);
+    wait_for("settings window returned to the primary monitor", || {
+        on(primary, frame(settings.window))
+    });
+    assert!(
+        on(card_display, frame(mirror.window)),
+        "the mirror window was moved"
+    );
 }
 
 fn pointer() -> (i32, i32) {

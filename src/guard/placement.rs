@@ -25,8 +25,8 @@ pub struct WindowState {
     pub hidden: bool,
     pub cloaked: bool,
     pub tool: bool,
-    /// One of cardcast's own windows, such as the mirror.
-    pub own: bool,
+    /// Cardcast's mirror window, the only window allowed on the card display.
+    pub mirror: bool,
 }
 
 /// Where a window goes.
@@ -163,9 +163,17 @@ pub fn guarded_monitors<'a>(
     Ok(Some((card, send_to)))
 }
 
+/// The mirror window's class name, as registered in `mirror/window.rs`.
+pub const MIRROR_WINDOW_CLASS: &str = "cardcast mirror";
+
+/// Only the mirror is exempt from the guard; cardcast's settings window is guarded like any other.
+pub fn is_mirror(in_cardcast_process: bool, class_name: &str) -> bool {
+    in_cardcast_process && class_name == MIRROR_WINDOW_CLASS
+}
+
 /// Decides where a window goes, given the card display and the "send windows to" monitor's work area.
 pub fn place(window: &WindowState, card_display: Rect, send_windows_to: Rect) -> Placement {
-    if window.minimised || window.hidden || window.cloaked || window.tool || window.own {
+    if window.minimised || window.hidden || window.cloaked || window.tool || window.mirror {
         return Placement::Stay;
     }
     let frame = window.frame;
@@ -293,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn minimised_hidden_cloaked_tool_and_own_windows_stay() {
+    fn minimised_hidden_cloaked_tool_and_mirror_windows_stay() {
         let on_card = window(rect(2000, 100, 2800, 700));
         for ignored in [
             WindowState {
@@ -313,7 +321,7 @@ mod tests {
                 ..on_card
             },
             WindowState {
-                own: true,
+                mirror: true,
                 ..on_card
             },
         ] {
@@ -323,6 +331,24 @@ mod tests {
                 "{ignored:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_cardcasts_mirror_window_is_the_mirror_so_its_settings_window_is_returned() {
+        assert!(is_mirror(true, MIRROR_WINDOW_CLASS));
+        assert!(
+            !is_mirror(false, MIRROR_WINDOW_CLASS),
+            "another program's window"
+        );
+        // eframe's settings window class.
+        let settings = WindowState {
+            mirror: is_mirror(true, "Window Class"),
+            ..window(rect(2000, 100, 2800, 700))
+        };
+        assert_eq!(
+            place(&settings, CARD, PRIMARY_WORK),
+            Placement::MoveTo(rect(80, 100, 880, 700))
+        );
     }
 
     const ID: isize = 0x1234;
