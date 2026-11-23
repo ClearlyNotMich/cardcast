@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint,
+    GetMonitorInfoW, MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
@@ -20,12 +20,13 @@ use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWi
 use windows::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW, EVENT_SYSTEM_MINIMIZEEND, EnumWindows, GA_ROOT,
-    GWL_EXSTYLE, GetAncestor, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, KillTimer, MSG,
-    OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetCursorPos, SetTimer,
-    SetWindowPos, WINDOW_EX_STYLE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
+    GWL_EXSTYLE, GetAncestor, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowPlacement,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed,
+    KillTimer, MSG, OBJID_WINDOW, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, RegisterClassW,
+    SW_SHOWMAXIMIZED, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER,
+    SetCursorPos, SetTimer, SetWindowPlacement, SetWindowPos, WINDOW_EX_STYLE, WINDOWPLACEMENT,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_DISPLAYCHANGE, WM_QUIT, WM_TIMER, WNDCLASSW,
+    WPF_ASYNCWINDOWPLACEMENT, WS_EX_TOOLWINDOW, WS_OVERLAPPED,
 };
 use windows::core::{BOOL, w};
 
@@ -413,7 +414,11 @@ fn check(state: &mut State, window: HWND, now: Instant) {
         now,
     ) {
         Placement::Stay => return,
-        Placement::MoveTo(target) | Placement::Maximise(target) => target,
+        Placement::MoveTo(target) => target,
+        Placement::Maximise { restore, .. } => {
+            maximise(window, restore);
+            return;
+        }
         Placement::GiveUp => {
             let _ = state.reports.send(format!(
                 "The window guard left \"{}\" on the card display because it keeps going back there.",
@@ -443,6 +448,50 @@ fn check(state: &mut State, window: HWND, now: Instant) {
             SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
         )
     };
+}
+
+/// Maximises the window on the monitor holding `restore` and makes `restore` its restore position.
+fn maximise(window: HWND, restore: Rect) {
+    let Some(mut placement) = window_placement(window) else {
+        return;
+    };
+    let (x, y) = workspace_origin();
+    placement.rcNormalPosition = RECT {
+        left: restore.left - x,
+        top: restore.top - y,
+        right: restore.right - x,
+        bottom: restore.bottom - y,
+    };
+    placement.showCmd = SW_SHOWMAXIMIZED.0 as u32;
+    placement.flags = WPF_ASYNCWINDOWPLACEMENT;
+    // SAFETY: placement is a WINDOWPLACEMENT with length set; WPF_ASYNCWINDOWPLACEMENT posts the request, so a hung program cannot block this thread.
+    let _ = unsafe { SetWindowPlacement(window, &placement) };
+}
+
+fn window_placement(window: HWND) -> Option<WINDOWPLACEMENT> {
+    let mut placement = WINDOWPLACEMENT {
+        length: u32::try_from(size_of::<WINDOWPLACEMENT>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: placement is a WINDOWPLACEMENT with length set; a stale handle just fails.
+    unsafe { GetWindowPlacement(window, &mut placement) }.ok()?;
+    Some(placement)
+}
+
+/// Desktop position of workspace (0,0): the primary monitor's work area corner.
+fn workspace_origin() -> (i32, i32) {
+    // SAFETY: plain lookup; MONITOR_DEFAULTTOPRIMARY always returns a monitor.
+    let handle = unsafe { MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY) };
+    let mut info = MONITORINFO {
+        cbSize: u32::try_from(size_of::<MONITORINFO>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: info is a MONITORINFO with cbSize set.
+    if unsafe { GetMonitorInfoW(handle, &mut info) }.as_bool() {
+        (info.rcWork.left, info.rcWork.top)
+    } else {
+        (0, 0)
+    }
 }
 
 /// The window's state and its full window rectangle; none of these calls wait on the window's program.
@@ -475,11 +524,20 @@ fn read_window(window: HWND) -> Option<(WindowState, Rect)> {
     let mut process_id = 0u32;
     // SAFETY: process_id is a valid u32 out pointer.
     unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
+    let (x, y) = workspace_origin();
+    let normal = window_placement(window)?.rcNormalPosition;
+    let restore = Rect {
+        left: normal.left + x,
+        top: normal.top + y,
+        right: normal.right + x,
+        bottom: normal.bottom + y,
+    };
     // SAFETY: the remaining calls only read window flags and styles.
     let state = unsafe {
         WindowState {
             frame: rect(frame),
             maximised: IsZoomed(window).as_bool(),
+            restore,
             minimised: IsIconic(window).as_bool(),
             hidden: !IsWindowVisible(window).as_bool(),
             cloaked,

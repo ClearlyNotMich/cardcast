@@ -18,6 +18,8 @@ pub struct WindowState {
     /// The visible frame, without the invisible resize borders.
     pub frame: Rect,
     pub maximised: bool,
+    /// Where the window goes when restored from maximised or minimised, in desktop pixels.
+    pub restore: Rect,
     pub minimised: bool,
     pub hidden: bool,
     pub cloaked: bool,
@@ -32,8 +34,11 @@ pub enum Placement {
     Stay,
     /// Move the visible frame to this rectangle.
     MoveTo(Rect),
-    /// Maximise on the monitor with this work area.
-    Maximise(Rect),
+    /// Maximise on the monitor with this work area, restoring to `restore`.
+    Maximise {
+        work_area: Rect,
+        restore: Rect,
+    },
     /// The window keeps landing on the card display; leave it there and report it.
     GiveUp,
 }
@@ -111,25 +116,32 @@ pub fn place(window: &WindowState, card_display: Rect, send_windows_to: Rect) ->
         return Placement::Stay;
     }
     if window.maximised {
-        return Placement::Maximise(send_windows_to);
+        return Placement::Maximise {
+            work_area: send_windows_to,
+            restore: move_into(window.restore, card_display, send_windows_to),
+        };
     }
-    let width = frame.width().min(send_windows_to.width());
-    let height = frame.height().min(send_windows_to.height());
-    // Keep the frame's offset from the card display's corner, then pull it inside the work area.
-    let left = send_windows_to.left + frame.left - card_display.left;
-    let top = send_windows_to.top + frame.top - card_display.top;
+    Placement::MoveTo(move_into(frame, card_display, send_windows_to))
+}
+
+/// Keeps `rect`'s offset from the card display's corner on `send_windows_to`, shrunk and pulled inside it.
+fn move_into(rect: Rect, card_display: Rect, send_windows_to: Rect) -> Rect {
+    let width = rect.width().min(send_windows_to.width());
+    let height = rect.height().min(send_windows_to.height());
+    let left = send_windows_to.left + rect.left - card_display.left;
+    let top = send_windows_to.top + rect.top - card_display.top;
     let left = left
         .min(send_windows_to.right - width)
         .max(send_windows_to.left);
     let top = top
         .min(send_windows_to.bottom - height)
         .max(send_windows_to.top);
-    Placement::MoveTo(Rect {
+    Rect {
         left,
         top,
         right: left + width,
         bottom: top + height,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -189,14 +201,36 @@ mod tests {
     }
 
     #[test]
-    fn maximised_window_is_maximised_on_the_send_windows_to_monitor() {
+    fn maximised_window_is_maximised_on_the_send_windows_to_monitor_with_its_restore_rect_moved_too()
+     {
+        // Restores to 800×600 at (100, 50) on the card display.
         let maximised = WindowState {
             maximised: true,
+            restore: rect(2020, 50, 2820, 650),
             ..window(CARD)
         };
         assert_eq!(
             place(&maximised, CARD, PRIMARY_WORK),
-            Placement::Maximise(PRIMARY_WORK)
+            Placement::Maximise {
+                work_area: PRIMARY_WORK,
+                restore: rect(100, 50, 900, 650),
+            }
+        );
+    }
+
+    #[test]
+    fn maximised_window_restore_rect_too_big_for_the_work_area_shrinks_to_fit() {
+        let maximised = WindowState {
+            maximised: true,
+            restore: rect(1900, -20, 3900, 1100),
+            ..window(CARD)
+        };
+        assert_eq!(
+            place(&maximised, CARD, PRIMARY_WORK),
+            Placement::Maximise {
+                work_area: PRIMARY_WORK,
+                restore: PRIMARY_WORK,
+            }
         );
     }
 
