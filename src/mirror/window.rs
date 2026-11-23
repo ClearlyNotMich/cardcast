@@ -200,9 +200,7 @@ impl Screen {
         let outputs = outputs(&factory);
         let output = find_output(&card_display.device_path, &monitors, &outputs)
             .ok_or("The card display is not connected to any graphics card.")?;
-        let _ = source_output;
-        let source = find_output(&source_monitor.device_path, &monitors, &outputs)
-            .ok_or("The source monitor is not connected to any graphics card.")?;
+        let source = source_output(&source_monitor.device_path, output, &monitors, &outputs)?;
         let card_display = monitors
             .iter()
             .find(|monitor| monitor.device_path == card_display.device_path)
@@ -377,8 +375,8 @@ fn create_window(card_display: &Monitor) -> Option<HWND> {
             w!("cardcast mirror"),
             w!("cardcast mirror"),
             WS_POPUP,
-            0,
-            0,
+            card_display.left,
+            card_display.top,
             i32::try_from(card_display.width).ok()?,
             i32::try_from(card_display.height).ok()?,
             None,

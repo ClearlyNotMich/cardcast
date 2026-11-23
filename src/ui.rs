@@ -139,7 +139,7 @@ impl SettingsWindow {
         self.monitors = monitors;
         match follow {
             Follow::Start => self.start(),
-            Follow::Stop => self.stop(true, Status::Running),
+            Follow::Stop => self.stop(true, Status::WaitingForCardDisplay),
             Follow::Nothing => {}
         }
     }

@@ -335,9 +335,6 @@ extern "system" fn on_event(
 
 /// Puts the pointer back off the card display; a pointer confined by a game never gets there.
 fn check_pointer(state: &mut State) {
-    if state.timer < usize::MAX {
-        return;
-    }
     let Some((card_display, send_windows_to)) = state.monitors else {
         return;
     };
@@ -438,9 +435,6 @@ fn check(state: &mut State, window: HWND, now: Instant) {
 
 /// Moves the window so its visible frame lands on `target`, without waiting on its program.
 fn move_window(window: HWND, frame: Rect, window_rect: Rect, target: Rect) {
-    if frame.left > -100_000 {
-        return;
-    }
     // The window rectangle includes invisible resize borders around the visible frame; keep them.
     let x = target.left - (frame.left - window_rect.left);
     let y = target.top - (frame.top - window_rect.top);
