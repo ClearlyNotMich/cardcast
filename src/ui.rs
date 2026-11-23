@@ -3,7 +3,7 @@
 mod settings;
 
 use crate::audio::{self, AudioDevice};
-use crate::guard::{self, Guard, Monitor, StandInGuard};
+use crate::guard::{self, Guard, Monitor};
 use crate::mirror::{Mirror, StandInMirror};
 use eframe::egui;
 use settings::{Settings, Status};
@@ -17,7 +17,7 @@ pub fn run() -> eframe::Result {
     eframe::run_native(
         "cardcast",
         options,
-        Box::new(|_| Ok(Box::new(SettingsWindow::new()))),
+        Box::new(|creation| Ok(Box::new(SettingsWindow::new(&creation.egui_ctx)))),
     )
 }
 
@@ -31,7 +31,7 @@ struct SettingsWindow {
 }
 
 impl SettingsWindow {
-    fn new() -> Self {
+    fn new(context: &egui::Context) -> Self {
         let mut status = Status::Stopped;
         let monitors = guard::monitors().unwrap_or_else(|error| {
             status = Status::Error(error);
@@ -42,9 +42,9 @@ impl SettingsWindow {
             Vec::new()
         });
         let settings = Settings::load().with_defaults(&monitors);
-        // Start/guard drive stand-ins until the mirror and guard tickets land.
-        let mut guard: Box<dyn Guard> = Box::new(StandInGuard::default());
-        guard.set_enabled(settings.guard_enabled);
+        let context = context.clone();
+        let mut guard = guard::new_guard(move || context.request_repaint());
+        update_guard(&mut *guard, &settings);
         Self {
             settings,
             monitors,
@@ -106,6 +106,14 @@ impl SettingsWindow {
     }
 }
 
+fn update_guard(guard: &mut dyn Guard, settings: &Settings) {
+    guard.update(
+        settings.guard_enabled,
+        settings.card_display.as_deref(),
+        settings.send_windows_to.as_deref(),
+    );
+}
+
 #[derive(Clone, Copy)]
 enum Choice {
     SourceMonitor,
@@ -122,6 +130,9 @@ fn monitor_label(monitor: &Monitor) -> String {
 
 impl eframe::App for SettingsWindow {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(report) = self.guard.take_report() {
+            self.status = Status::Error(report);
+        }
         let before = self.settings.clone();
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
@@ -140,19 +151,15 @@ impl eframe::App for SettingsWindow {
                     self.status =
                         settings::start(&self.settings, &self.monitors, &mut *self.mirror);
                 }
-                if ui
-                    .checkbox(&mut self.settings.guard_enabled, "Guard")
-                    .changed()
-                {
-                    self.guard.set_enabled(self.settings.guard_enabled);
-                }
+                ui.checkbox(&mut self.settings.guard_enabled, "Guard");
             });
             ui.label(self.status.text());
         });
-        if self.settings != before
-            && let Err(error) = self.settings.save()
-        {
-            self.status = Status::Error(error);
+        if self.settings != before {
+            update_guard(&mut *self.guard, &self.settings);
+            if let Err(error) = self.settings.save() {
+                self.status = Status::Error(error);
+            }
         }
     }
 }

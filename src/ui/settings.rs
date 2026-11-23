@@ -162,6 +162,8 @@ mod tests {
             height: 1080,
             refresh_hz: 60,
             primary,
+            left: 0,
+            top: 0,
         }
     }
 

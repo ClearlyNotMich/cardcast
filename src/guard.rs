@@ -6,6 +6,17 @@
     reason = "SPEC allows unsafe only in mirror, guard and audio, for Windows API calls"
 )]
 
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows window guard calls it; its tests run everywhere"
+    )
+)]
+mod placement;
+#[cfg(windows)]
+mod window_guard;
+
 /// A monitor on the sender, as shown in the settings dropdowns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Monitor {
@@ -16,22 +27,46 @@ pub struct Monitor {
     pub height: u32,
     pub refresh_hz: u32,
     pub primary: bool,
+    /// Top-left corner on the desktop.
+    pub left: i32,
+    pub top: i32,
 }
 
 /// What the settings window needs from the window guard and pointer guard.
 pub trait Guard {
-    fn set_enabled(&mut self, enabled: bool);
+    /// Applies the guard checkbox and the chosen card display and "send windows to" monitor.
+    fn update(&mut self, enabled: bool, card_display: Option<&str>, send_windows_to: Option<&str>);
+    /// The guard's latest message for the status line, in plain words.
+    fn take_report(&mut self) -> Option<String>;
 }
 
-/// Stand-in until the real guard lands; it only remembers the checkbox.
+/// The window guard; `wake` asks the settings window to repaint when a report is waiting.
+#[cfg(windows)]
+pub fn new_guard(wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
+    Box::new(window_guard::WindowGuard::new(wake))
+}
+
+/// The guard cannot run on Linux, so the settings window gets the stand-in.
+#[cfg(not(windows))]
+pub fn new_guard(_wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
+    Box::new(StandInGuard::default())
+}
+
+/// Stand-in for Linux; it only remembers the checkbox.
+#[cfg(not(windows))]
 #[derive(Debug, Default)]
 pub struct StandInGuard {
     pub enabled: bool,
 }
 
+#[cfg(not(windows))]
 impl Guard for StandInGuard {
-    fn set_enabled(&mut self, enabled: bool) {
+    fn update(&mut self, enabled: bool, _card: Option<&str>, _send_windows_to: Option<&str>) {
         self.enabled = enabled;
+    }
+
+    fn take_report(&mut self) -> Option<String> {
+        None
     }
 }
 
@@ -45,6 +80,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         height,
         refresh_hz,
         primary,
+        left: 0,
+        top: 0,
     };
     Ok(vec![
         monitor(
@@ -143,6 +180,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
                 .unwrap_or(0),
             // Windows always places the primary monitor at the desktop origin.
             primary: source_mode.position.x == 0 && source_mode.position.y == 0,
+            left: source_mode.position.x,
+            top: source_mode.position.y,
         });
     }
     Ok(monitors)
