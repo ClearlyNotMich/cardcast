@@ -27,7 +27,9 @@ Do: decide with the frame bounds, then add the border offsets back before callin
 - `rcNormalPosition` is where the window goes when restored; `showCmd` is its show state (maximised, minimised, normal). [WINDOWPLACEMENT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-windowplacement)
 - `length` must be `size_of::<WINDOWPLACEMENT>()` or `SetWindowPlacement` fails. If the placement would be fully off screen, the system moves it onto a visible monitor. [SetWindowPlacement](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowplacement)
 
-Do: move a maximised or minimised window with `SetWindowPlacement`, so its restore position moves too. Don't: mix workspace and screen coordinates.
+- Measured on the CI runner's second monitor (CI job `second-monitor`): `SetWindowPlacement` with `SW_SHOWMAXIMIZED` on a window that is already maximised only changes its restore position; the window stays maximised on its old monitor. Restoring it first and then maximising moves it, but maximising activates it (`SW_SHOWMAXIMIZED` activates). [ShowWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow)
+
+Do: move a maximised or minimised window with `SetWindowPlacement`, so its restore position moves too; to put a maximised window on another monitor, also move its frame onto that monitor's work area with `SetWindowPos`. Don't: mix workspace and screen coordinates.
 
 ## Out-of-context SetWinEventHook
 

@@ -287,6 +287,76 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
     Ok(monitors)
 }
 
+/// Helpers for the tests the CI `second-monitor` job runs: it adds two virtual monitors on one
+/// virtual graphics card and sets `CARDCAST_SECOND_MONITOR` to that card (a PnP instance id).
+#[cfg(all(test, windows))]
+pub mod second_monitor {
+    use super::Monitor;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    const ENV: &str = "CARDCAST_SECOND_MONITOR";
+
+    /// The primary monitor then the others, or `None` (the test skips) outside that job or with fewer than `count`.
+    pub fn monitors(count: usize) -> Option<Vec<Monitor>> {
+        if std::env::var_os(ENV).is_none() {
+            eprintln!("skipped: {ENV} is not set");
+            return None;
+        }
+        let mut monitors = super::monitors().unwrap_or_else(|error| panic!("{error}"));
+        monitors.sort_by_key(|monitor| !monitor.primary);
+        if monitors.len() < count || !monitors[0].primary {
+            eprintln!("skipped: needs {count} monitors, one of them primary");
+            return None;
+        }
+        Some(monitors)
+    }
+
+    /// Unplugs the virtual monitors by disabling their graphics card; they are plugged back in on drop.
+    pub struct Unplugged;
+
+    impl Unplugged {
+        pub fn new() -> Self {
+            assert!(pnputil("/disable-device"), "pnputil /disable-device failed");
+            Self
+        }
+    }
+
+    impl Drop for Unplugged {
+        /// Never panics: it also runs while a failed test unwinds, and leaves the monitor connected for the next test.
+        fn drop(&mut self) {
+            if !pnputil("/enable-device") {
+                return;
+            }
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline
+                && !super::monitors().is_ok_and(|monitors| monitors.len() > 2)
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    fn pnputil(action: &str) -> bool {
+        let Ok(device) = std::env::var(ENV) else {
+            return false;
+        };
+        Command::new("pnputil")
+            .args([action, &device])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// Polls until `done` holds; panics after `limit`.
+    pub fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !done() {
+            assert!(start.elapsed() < limit, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn wide_to_string(wide: &[u16]) -> String {
     let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());

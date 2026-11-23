@@ -289,8 +289,9 @@ fn write(
     let buffer = unsafe { render.GetBuffer(frames) }?;
     let flags = match data {
         Some(data) => {
-            debug_assert_eq!(data.len(), frames as usize * to.frame_bytes());
-            // SAFETY: GetBuffer returned room for `frames` frames, which is exactly data.len() bytes.
+            // Release-mode check: the copy below is unsound without it.
+            assert_eq!(data.len(), frames as usize * to.frame_bytes());
+            // SAFETY: GetBuffer returned room for `frames` frames, and the assert above makes that exactly data.len() bytes.
             unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buffer, data.len()) };
             0
         }

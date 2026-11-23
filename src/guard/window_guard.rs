@@ -435,9 +435,11 @@ fn check(state: &mut State, window: HWND, now: Instant) {
     ) {
         Placement::Stay => return,
         Placement::MoveTo(target) => target,
-        Placement::Maximise { restore, .. } => {
+        Placement::Maximise { work_area, restore } => {
             maximise(window, restore);
-            return;
+            // Changing only the placement leaves a maximised window on its monitor, and maximising
+            // a restored one activates it, so move the maximised frame over (measured on the CI runner).
+            work_area
         }
         Placement::GiveUp | Placement::Handled => {
             report(state);

@@ -165,6 +165,15 @@ impl SettingsWindow {
         }
     }
 
+    /// What every pass does, even while minimised: follow display changes, the mirror and reports.
+    fn follow(&mut self, context: &egui::Context) {
+        if self.displays_changed.swap(false, Ordering::Relaxed) {
+            self.follow_displays();
+        }
+        self.follow_mirror(context);
+        self.follow_reports();
+    }
+
     /// Re-reads the monitors after a display change and follows the card display.
     fn follow_displays(&mut self) {
         match guard::monitors() {
@@ -266,11 +275,7 @@ fn monitor_label(monitor: &Monitor) -> String {
 impl eframe::App for SettingsWindow {
     // Runs while minimised too, so the mirror follows the card display without the window open.
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.displays_changed.swap(false, Ordering::Relaxed) {
-            self.follow_displays();
-        }
-        self.follow_mirror(context);
-        self.follow_reports();
+        self.follow(context);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -439,6 +444,74 @@ mod tests {
         window.start();
         assert!(window.mirror.is_running());
         assert_eq!(*relay.0.borrow(), ["stop"]);
+    }
+
+    /// The settings window as `run` builds it, with the real mirror and display watcher.
+    #[cfg(windows)]
+    #[test]
+    fn second_monitor_unplug_waits_for_the_card_display_and_replug_brings_the_mirror_back() {
+        use guard::second_monitor::{Unplugged, wait_for};
+        // The two virtual monitors share a graphics card, as SPEC section 1 needs.
+        let Some(monitors) = guard::second_monitor::monitors(3) else {
+            return;
+        };
+        let (source_monitor, card_display) = (monitors[1].clone(), monitors[2].clone());
+        let displays_changed = Arc::new(AtomicBool::new(false));
+        let display_watcher = {
+            let displays_changed = displays_changed.clone();
+            Some(
+                guard::DisplayWatcher::new(move || displays_changed.store(true, Ordering::Relaxed))
+                    .unwrap(),
+            )
+        };
+        let mut window = SettingsWindow {
+            settings: Settings {
+                source_monitor: Some(source_monitor.device_path),
+                card_display: Some(card_display.device_path.clone()),
+                ..Settings::default()
+            },
+            monitors,
+            playback_devices: Vec::new(),
+            status: StatusLine::new(Status::Stopped),
+            restart_at: Instant::now(),
+            mirror: mirror::new_mirror(|| {}),
+            relay: Box::new(RecordingRelay::default()),
+            guard: Box::new(ReportingGuard::default()),
+            displays_changed,
+            _display_watcher: display_watcher,
+        };
+        let context = egui::Context::default();
+        window.start();
+        assert_eq!(window.status.text(), "Running");
+
+        let unplugged = Unplugged::new();
+        wait_for("Waiting for card display", Duration::from_secs(15), || {
+            window.follow(&context);
+            window.status.mirror == Status::WaitingForCardDisplay
+        });
+        assert!(!window.mirror.is_running(), "the mirror still runs");
+
+        drop(unplugged);
+        wait_for("the mirror to come back", Duration::from_secs(30), || {
+            window.follow(&context);
+            window.mirror.is_running() && window.status.mirror == Status::Running
+        });
+        let back = window
+            .monitors
+            .iter()
+            .find(|monitor| monitor.device_path == card_display.device_path)
+            .unwrap();
+        println!(
+            "card display {} came back as {}",
+            card_display.gdi_name, back.gdi_name
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        window.follow(&context);
+        assert!(
+            window.mirror.is_running(),
+            "the mirror ended after the replug"
+        );
+        assert_eq!(window.status.text(), "Running");
     }
 
     #[test]
