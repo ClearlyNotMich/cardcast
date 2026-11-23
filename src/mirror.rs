@@ -28,25 +28,62 @@ pub trait Mirror {
     fn stop(&mut self);
     /// False once stopped, or if the mirror ended on its own (for example a failed present).
     fn is_running(&self) -> bool;
+    /// What to do about the mirror ending on its own; given once, after it ended.
+    fn take_end(&mut self) -> Option<Ended>;
 }
 
-/// The mirror window on the card display.
+/// What the settings window does after the mirror ended on its own, with the status text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ended {
+    /// Start it again, like capture re-creates the duplication after access loss.
+    Restart(String),
+    /// Leave it stopped; starting again would fail the same way.
+    Stop(String),
+}
+
+/// Decides from the HRESULT that ended the mirror thread whether a fresh start can fix it.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows mirror window calls it")
+)]
+pub fn ended(code: i32) -> Ended {
+    // DXGI_ERROR_DEVICE_REMOVED, _DEVICE_HUNG, _DEVICE_RESET, _DRIVER_INTERNAL_ERROR and
+    // _ACCESS_LOST: the graphics device or output went away (driver update, TDR, mode change).
+    const GONE: [u32; 5] = [
+        0x887A_0005,
+        0x887A_0006,
+        0x887A_0007,
+        0x887A_0020,
+        0x887A_0026,
+    ];
+    let code = code.cast_unsigned();
+    if GONE.contains(&code) {
+        Ended::Restart("The mirror lost the graphics card; restarting it.".into())
+    } else {
+        Ended::Stop(format!(
+            "The mirror stopped (error 0x{code:08X}). Press Start to try again."
+        ))
+    }
+}
+
+/// The mirror window on the card display; `wake` asks the settings window to repaint when it ends on its own.
 #[cfg(windows)]
-pub fn new_mirror() -> Box<dyn Mirror> {
-    Box::new(window::MirrorWindow::default())
+pub fn new_mirror(wake: impl Fn() + Send + Sync + 'static) -> Box<dyn Mirror> {
+    Box::new(window::MirrorWindow::new(wake))
 }
 
 /// The mirror cannot run on Linux, so the settings window gets the stand-in.
 #[cfg(not(windows))]
-pub fn new_mirror() -> Box<dyn Mirror> {
+pub fn new_mirror(_wake: impl Fn() + Send + Sync + 'static) -> Box<dyn Mirror> {
     Box::new(StandInMirror::default())
 }
 
-/// Stand-in for Linux and tests; it only remembers whether it was started.
+/// Stand-in for Linux and tests; it remembers whether it was started, and `end` ends it on its own.
 #[cfg(any(test, not(windows)))]
 #[derive(Debug, Default)]
 pub struct StandInMirror {
     pub running: bool,
+    pub end: Option<Ended>,
 }
 
 #[cfg(any(test, not(windows)))]
@@ -61,7 +98,13 @@ impl Mirror for StandInMirror {
     }
 
     fn is_running(&self) -> bool {
-        self.running
+        self.running && self.end.is_none()
+    }
+
+    fn take_end(&mut self) -> Option<Ended> {
+        let end = self.end.take()?;
+        self.running = false;
+        Some(end)
     }
 }
 
@@ -189,6 +232,26 @@ pub fn sdr_from_hdr(linear: f32, white_scale: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lost_graphics_card_restarts_the_mirror() {
+        // DXGI_ERROR_DEVICE_REMOVED and DXGI_ERROR_DEVICE_RESET.
+        for code in [0x887A_0005_u32, 0x887A_0007] {
+            assert_eq!(
+                ended(code.cast_signed()),
+                Ended::Restart("The mirror lost the graphics card; restarting it.".into())
+            );
+        }
+    }
+
+    #[test]
+    fn any_other_failure_stops_the_mirror_with_its_code() {
+        // E_OUTOFMEMORY.
+        assert_eq!(
+            ended(0x8007_000E_u32.cast_signed()),
+            Ended::Stop("The mirror stopped (error 0x8007000E). Press Start to try again.".into())
+        );
+    }
 
     #[test]
     fn sdr_white_becomes_full_white() {

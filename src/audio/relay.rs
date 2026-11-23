@@ -1,6 +1,7 @@
 //! The audio relay: WASAPI loopback of the audio source, played on the card display's sound
 //! output, on its own thread. See docs/win32-mirror-audio.md, "WASAPI loopback and rendering".
 
+use super::RelayReport;
 use super::pacing::{self, Drift};
 use super::samples::{self, Format, Sample};
 use std::sync::Arc;
@@ -41,8 +42,8 @@ struct Running {
 
 pub struct WasapiRelay {
     running: Option<Running>,
-    report_sender: Sender<String>,
-    reports: Receiver<String>,
+    report_sender: Sender<RelayReport>,
+    reports: Receiver<RelayReport>,
     wake: Wake,
 }
 
@@ -94,7 +95,7 @@ impl super::Relay for WasapiRelay {
         self.reports.try_iter().for_each(drop);
     }
 
-    fn take_report(&mut self) -> Option<String> {
+    fn take_report(&mut self) -> Option<RelayReport> {
         self.reports.try_iter().last()
     }
 }
@@ -104,19 +105,26 @@ fn run(
     audio_source: &str,
     card_display_name: &str,
     stop: &AtomicBool,
-    reports: &Sender<String>,
+    reports: &Sender<RelayReport>,
     wake: &Wake,
 ) {
     // SAFETY: plain COM initialisation of this thread; it owns no apartment-bound objects.
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     let mut failures = 0;
     while !stop.load(Ordering::Relaxed) {
-        let Err(error) = relay(audio_source, card_display_name, stop, &mut failures) else {
+        let mut opened = || {
+            if failures >= REPORT_AFTER {
+                let _ = reports.send(RelayReport::Relaying);
+                wake();
+            }
+            failures = 0;
+        };
+        let Err(error) = relay(audio_source, card_display_name, stop, &mut opened) else {
             break;
         };
         failures += 1;
         if failures == REPORT_AFTER {
-            let _ = reports.send(error);
+            let _ = reports.send(RelayReport::Failing(error));
             wake();
         }
         for _ in 0..10 {
@@ -137,7 +145,7 @@ fn relay(
     audio_source: &str,
     card_display_name: &str,
     stop: &AtomicBool,
-    failures: &mut u32,
+    opened: &mut dyn FnMut(),
 ) -> Result<(), String> {
     let devices = super::playback_devices()?;
     let output = super::card_output(&devices, audio_source, card_display_name)?;
@@ -184,7 +192,7 @@ fn relay(
     unsafe { render_client.Start() }.map_err(&playing)?;
     // SAFETY: as above.
     let started = unsafe { capture_client.Start() }.map_err(failed("record the audio source"));
-    *failures = 0;
+    opened();
     let result = started.and_then(|()| {
         pump(
             &event,
@@ -449,7 +457,10 @@ mod tests {
             assert!(Instant::now() < deadline, "no report");
             std::thread::sleep(Duration::from_millis(50));
         };
-        assert_eq!(report, "The audio source is not connected.");
+        assert_eq!(
+            report,
+            RelayReport::Failing("The audio source is not connected.".into())
+        );
         let stopping = Instant::now();
         relay.stop();
         assert!(stopping.elapsed() < Duration::from_millis(500));

@@ -2,13 +2,17 @@
 
 mod settings;
 
-use crate::audio::{self, AudioDevice, Relay};
+use crate::audio::{self, AudioDevice, Relay, RelayReport};
 use crate::guard::{self, Guard, Monitor};
-use crate::mirror::{self, Mirror};
+use crate::mirror::{self, Ended, Mirror};
 use eframe::egui;
-use settings::{Follow, Settings, Status};
+use settings::{Follow, Settings, Status, StatusLine};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// How often a restarting mirror is started again, as capture retries after access loss.
+const RESTART_EVERY: Duration = Duration::from_secs(1);
 
 /// Opens the settings window; returns when it is closed, which quits cardcast.
 pub fn run() -> eframe::Result {
@@ -31,7 +35,9 @@ struct SettingsWindow {
     settings: Settings,
     monitors: Vec<Monitor>,
     playback_devices: Vec<AudioDevice>,
-    status: Status,
+    status: StatusLine,
+    /// When a restarting mirror is next started.
+    restart_at: Instant,
     mirror: Box<dyn Mirror>,
     relay: Box<dyn Relay>,
     guard: Box<dyn Guard>,
@@ -43,17 +49,18 @@ struct SettingsWindow {
 
 impl SettingsWindow {
     fn new(context: &egui::Context) -> Self {
-        let mut status = Status::Stopped;
+        let mut status = StatusLine::new(Status::Stopped);
         let monitors = guard::monitors().unwrap_or_else(|error| {
-            status = Status::Error(error);
+            status.other = Some(error);
             Vec::new()
         });
         let playback_devices = audio::playback_devices().unwrap_or_else(|error| {
-            status = Status::Error(error);
+            status.other = Some(error);
             Vec::new()
         });
         let settings = Settings::load().with_defaults(&monitors);
         let relay_context = context.clone();
+        let mirror_context = context.clone();
         let guard_context = context.clone();
         let mut guard = guard::new_guard(move || guard_context.request_repaint());
         update_guard(&mut *guard, &settings);
@@ -70,7 +77,8 @@ impl SettingsWindow {
             monitors,
             playback_devices,
             status,
-            mirror: mirror::new_mirror(),
+            restart_at: Instant::now(),
+            mirror: mirror::new_mirror(move || mirror_context.request_repaint()),
             relay: audio::new_relay(move || relay_context.request_repaint()),
             guard,
             wanted: false,
@@ -83,7 +91,7 @@ impl SettingsWindow {
     fn launch(&mut self, context: &egui::Context) {
         if settings::starts_on_launch(&self.settings) {
             self.start();
-            if self.status == Status::Running {
+            if self.status.mirror == Status::Running {
                 context.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             }
         }
@@ -94,12 +102,16 @@ impl SettingsWindow {
     fn start(&mut self) {
         self.wanted = true;
         self.relay.stop();
-        self.status = settings::start(&self.settings, &self.monitors, &mut *self.mirror);
+        self.status = StatusLine::new(settings::start(
+            &self.settings,
+            &self.monitors,
+            &mut *self.mirror,
+        ));
         let card_display = self
             .monitors
             .iter()
             .find(|monitor| self.settings.card_display.as_ref() == Some(&monitor.device_path));
-        if self.status == Status::Running
+        if self.status.mirror == Status::Running
             && let (Some(audio_source), Some(card_display)) =
                 (&self.settings.audio_source, card_display)
         {
@@ -112,7 +124,44 @@ impl SettingsWindow {
         self.mirror.stop();
         self.relay.stop();
         self.wanted = wanted;
-        self.status = status;
+        self.status = StatusLine::new(status);
+    }
+
+    /// Follows the mirror ending on its own, and starts a restarting mirror again on a timer.
+    fn follow_mirror(&mut self, context: &egui::Context) {
+        match self.mirror.take_end() {
+            Some(Ended::Restart(reason)) => {
+                self.status.mirror = Status::Restarting(reason);
+                self.restart_at = Instant::now();
+            }
+            Some(Ended::Stop(reason)) => self.stop(true, Status::Error(reason)),
+            None => {}
+        }
+        if matches!(self.status.mirror, Status::Restarting(_)) {
+            let wait = self.restart_at.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                self.start();
+                self.status.mirror = settings::restarted(self.status.mirror.clone());
+                self.restart_at = Instant::now() + RESTART_EVERY;
+            }
+            if matches!(self.status.mirror, Status::Restarting(_)) {
+                context.request_repaint_after(
+                    self.restart_at.saturating_duration_since(Instant::now()),
+                );
+            }
+        }
+    }
+
+    /// Takes the guard's and relay's latest reports into the status line.
+    fn follow_reports(&mut self) {
+        if let Some(report) = self.guard.take_report() {
+            self.status.other = Some(report);
+        }
+        match self.relay.take_report() {
+            Some(RelayReport::Failing(problem)) => self.status.audio = Some(problem),
+            Some(RelayReport::Relaying) => self.status.audio = None,
+            None => {}
+        }
     }
 
     /// Re-reads the monitors after a display change and follows the card display.
@@ -120,7 +169,7 @@ impl SettingsWindow {
         let monitors = match guard::monitors() {
             Ok(monitors) => monitors,
             Err(error) => {
-                self.status = Status::Error(error);
+                self.status.other = Some(error);
                 return;
             }
         };
@@ -189,10 +238,6 @@ impl SettingsWindow {
             });
         ui.end_row();
     }
-
-    fn running(&self) -> bool {
-        self.wanted && !matches!(self.status, Status::Error(_))
-    }
 }
 
 fn update_guard(guard: &mut dyn Guard, settings: &Settings) {
@@ -219,20 +264,15 @@ fn monitor_label(monitor: &Monitor) -> String {
 
 impl eframe::App for SettingsWindow {
     // Runs while minimised too, so the mirror follows the card display without the window open.
-    fn logic(&mut self, _context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         if self.displays_changed.swap(false, Ordering::Relaxed) {
             self.follow_displays();
         }
+        self.follow_mirror(context);
+        self.follow_reports();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if let Some(report) = self
-            .guard
-            .take_report()
-            .or_else(|| self.relay.take_report())
-        {
-            self.status = Status::Error(report);
-        }
         let before = self.settings.clone();
         egui::CentralPanel::default().show(ui, |ui| {
             egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
@@ -242,7 +282,7 @@ impl eframe::App for SettingsWindow {
                 self.audio_dropdown(ui);
             });
             ui.horizontal(|ui| {
-                if self.running() {
+                if self.status.shows_stop() {
                     if ui.button("Stop").clicked() {
                         self.stop(false, Status::Stopped);
                     }
@@ -256,7 +296,7 @@ impl eframe::App for SettingsWindow {
         if self.settings != before {
             update_guard(&mut *self.guard, &self.settings);
             if let Err(error) = self.settings.save() {
-                self.status = Status::Error(error);
+                self.status.other = Some(error);
             }
         }
     }
@@ -267,9 +307,12 @@ mod tests {
     use super::*;
     use crate::mirror::StandInMirror;
 
-    /// Records what the settings window asked of the audio relay.
+    /// Records what the settings window asked of the audio relay, and hands out `reports`.
     #[derive(Default, Clone)]
-    struct RecordingRelay(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+    struct RecordingRelay(
+        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        std::rc::Rc<std::cell::RefCell<Vec<RelayReport>>>,
+    );
 
     impl audio::Relay for RecordingRelay {
         fn start(&mut self, audio_source: &str, card_display_name: &str) {
@@ -280,8 +323,8 @@ mod tests {
         fn stop(&mut self) {
             self.0.borrow_mut().push("stop".into());
         }
-        fn take_report(&mut self) -> Option<String> {
-            None
+        fn take_report(&mut self) -> Option<RelayReport> {
+            self.1.borrow_mut().pop()
         }
     }
 
@@ -317,7 +360,8 @@ mod tests {
             },
             monitors: vec![monitor("source", true), monitor("card", false)],
             playback_devices: Vec::new(),
-            status: Status::Stopped,
+            status: StatusLine::new(Status::Stopped),
+            restart_at: Instant::now(),
             mirror: Box::new(StandInMirror::default()),
             relay: Box::new(RecordingRelay::default()),
             guard: Box::new(NoGuard),
@@ -352,7 +396,7 @@ mod tests {
         let mut window = window("gone");
         assert!(!launched_minimised(&mut window));
         assert!(!window.mirror.is_running());
-        assert!(window.running());
+        assert!(window.status.shows_stop());
         assert_eq!(window.status.text(), "Waiting for card display");
     }
 
@@ -390,5 +434,67 @@ mod tests {
         window.start();
         assert!(window.mirror.is_running());
         assert_eq!(*relay.0.borrow(), ["stop"]);
+    }
+
+    #[test]
+    fn audio_problem_keeps_the_stop_button_and_clears_when_audio_recovers() {
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        window.start();
+        relay.1.borrow_mut().push(RelayReport::Failing(
+            "The audio source is not connected.".into(),
+        ));
+        window.follow_reports();
+        assert!(window.status.shows_stop());
+        assert_eq!(
+            window.status.text(),
+            "Running | The audio source is not connected."
+        );
+        relay.1.borrow_mut().push(RelayReport::Relaying);
+        window.follow_reports();
+        assert_eq!(window.status.text(), "Running");
+    }
+
+    fn mirror_ends(window: &mut SettingsWindow, end: Ended) {
+        window.mirror = Box::new(StandInMirror {
+            running: true,
+            end: Some(end),
+        });
+    }
+
+    #[test]
+    fn mirror_that_lost_the_graphics_card_is_restarted() {
+        let mut window = window("card");
+        window.start();
+        mirror_ends(&mut window, Ended::Restart("lost".into()));
+        assert!(!window.mirror.is_running());
+        window.follow_mirror(&egui::Context::default());
+        assert!(window.mirror.is_running());
+        assert_eq!(window.status.text(), "Running");
+        assert!(window.status.shows_stop());
+    }
+
+    #[test]
+    fn mirror_that_failed_for_good_stops_with_its_reason_and_audio() {
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        window.start();
+        mirror_ends(&mut window, Ended::Stop("The mirror stopped.".into()));
+        window.follow_mirror(&egui::Context::default());
+        assert!(!window.mirror.is_running());
+        assert_eq!(window.status.text(), "The mirror stopped.");
+        assert!(!window.status.shows_stop());
+        assert_eq!(relay.0.borrow().last().map(String::as_str), Some("stop"));
+    }
+
+    #[test]
+    fn restart_waits_with_the_stop_button_for_an_unplugged_card_display() {
+        let mut window = window("card");
+        window.start();
+        mirror_ends(&mut window, Ended::Restart("lost".into()));
+        window
+            .monitors
+            .retain(|monitor| monitor.device_path != "card");
+        window.follow_mirror(&egui::Context::default());
+        assert_eq!(window.status.text(), "Waiting for card display");
+        assert!(window.status.shows_stop());
     }
 }

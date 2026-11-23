@@ -2,7 +2,7 @@
 //! drawn once per refresh through a flip-model swap chain on its own thread.
 
 use super::capture::Desktop;
-use super::{Fit, Mirror, Output, find_output, fit, source_output};
+use super::{Ended, Fit, Mirror, Output, ended, find_output, fit, source_output};
 use crate::guard::Monitor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,16 +52,26 @@ pub trait Picture {
 /// The mirror thread and what tests read from it.
 struct Running {
     thread_id: u32,
-    thread: JoinHandle<()>,
+    /// The HRESULT the mirror ended with on its own; `None` after WM_QUIT.
+    thread: JoinHandle<Option<i32>>,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the Windows tests"))]
     window: isize,
     #[cfg_attr(not(test), expect(dead_code, reason = "read by the Windows tests"))]
     presents: Arc<AtomicU64>,
 }
 
-#[derive(Default)]
 pub struct MirrorWindow {
     running: Option<Running>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl MirrorWindow {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            running: None,
+            wake: Arc::new(wake),
+        }
+    }
 }
 
 impl Drop for MirrorWindow {
@@ -77,9 +87,13 @@ impl Mirror for MirrorWindow {
         let presents = Arc::new(AtomicU64::new(0));
         let thread = {
             let (source_monitor, card_display) = (source_monitor.clone(), card_display.clone());
-            let presents = presents.clone();
+            let (presents, wake) = (presents.clone(), self.wake.clone());
             std::thread::spawn(move || {
-                run(&source_monitor, &card_display, &presents, &started_sender);
+                let code = run(&source_monitor, &card_display, &presents, &started_sender);
+                if code.is_some() {
+                    wake();
+                }
+                code
             })
         };
         match started.recv() {
@@ -119,15 +133,29 @@ impl Mirror for MirrorWindow {
             .as_ref()
             .is_some_and(|running| !running.thread.is_finished())
     }
+
+    fn take_end(&mut self) -> Option<Ended> {
+        if !self.running.as_ref()?.thread.is_finished() {
+            return None;
+        }
+        let running = self.running.take()?;
+        // A panicked mirror thread has no HRESULT; E_UNEXPECTED stops the mirror with a code.
+        let code = running
+            .thread
+            .join()
+            .unwrap_or(Some(0x8000_FFFF_u32.cast_signed()))?;
+        Some(ended(code))
+    }
 }
 
 /// Mirror thread: opens the window, reports its thread id and window, then draws until WM_QUIT.
+/// Returns the HRESULT of a failed draw or present, `None` after WM_QUIT or a failed open.
 fn run(
     source_monitor: &Monitor,
     card_display: &Monitor,
     presents: &AtomicU64,
     started: &Sender<Result<(u32, isize), String>>,
-) {
+) -> Option<i32> {
     let opened = Screen::open(source_monitor, card_display).and_then(|(screen, source)| {
         // SAFETY: plain call returning the context's device.
         let device = unsafe { screen.context.GetDevice() }
@@ -139,7 +167,7 @@ fn run(
         Ok(opened) => opened,
         Err(message) => {
             let _ = started.send(Err(message));
-            return;
+            return None;
         }
     };
     let mut message = MSG::default();
@@ -151,10 +179,12 @@ fn run(
         .send(Ok((thread_id, screen.window.0.0 as isize)))
         .is_err()
     {
-        return;
+        return None;
     }
-    // shortcut: a lost device or failed present ends the thread; the settings window restarts it on the next display change, add a wake from here if that proves too late.
-    let _ = screen.draw_until_quit(&mut desktop, presents);
+    screen
+        .draw_until_quit(&mut desktop, presents)
+        .err()
+        .map(|error| error.code().0)
 }
 
 /// Destroys the mirror window when dropped.

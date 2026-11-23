@@ -18,7 +18,7 @@ fn card_display() -> Monitor {
 }
 
 fn started(card_display: &Monitor) -> MirrorWindow {
-    let mut mirror = MirrorWindow::default();
+    let mut mirror = MirrorWindow::new(|| {});
     mirror.start(card_display, card_display).unwrap();
     mirror
 }
@@ -111,4 +111,33 @@ fn stop_closes_the_mirror_window() {
     assert!(!mirror.is_running());
     // SAFETY: IsWindow accepts any handle.
     assert!(!unsafe { IsWindow(Some(window)) }.as_bool());
+}
+
+#[test]
+fn a_lost_graphics_card_restarts_and_other_failures_stop() {
+    assert!(matches!(
+        ended(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED.0),
+        Ended::Restart(_)
+    ));
+    assert!(matches!(
+        ended(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_HUNG.0),
+        Ended::Restart(_)
+    ));
+    assert!(matches!(
+        ended(windows::Win32::Graphics::Dxgi::DXGI_ERROR_ACCESS_LOST.0),
+        Ended::Restart(_)
+    ));
+    assert!(matches!(
+        ended(windows::Win32::Foundation::E_OUTOFMEMORY.0),
+        Ended::Stop(_)
+    ));
+}
+
+#[test]
+fn stopped_mirror_has_no_end_to_report() {
+    let _duplicating = duplicating();
+    let mut mirror = started(&card_display());
+    assert_eq!(mirror.take_end(), None);
+    mirror.stop();
+    assert_eq!(mirror.take_end(), None);
 }
