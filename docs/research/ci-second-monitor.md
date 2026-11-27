@@ -57,6 +57,13 @@ Resolution and count of virtual monitors come from `vdd_settings.xml` [3][2].
   monitor works, and the mirror starts and presents with one virtual monitor as source monitor and
   a second (`<count>2</count>` in `vdd_settings.xml`) as card display. Presents are not paced to
   the virtual monitor's mode (47 a second at 30 Hz). The text below is from before that.
+- Higher refresh rates (issue #31): the virtual monitors offer 30 to 165 Hz at each resolution
+  (`vdd_settings.xml`), and `ChangeDisplaySettingsExW` sets the card display to 120 Hz, which
+  `guard::monitors` then reads. The mirror runs on it, but its presents follow the runner's
+  64 Hz Hyper-V monitor, not the virtual monitor: 49.8 a second at 30 Hz and 63.9 at 120 Hz
+  (run 46056861903). A virtual monitor has no vertical blank, so CI can't prove that the mirror
+  follows a 120 Hz refresh, or that nothing caps it at 60. That stays an owner check on a
+  capture card that takes 120 Hz (issue #13); `second_monitor_mirror_runs_on_a_card_display_set_to_120_hz` checks the rest.
 - Not measured yet. The spike only listed monitors.
 - With no GPU, WARP backs D3D11 up to feature level 11_1 through the Microsoft Basic Render
   Adapter, and is present in DXGI adapter enumeration [14]. The runner's display adapter is the

@@ -58,6 +58,12 @@ pub struct Monitor {
     pub top: i32,
     /// Name of the graphics card the monitor is plugged into, as DXGI lists it; empty if unknown.
     pub graphics_card: String,
+    /// The physical device the monitor is part of (`DEVPKEY_Device_ContainerId`), shared with its
+    /// HDMI or DisplayPort sound output; empty if unknown.
+    pub container_id: String,
+    /// The graphics card's device path and the target id of the video output the monitor is on;
+    /// unlike `device_path` it stays when the monitor's EDID (its name) changes. Empty if unknown.
+    pub connector: String,
 }
 
 /// What the settings window needs from the window guard and pointer guard.
@@ -130,6 +136,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             } else {
                 "Stand-in graphics card".into()
             },
+            container_id: String::new(),
+            connector: format!("{device_path} connector"),
         };
     // Arranged as on the sender: the source monitor left of the primary monitor, the card display right of it.
     Ok(vec![
@@ -228,11 +236,44 @@ pub(crate) fn device_path(
     ))
 }
 
+/// A monitor's size on the desktop. The display configuration gives the source mode before the
+/// monitor's rotation, so a monitor turned to portrait has its width and height swapped.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows monitor list calls it; its tests run everywhere"
+    )
+)]
+fn desktop_size(width: u32, height: u32, sideways: bool) -> (u32, u32) {
+    if sideways {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
+#[cfg(test)]
+mod desktop_size_tests {
+    use super::desktop_size;
+
+    #[test]
+    fn a_portrait_monitor_is_taller_than_wide() {
+        assert_eq!(desktop_size(2560, 1440, true), (1440, 2560));
+    }
+
+    #[test]
+    fn a_landscape_or_upside_down_monitor_keeps_its_size() {
+        assert_eq!(desktop_size(2560, 1440, false), (2560, 1440));
+    }
+}
+
 /// Active monitors from the Windows display configuration, keyed by device path.
 #[cfg(windows)]
 pub fn monitors() -> Result<Vec<Monitor>, String> {
     use windows::Win32::Devices::Display::{
-        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_ROTATION_ROTATE90,
+        DISPLAYCONFIG_ROTATION_ROTATE270, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
         DisplayConfigGetDeviceInfo,
     };
 
@@ -262,12 +303,18 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         // SAFETY: the mode a path's source index points to is a source mode.
         let source_mode = unsafe { mode.Anonymous.sourceMode };
         let rate = path.targetInfo.refreshRate;
+        let sideways = matches!(
+            path.targetInfo.rotation,
+            DISPLAYCONFIG_ROTATION_ROTATE90 | DISPLAYCONFIG_ROTATION_ROTATE270
+        );
+        let (width, height) = desktop_size(source_mode.width, source_mode.height, sideways);
         let gdi_name = wide_to_string(&source.viewGdiDeviceName);
         let graphics_card = cards
             .iter()
             .find(|(output, _)| output.eq_ignore_ascii_case(&gdi_name))
             .map(|(_, card)| card.clone())
             .unwrap_or_default();
+        let container_id = displays::container_id(&device_path);
         monitors.push(Monitor {
             device_path,
             gdi_name,
@@ -276,8 +323,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             } else {
                 name
             },
-            width: source_mode.width,
-            height: source_mode.height,
+            width,
+            height,
             refresh_hz: (rate.Numerator + rate.Denominator / 2)
                 .checked_div(rate.Denominator)
                 .unwrap_or(0),
@@ -286,6 +333,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             left: source_mode.position.x,
             top: source_mode.position.y,
             graphics_card,
+            container_id,
+            connector: displays::connector(path.targetInfo.adapterId, path.targetInfo.id),
         });
     }
     Ok(monitors)
@@ -324,8 +373,13 @@ fn graphics_cards() -> Vec<(String, String)> {
 #[cfg(all(test, windows))]
 pub mod second_monitor {
     use super::Monitor;
+    use std::io::Write as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_ROTATION_ROTATE90,
+        SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SetDisplayConfig,
+    };
 
     const ENV: &str = "CARDCAST_SECOND_MONITOR";
 
@@ -387,11 +441,143 @@ pub mod second_monitor {
         }
     }
 
+    /// A monitor set to another refresh rate at its resolution, as a user does in Windows' advanced
+    /// display settings; its saved mode is put back on drop.
+    pub struct RefreshRate(Vec<u16>);
+
+    impl RefreshRate {
+        pub fn set(monitor: &Monitor, hz: u32) -> Self {
+            use windows::Win32::Graphics::Gdi::{
+                CDS_TYPE, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
+                DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
+            };
+            let name: Vec<u16> = monitor.gdi_name.encode_utf16().chain([0]).collect();
+            let mode = DEVMODEW {
+                dmSize: u16::try_from(size_of::<DEVMODEW>()).unwrap_or(0),
+                dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
+                dmPelsWidth: monitor.width,
+                dmPelsHeight: monitor.height,
+                dmDisplayFrequency: hz,
+                ..DEVMODEW::default()
+            };
+            // SAFETY: name is NUL-terminated and mode a DEVMODEW with dmSize set; both outlive the call.
+            let result = unsafe {
+                ChangeDisplaySettingsExW(
+                    windows::core::PCWSTR(name.as_ptr()),
+                    Some(&raw const mode),
+                    None,
+                    CDS_TYPE(0),
+                    None,
+                )
+            };
+            assert_eq!(
+                result, DISP_CHANGE_SUCCESSFUL,
+                "{} could not be set to {hz} Hz",
+                monitor.gdi_name
+            );
+            Self(name)
+        }
+    }
+
+    impl Drop for RefreshRate {
+        /// Never panics: it also runs while a failed test unwinds.
+        fn drop(&mut self) {
+            use windows::Win32::Graphics::Gdi::{CDS_TYPE, ChangeDisplaySettingsExW};
+            // SAFETY: the name is NUL-terminated; no mode with no flags puts back the saved one.
+            let _ = unsafe {
+                ChangeDisplaySettingsExW(
+                    windows::core::PCWSTR(self.0.as_ptr()),
+                    None,
+                    None,
+                    CDS_TYPE(0),
+                    None,
+                )
+            };
+        }
+    }
+
     fn pnputil(action: &str, device: &str) -> bool {
         Command::new("pnputil")
             .args([action, device])
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    /// A monitor turned to portrait; it is turned back on drop.
+    pub struct Rotated {
+        device_path: String,
+        paths: Vec<DISPLAYCONFIG_PATH_INFO>,
+        modes: Vec<DISPLAYCONFIG_MODE_INFO>,
+    }
+
+    impl Rotated {
+        /// Turns the monitor with `device_path` 90°, keeping its source mode: `SetDisplayConfig`
+        /// takes it unswapped (docs/win32-pitfalls.md).
+        pub fn portrait(device_path: &str) -> Self {
+            let (paths, modes) = super::display_config().unwrap_or_else(|error| panic!("{error}"));
+            let original = Self {
+                device_path: device_path.to_owned(),
+                paths: paths.clone(),
+                modes: modes.clone(),
+            };
+            let mut paths = paths;
+            let path = paths
+                .iter_mut()
+                .find(|path| super::device_path(path).is_some_and(|(p, _)| p == device_path))
+                .unwrap_or_else(|| panic!("no display path for {device_path}"));
+            path.targetInfo.rotation = DISPLAYCONFIG_ROTATION_ROTATE90;
+            let result = apply(&paths, &modes);
+            log(&format!("rotate 90: {result}"));
+            assert_eq!(result, 0, "SetDisplayConfig could not rotate the monitor");
+            original
+        }
+
+        /// Waits until the monitor's desktop is landscape; false on timeout.
+        fn wait_for_landscape(&self) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let landscape = super::monitors().is_ok_and(|monitors| {
+                    monitors.iter().any(|monitor| {
+                        monitor.device_path == self.device_path && monitor.width > monitor.height
+                    })
+                });
+                if landscape {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        }
+    }
+
+    impl Drop for Rotated {
+        /// Waits until the monitor is landscape again so later tests don't run on a rotated
+        /// monitor, and panics if it isn't; while a failed test unwinds it only logs, since a
+        /// second panic would abort the test run.
+        fn drop(&mut self) {
+            let result = apply(&self.paths, &self.modes);
+            let back = result == 0 && self.wait_for_landscape();
+            log(&format!("rotation put back: {result}, landscape: {back}"));
+            if !back && !std::thread::panicking() {
+                panic!("could not turn {} back to landscape", self.device_path);
+            }
+        }
+    }
+
+    fn apply(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &[DISPLAYCONFIG_MODE_INFO]) -> i32 {
+        // SAFETY: both slices come from QueryDisplayConfig and stay alive for the call.
+        unsafe {
+            SetDisplayConfig(
+                Some(paths),
+                Some(modes),
+                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+            )
+        }
+    }
+
+    /// Written to stderr directly: libtest captures only the print macros, and CI runs without --nocapture.
+    pub fn log(line: &str) {
+        let _ = writeln!(std::io::stderr(), "{line}");
     }
 
     /// Polls until `done` holds; panics after `limit`.
@@ -460,5 +646,111 @@ mod tests {
             Ok(Some("quit")),
             "the thread was left running or never asked to quit"
         );
+    }
+
+    use super::second_monitor::{Rotated, log, wait_for};
+    use windows::Win32::Foundation::{LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    };
+    use windows::core::BOOL;
+
+    /// Each monitor's GDI name and `rcMonitor`, the desktop rectangle Windows reports.
+    fn desktop_rects() -> Vec<(String, RECT)> {
+        extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, rects: LPARAM) -> BOOL {
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = u32::try_from(size_of::<MONITORINFOEXW>()).unwrap_or(0);
+            // SAFETY: info is a MONITORINFOEXW with cbSize set, which GetMonitorInfoW accepts as a MONITORINFO.
+            if unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) }.as_bool()
+            {
+                // SAFETY: rects is the Vec passed to EnumDisplayMonitors below, alive for its call.
+                let rects = unsafe { &mut *(rects.0 as *mut Vec<(String, RECT)>) };
+                rects.push((
+                    super::wide_to_string(&info.szDevice),
+                    info.monitorInfo.rcMonitor,
+                ));
+            }
+            true.into()
+        }
+        let mut rects = Vec::new();
+        // SAFETY: the callback only runs during this call, while rects is alive.
+        let _ =
+            unsafe { EnumDisplayMonitors(None, None, Some(each), LPARAM(&raw mut rects as isize)) };
+        rects
+    }
+
+    #[test]
+    fn second_monitor_rotated_monitor_has_the_size_and_position_the_desktop_gives_it() {
+        let Some(monitors) = super::second_monitor::monitors(2) else {
+            return;
+        };
+        // The rightmost, so turning it leaves no gap between monitors.
+        let turned = monitors.iter().max_by_key(|monitor| monitor.left).unwrap();
+        let _rotated = Rotated::portrait(&turned.device_path);
+        let portrait = |rects: &[(String, RECT)]| {
+            rects.iter().any(|(name, rect)| {
+                *name == turned.gdi_name && rect.bottom - rect.top > rect.right - rect.left
+            })
+        };
+        wait_for(
+            "the desktop to show the monitor in portrait",
+            Duration::from_secs(10),
+            || portrait(&desktop_rects()),
+        );
+        let (paths, modes) = super::display_config().unwrap();
+        for path in &paths {
+            // SAFETY: as in `monitors`: the union holds modeInfoIdx, which points at a source mode.
+            let source = unsafe {
+                modes[path.sourceInfo.Anonymous.modeInfoIdx as usize]
+                    .Anonymous
+                    .sourceMode
+            };
+            log(&format!(
+                "rotation {:?}: source mode {}x{}",
+                path.targetInfo.rotation, source.width, source.height
+            ));
+        }
+        let rects = desktop_rects();
+        let monitors = super::monitors().unwrap();
+        assert_eq!(monitors.len(), rects.len());
+        for monitor in &monitors {
+            let (_, rect) = rects
+                .iter()
+                .find(|(name, _)| *name == monitor.gdi_name)
+                .unwrap();
+            log(&format!(
+                "{} {}: monitors() {}x{} at {},{}; rcMonitor {}x{} at {},{}",
+                monitor.gdi_name,
+                if monitor.gdi_name == turned.gdi_name {
+                    "rotated 90"
+                } else {
+                    "unrotated"
+                },
+                monitor.width,
+                monitor.height,
+                monitor.left,
+                monitor.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                rect.left,
+                rect.top
+            ));
+            assert_eq!(
+                (
+                    monitor.left,
+                    monitor.top,
+                    monitor.width as i32,
+                    monitor.height as i32
+                ),
+                (
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top
+                ),
+                "{}",
+                monitor.gdi_name
+            );
+        }
     }
 }

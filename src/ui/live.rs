@@ -229,7 +229,7 @@ pub fn layout_map(
         .collect();
     let rects = look::fit_layout(&drawn, area.shrink2(vec2(6.0, 34.0)), 3.0);
     let live = *status == Status::Running;
-    let clash = settings::role_problem(settings).is_some();
+    let clash = settings::role_problem(settings, monitors).is_some();
     let mut ends = [None, None];
     for (monitor, rect) in monitors.iter().zip(&rects) {
         let roles: Vec<Role> = Role::ALL
@@ -262,7 +262,7 @@ pub fn layout_map(
             response.hovered(),
             problem,
         );
-        role_menu(&response, monitor, settings);
+        role_menu(&response, monitor, monitors, settings);
     }
     if let (Some(placeholder), Some(rect)) = (&missing_card_display, rects.last()) {
         placeholder_tile(&painter, *rect);
@@ -289,15 +289,23 @@ pub fn layout_map(
     }
 }
 
-/// The roles to choose for a clicked monitor; the current ones are ticked. It opens beside the
-/// tile, so it covers neither the tile nor the choices below.
-fn role_menu(response: &egui::Response, monitor: &Monitor, settings: &mut Settings) {
+/// The roles a clicked monitor can take ([`Role::offers`]); the current ones are ticked. It opens
+/// beside the tile, so it covers neither the tile nor the choices below.
+fn role_menu(
+    response: &egui::Response,
+    monitor: &Monitor,
+    monitors: &[Monitor],
+    settings: &mut Settings,
+) {
     egui::Popup::menu(response)
         .align(egui::RectAlign::RIGHT_START)
         .align_alternatives(&[egui::RectAlign::LEFT_START, egui::RectAlign::BOTTOM_START])
         .show(|ui| {
             ui.label(RichText::new(&monitor.name).strong().color(look::TEXT));
             for role in Role::ALL {
+                if !role.offers(settings, monitors, monitor) {
+                    continue;
+                }
                 let chosen = role.is(settings, monitor);
                 let row = ui.horizontal(|ui| {
                     let (tick, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());

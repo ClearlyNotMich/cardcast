@@ -6,7 +6,7 @@ mod settings;
 #[cfg(all(test, target_os = "linux"))]
 mod snapshots;
 
-use crate::audio::{self, AudioDevice, Relay, RelayReport};
+use crate::audio::{self, AudioDevice, Relay, RelayReport, SoundOutput};
 use crate::guard::{self, Guard, Monitor};
 use crate::mirror::{self, Ended, Mirror};
 use eframe::egui::{self, RichText};
@@ -20,7 +20,7 @@ use std::time::Instant;
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([780.0, 720.0])
+            .with_inner_size([780.0, 780.0])
             .with_min_inner_size([560.0, 560.0]),
         ..Default::default()
     };
@@ -40,6 +40,8 @@ struct SettingsWindow {
     settings: Settings,
     monitors: Vec<Monitor>,
     playback_devices: Vec<AudioDevice>,
+    /// The sound output dialog is open with this choice, not yet saved.
+    choosing_sound_output: Option<SoundOutput>,
     status: StatusLine,
     /// When a restarting mirror is next started.
     restart_at: Instant,
@@ -69,7 +71,16 @@ impl SettingsWindow {
             status.other = Some(error);
             Vec::new()
         });
-        let settings = Settings::load().with_defaults(&monitors);
+        let mut settings = Settings::load();
+        let cleared = settings.clear_role_clashes();
+        let mut settings = settings.with_defaults(&monitors);
+        let followed = settings::follow_card_display(&mut settings, &monitors);
+        if (cleared.is_some() || followed)
+            && let Err(error) = settings.save()
+        {
+            status.other = Some(error);
+        }
+        status.other = settings::notices(status.other, cleared);
         let relay_context = context.clone();
         let mirror_context = context.clone();
         let guard_context = context.clone();
@@ -89,6 +100,7 @@ impl SettingsWindow {
             settings,
             monitors,
             playback_devices,
+            choosing_sound_output: None,
             status,
             restart_at: Instant::now(),
             attempts: 0,
@@ -106,9 +118,12 @@ impl SettingsWindow {
     /// Starts the mirror from saved settings; the window minimises once it runs.
     fn launch(&mut self, context: &egui::Context) {
         if settings::starts_on_launch(&self.settings) {
+            // A problem found while loading outlives the start, which clears the status line's.
+            let loaded = self.status.other.take();
             self.minimise_when_running = true;
             self.start();
             self.follow_mirror(context);
+            self.status.other = settings::notices(self.status.other.take(), loaded);
         }
     }
 
@@ -144,14 +159,41 @@ impl SettingsWindow {
         }
         self.status.mirror = Status::Running;
         self.attempts = 0;
-        let card_display = self
-            .monitors
+        self.start_audio();
+    }
+
+    fn card_display(&self) -> Option<&Monitor> {
+        self.monitors
             .iter()
-            .find(|monitor| self.settings.card_display.as_ref() == Some(&monitor.device_path));
-        if let (Some(audio_source), Some(card_display)) =
-            (&self.settings.audio_source, card_display)
-        {
-            self.relay.start(audio_source, &card_display.name);
+            .find(|monitor| self.settings.card_display.as_ref() == Some(&monitor.device_path))
+    }
+
+    /// Starts the relay for the running mirror, unless the sound output is No audio.
+    fn start_audio(&mut self) {
+        let Some(card_display) = self.card_display() else {
+            return;
+        };
+        let card_display = (card_display.container_id.clone(), card_display.name.clone());
+        if let (Some(audio_source), false) = (
+            &self.settings.audio_source,
+            self.settings.sound_output == SoundOutput::NoAudio,
+        ) {
+            self.relay.start(
+                audio_source,
+                &self.settings.sound_output,
+                &card_display.0,
+                &card_display.1,
+            );
+        }
+    }
+
+    /// A new sound output restarts only the audio; the mirror never waits on it.
+    fn restart_audio(&mut self) {
+        self.relay.stop();
+        self.status.audio = None;
+        self.status.choose_sound_output = false;
+        if self.status.mirror == Status::Running {
+            self.start_audio();
         }
     }
 
@@ -207,8 +249,18 @@ impl SettingsWindow {
             self.status.follow_guard(report);
         }
         match self.relay.take_report() {
-            Some(RelayReport::Failing(problem)) => self.status.audio = Some(problem),
-            Some(RelayReport::Relaying) => self.status.audio = None,
+            Some(RelayReport::Failing(problem)) => {
+                self.status.audio = Some(problem);
+                self.status.choose_sound_output = false;
+            }
+            Some(RelayReport::NoSoundOutput) => {
+                self.status.audio = Some(audio::NO_SOUND_OUTPUT.into());
+                self.status.choose_sound_output = true;
+            }
+            Some(RelayReport::Relaying) => {
+                self.status.audio = None;
+                self.status.choose_sound_output = false;
+            }
             None => {}
         }
     }
@@ -226,6 +278,8 @@ impl SettingsWindow {
 
     /// Re-reads the monitors after a display change and follows the source monitor and card display.
     fn follow_displays(&mut self) {
+        // A card display's sound output comes and goes with it.
+        self.take_playback_devices(audio::playback_devices());
         match guard::monitors() {
             Ok(monitors) => self.follow_monitors(monitors),
             Err(error) => self.status.other = Some(error),
@@ -233,15 +287,22 @@ impl SettingsWindow {
     }
 
     fn follow_monitors(&mut self, monitors: Vec<Monitor>) {
-        let chosen = |monitors: &'_ [Monitor]| {
-            [&self.settings.source_monitor, &self.settings.card_display].map(|chosen| {
+        let chosen = |settings: &Settings, monitors: &'_ [Monitor]| {
+            [&settings.source_monitor, &settings.card_display].map(|chosen| {
                 monitors
                     .iter()
                     .find(|monitor| chosen.as_ref() == Some(&monitor.device_path))
                     .cloned()
             })
         };
-        let (before, now) = (chosen(&self.monitors), chosen(&monitors));
+        let before = chosen(&self.settings, &self.monitors);
+        if settings::follow_card_display(&mut self.settings, &monitors) {
+            update_guard(&mut *self.guard, &self.settings);
+            if let Err(error) = self.settings.save() {
+                self.status.other = Some(error);
+            }
+        }
+        let now = chosen(&self.settings, &monitors);
         let follow = settings::follow_displays(
             self.status.shows_stop(),
             self.mirror.is_running() || matches!(self.status.mirror, Status::Restarting(_)),
@@ -262,10 +323,18 @@ impl SettingsWindow {
         update_guard(&mut *self.guard, &self.settings);
         if settings::restarts_on_change(self.status.shows_stop(), before, &self.settings) {
             self.start_by_user();
+        } else if before.sound_output != self.settings.sound_output {
+            self.restart_audio();
         }
     }
 
+    /// Offers only the monitors the role can take ([`Role::offers`]).
     fn monitor_dropdown(&mut self, ui: &mut egui::Ui, role: Role) {
+        let offered: Vec<&Monitor> = self
+            .monitors
+            .iter()
+            .filter(|monitor| role.offers(&self.settings, &self.monitors, monitor))
+            .collect();
         let selected = role.choice(&mut self.settings);
         let shown = self
             .monitors
@@ -277,7 +346,7 @@ impl SettingsWindow {
             .selected_text(shown)
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                for monitor in &self.monitors {
+                for monitor in offered {
                     ui.selectable_value(
                         selected,
                         Some(monitor.device_path.clone()),
@@ -290,6 +359,12 @@ impl SettingsWindow {
     }
 
     fn audio_dropdown(&mut self, ui: &mut egui::Ui) {
+        let card_display = self
+            .monitors
+            .iter()
+            .find(|monitor| self.settings.card_display.as_ref() == Some(&monitor.device_path));
+        let choices =
+            settings::audio_source_choices(&self.playback_devices, &self.settings, card_display);
         let selected = &mut self.settings.audio_source;
         let shown = self
             .playback_devices
@@ -301,12 +376,97 @@ impl SettingsWindow {
             .selected_text(shown)
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                for device in &self.playback_devices {
+                for device in &choices {
                     ui.selectable_value(selected, Some(device.id.clone()), &device.name);
                 }
             })
             .response
             .labelled_by(label.id);
+        ui.horizontal_wrapped(|ui| {
+            let shown = settings::sound_output_label(
+                &self.settings,
+                &self.playback_devices,
+                self.card_display(),
+            );
+            ui.label(
+                RichText::new(format!("Sound output: {shown} ·"))
+                    .small()
+                    .color(look::TEXT_DIM),
+            );
+            if ui
+                .link(RichText::new("Change").small())
+                .on_hover_text("Choose where the capture card's sound plays")
+                .clicked()
+            {
+                self.choose_sound_output();
+            }
+        });
+    }
+
+    /// A fresh list of playback devices; a failed one keeps the old list and says why.
+    fn take_playback_devices(&mut self, devices: Result<Vec<AudioDevice>, String>) {
+        match devices {
+            Ok(devices) => self.playback_devices = devices,
+            Err(error) => self.status.other = Some(error),
+        }
+    }
+
+    /// Opens the sound output dialog with the saved choice, on a fresh list of playback devices.
+    fn choose_sound_output(&mut self) {
+        self.take_playback_devices(audio::playback_devices());
+        self.choosing_sound_output = Some(self.settings.sound_output.clone());
+    }
+
+    /// The sound output dialog: one dropdown, then Save or Cancel.
+    fn sound_output_dialog(&mut self, context: &egui::Context) {
+        let Some(choice) = &mut self.choosing_sound_output else {
+            return;
+        };
+        let choices = settings::sound_output_choices(
+            &self.playback_devices,
+            self.settings.audio_source.as_deref(),
+        );
+        let mut close = false;
+        let mut save = false;
+        let modal = egui::Modal::new(egui::Id::unique("Sound output")).show(context, |ui| {
+            ui.set_width(380.0);
+            let title = ui.label(RichText::new("Sound output").strong().color(look::TEXT));
+            ui.label(
+                RichText::new(
+                    "Where the capture card's sound plays. Automatic finds the card display's own \
+                     sound output; choose No audio if the capture card has none.",
+                )
+                .small()
+                .color(look::TEXT_DIM),
+            );
+            ui.add_space(8.0);
+            let shown = choices
+                .iter()
+                .find(|(output, _)| output == choice)
+                .map_or("Automatic", |(_, name)| name.as_str());
+            egui::ComboBox::from_id_salt("Sound output choice")
+                .selected_text(shown)
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for (output, name) in &choices {
+                        ui.selectable_value(choice, output.clone(), name);
+                    }
+                })
+                .response
+                .labelled_by(title.id);
+
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                save = ui.button("Save").clicked();
+                close = ui.button("Cancel").clicked();
+            });
+        });
+        if save {
+            self.settings.sound_output = choice.clone();
+        }
+        if save || close || modal.should_close() {
+            self.choosing_sound_output = None;
+        }
     }
 
     /// Start or Stop, the guard switch, and the status line with the guard notice's dismiss button.
@@ -342,7 +502,11 @@ impl SettingsWindow {
             return;
         };
         ui.add_space(6.0);
-        let tone = look::Tone::of(&self.status.mirror);
+        // A slow mirror still runs, but the box warns.
+        let tone = match look::Tone::of(&self.status.mirror) {
+            look::Tone::Live if self.status.slow_mirror.is_some() => look::Tone::Busy,
+            tone => tone,
+        };
         egui::Frame::new()
             .fill(look::BACKGROUND)
             .stroke(egui::Stroke::new(1.0, tone.colour().gamma_multiply(0.35)))
@@ -353,6 +517,11 @@ impl SettingsWindow {
                 ui.horizontal_wrapped(|ui| {
                     live::dot(ui, tone.colour());
                     ui.label(RichText::new(details).color(look::TEXT));
+                    if self.status.choose_sound_output
+                        && ui.small_button("Choose sound output").clicked()
+                    {
+                        self.choose_sound_output();
+                    }
                     if self.status.guard.is_some()
                         && ui
                             .small_button("Dismiss")
@@ -391,9 +560,13 @@ impl eframe::App for SettingsWindow {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let before = self.settings.clone();
         if let (Status::Running, Some(presents)) = (&self.status.mirror, self.mirror.presents()) {
-            self.frame_rate.sample(presents, Instant::now());
+            let refresh_hz = self.card_display().map_or(0, |monitor| monitor.refresh_hz);
+            let now = Instant::now();
+            self.frame_rate.sample(presents, refresh_hz, now);
+            self.status.slow_mirror = self.frame_rate.slow_warning(now);
         } else if self.status.mirror != Status::Running {
             self.frame_rate = FrameRate::default();
+            self.status.slow_mirror = None;
         }
         let (visible, focused, time) = ui.input(|input| {
             let viewport = input.viewport();
@@ -419,7 +592,7 @@ impl eframe::App for SettingsWindow {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(look::BACKGROUND).inner_margin(16))
             .show(ui, |ui| {
-                let hint = match settings::role_problem(&self.settings) {
+                let hint = match settings::role_problem(&self.settings, &self.monitors) {
                     Some(problem) => RichText::new(problem).small().color(look::PROBLEM),
                     None => RichText::new("Click a monitor to choose its role")
                         .small()
@@ -462,6 +635,9 @@ impl eframe::App for SettingsWindow {
                         .request_discard("the live layout takes the spare height");
                 }
             });
+        self.sound_output_dialog(ui.ctx());
+        // A newly chosen card display's connector is saved with it.
+        settings::follow_card_display(&mut self.settings, &self.monitors);
         if self.settings != before {
             self.follow_settings(&before);
             if let Err(error) = self.settings.save() {
@@ -488,16 +664,26 @@ mod tests {
 
     /// Records what the settings window asked of the audio relay, and hands out `reports`.
     #[derive(Default, Clone)]
-    struct RecordingRelay(
-        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
-        std::rc::Rc<std::cell::RefCell<Vec<RelayReport>>>,
+    pub(super) struct RecordingRelay(
+        pub(super) std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        pub(super) std::rc::Rc<std::cell::RefCell<Vec<RelayReport>>>,
     );
 
     impl audio::Relay for RecordingRelay {
-        fn start(&mut self, audio_source: &str, card_display_name: &str) {
-            self.0
-                .borrow_mut()
-                .push(format!("start {audio_source} to {card_display_name}"));
+        fn start(
+            &mut self,
+            audio_source: &str,
+            output: &SoundOutput,
+            container: &str,
+            card_display_name: &str,
+        ) {
+            let via = match output {
+                SoundOutput::Automatic => String::new(),
+                output => format!(" via {}", output.to_text()),
+            };
+            self.0.borrow_mut().push(format!(
+                "start {audio_source} to {card_display_name} in {container}{via}"
+            ));
         }
         fn stop(&mut self) {
             self.0.borrow_mut().push("stop".into());
@@ -539,6 +725,8 @@ mod tests {
             left: 0,
             top: 0,
             graphics_card: String::new(),
+            container_id: format!("{device_path} container"),
+            connector: format!("{device_path} connector"),
         }
     }
 
@@ -551,6 +739,7 @@ mod tests {
             },
             monitors: vec![monitor("source", true), monitor("card", false)],
             playback_devices: Vec::new(),
+            choosing_sound_output: None,
             status: StatusLine::new(Status::Stopped),
             restart_at: Instant::now(),
             attempts: 0,
@@ -586,6 +775,30 @@ mod tests {
     }
 
     #[test]
+    fn a_choice_cleared_at_load_is_still_said_after_the_start_at_launch() {
+        let mut window = window("card");
+        let cleared =
+            "\"Send windows to\" was the card display, so it is the primary monitor again.";
+        window.status.other = Some(cleared.into());
+        launched_minimised(&mut window);
+        assert_eq!(window.status.text(), format!("Running | {cleared}"));
+    }
+
+    #[test]
+    fn a_load_notice_and_a_start_notice_are_both_said_at_launch() {
+        let mut window = window("card");
+        window.status.other = Some("loaded".into());
+        // Start says the card display can't be the primary monitor.
+        window.monitors[0].primary = false;
+        window.monitors[1].primary = true;
+        window.launch(&egui::Context::default());
+        assert_eq!(
+            window.status.text(),
+            "The card display can't be the primary monitor. | loaded"
+        );
+    }
+
+    #[test]
     fn launch_without_the_card_display_waits_with_the_window_shown() {
         let mut window = window("gone");
         assert!(!launched_minimised(&mut window));
@@ -611,7 +824,7 @@ mod tests {
         window.stop(Status::Stopped);
         assert_eq!(
             *relay.0.borrow(),
-            ["stop", "start speakers to card", "stop"]
+            ["stop", "start speakers to card in card container", "stop"]
         );
     }
 
@@ -655,6 +868,7 @@ mod tests {
             },
             monitors,
             playback_devices: Vec::new(),
+            choosing_sound_output: None,
             status: StatusLine::new(Status::Stopped),
             restart_at: Instant::now(),
             attempts: 0,
@@ -722,6 +936,63 @@ mod tests {
             "the mirror ended after the replug"
         );
         assert_eq!(window.status.text(), "Running");
+    }
+
+    /// A card display the user set to 120 Hz is read as 120 Hz, and the mirror runs on it. Whether
+    /// it presents 120 times a second can't be proved here: a virtual monitor has no vertical
+    /// blank, and its presents follow the runner's 64 Hz Hyper-V monitor instead (about 50 a
+    /// second at 30 Hz, 64 at 120 Hz; docs/research/ci-second-monitor.md). That stays an owner check.
+    #[cfg(windows)]
+    #[test]
+    fn second_monitor_mirror_runs_on_a_card_display_set_to_120_hz() {
+        use guard::second_monitor::{RefreshRate, wait_for};
+        use std::io::Write as _;
+        let Some(monitors) = guard::second_monitor::monitors(3) else {
+            return;
+        };
+        let (source_monitor, card_display) = (monitors[1].clone(), monitors[2].clone());
+        let _rate = RefreshRate::set(&card_display, 120);
+        let mut monitors = Vec::new();
+        wait_for(
+            "the card display at 120 Hz",
+            Duration::from_secs(10),
+            || {
+                monitors = guard::monitors().unwrap();
+                monitors.iter().any(|monitor| {
+                    monitor.device_path == card_display.device_path && monitor.refresh_hz == 120
+                })
+            },
+        );
+        let card_display = monitors
+            .iter()
+            .find(|monitor| monitor.device_path == card_display.device_path)
+            .unwrap()
+            .clone();
+        let (mut window, _guard) = on_second_monitors(monitors, &source_monitor, &card_display);
+        let context = egui::Context::default();
+        start_and_wait(&mut window, &context);
+        // Measured as the header does, after the mirror settled.
+        std::thread::sleep(Duration::from_millis(500));
+        for _ in 0..=8 {
+            let now = Instant::now();
+            window
+                .frame_rate
+                .sample(window.mirror.presents().unwrap(), 120, now);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let shown = window.frame_rate.shown.unwrap();
+        // Written to stderr directly: libtest captures only the print macros.
+        let _ = writeln!(
+            std::io::stderr(),
+            "{shown:.1} presents a second on a {} Hz card display; slow warning: {:?}",
+            card_display.refresh_hz,
+            window.frame_rate.slow_warning(Instant::now())
+        );
+        assert!(
+            shown >= 30.0,
+            "{shown:.1} presents a second on a 120 Hz card display"
+        );
+        assert!(window.mirror.is_running(), "the mirror ended on its own");
     }
 
     #[cfg(windows)]
@@ -800,6 +1071,70 @@ mod tests {
     }
 
     #[test]
+    fn playback_devices_that_cannot_be_listed_are_kept_and_reported() {
+        let mut window = window("card");
+        window.playback_devices = vec![AudioDevice {
+            id: "speakers".into(),
+            name: "Speakers".into(),
+            description: "Speakers".into(),
+            container_id: String::new(),
+        }];
+        window.take_playback_devices(Err("Could not list playback devices.".into()));
+        assert_eq!(window.playback_devices.len(), 1);
+        assert_eq!(
+            window.status.text(),
+            "Stopped | Could not list playback devices."
+        );
+    }
+
+    #[test]
+    fn no_audio_runs_the_mirror_without_the_relay() {
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        window.settings.sound_output = SoundOutput::NoAudio;
+        window.start();
+        assert_eq!(window.status.text(), "Running");
+        assert_eq!(*relay.0.borrow(), ["stop"]);
+    }
+
+    #[test]
+    fn a_new_sound_output_restarts_the_audio_but_not_the_mirror() {
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        window.start();
+        // A mirror restart would fail and say so.
+        fails_to_start(&mut window, Ended::Stop("the mirror restarted".into()));
+        let before = window.settings.clone();
+        window.settings.sound_output = SoundOutput::Device("hdmi".into());
+        window.follow_settings(&before);
+        assert_eq!(
+            *relay.0.borrow(),
+            [
+                "stop",
+                "start speakers to card in card container",
+                "stop",
+                "start speakers to card in card container via hdmi"
+            ]
+        );
+        assert_eq!(window.status.text(), "Running");
+    }
+
+    #[test]
+    fn no_sound_output_found_offers_to_choose_it_and_the_mirror_keeps_running() {
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        window.start();
+        relay.1.borrow_mut().push(RelayReport::NoSoundOutput);
+        window.follow_reports();
+        assert_eq!(
+            window.status.text(),
+            "Running | Can't find the capture card's sound output. Choose it, or choose No audio if the capture card has no sound."
+        );
+        assert!(window.status.choose_sound_output);
+        assert!(window.mirror.is_running());
+        relay.1.borrow_mut().push(RelayReport::Relaying);
+        window.follow_reports();
+        assert!(!window.status.choose_sound_output);
+    }
+
+    #[test]
     fn audio_problem_keeps_the_stop_button_and_clears_when_audio_recovers() {
         let (mut window, relay) = with_relay(window("card"), Some("speakers"));
         window.start();
@@ -849,7 +1184,7 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
         assert_eq!(
             relay.0.borrow().last().map(String::as_str),
-            Some("start speakers to card")
+            Some("start speakers to card in card container")
         );
     }
 
@@ -882,7 +1217,36 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
         assert_eq!(
             relay.0.borrow().last().map(String::as_str),
-            Some("start speakers to card")
+            Some("start speakers to card in card container")
+        );
+    }
+
+    #[test]
+    fn card_display_with_a_new_device_path_is_followed_on_its_connector() {
+        let guard = ReportingGuard::default();
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        window.guard = Box::new(guard.clone());
+        window.start();
+        // Display EDID mode: the card display comes back named after the next display, with a new device path.
+        let monitors = window.monitors.clone();
+        window.follow_monitors(monitors.clone());
+        let renamed = Monitor {
+            device_path: "card renamed".into(),
+            name: "LG TV".into(),
+            container_id: "TV container".into(),
+            ..monitors[1].clone()
+        };
+        window.follow_monitors(vec![monitors[0].clone(), renamed]);
+        assert_eq!(
+            window.settings.card_display.as_deref(),
+            Some("card renamed")
+        );
+        assert_eq!(guard.1.borrow().as_deref(), Some("card renamed"));
+        assert!(window.mirror.is_running());
+        assert_eq!(window.status.text(), "Running");
+        assert_eq!(
+            relay.0.borrow().last().map(String::as_str),
+            Some("start speakers to LG TV in TV container")
         );
     }
 
@@ -900,7 +1264,7 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
         assert_eq!(
             relay.0.borrow().last().map(String::as_str),
-            Some("start speakers to card 2")
+            Some("start speakers to card 2 in card 2 container")
         );
         assert_eq!(guard.1.borrow().as_deref(), Some("card 2"));
     }
@@ -1110,7 +1474,7 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
         assert_eq!(
             relay.0.borrow().last().map(String::as_str),
-            Some("start speakers to card")
+            Some("start speakers to card in card container")
         );
         let mut output = context.run_ui(egui::RawInput::default(), |_| {});
         output.textures_delta.clear();

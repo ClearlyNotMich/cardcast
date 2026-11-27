@@ -1,7 +1,7 @@
 //! The mouse pointer Desktop Duplication reports separately from the picture: its shape as
 //! drawable pixels, and where it lands on the card display. No Windows calls.
 
-use super::Fit;
+use super::{Fit, upright_size};
 
 /// `DXGI_OUTDUPL_POINTER_SHAPE_TYPE` values.
 pub const MONOCHROME: u32 = 1;
@@ -77,15 +77,18 @@ pub fn pointer_image(
     })
 }
 
-/// Where a pointer `shape` (width, height) at `position` (its top-left on the source monitor)
-/// lands on the card display when the source monitor's `desktop` is drawn into `fit`.
+/// Where a pointer `shape` (width, height) at `position` (its top-left on the source monitor's
+/// upright desktop) lands on the card display when the duplicated `surface`, turned by `rotation`
+/// (as in `super::upright_size`), is drawn upright into `fit`. The shape comes upright too.
 /// Returns left, top, width and height in card display pixels, as a Direct3D viewport takes them.
 pub fn pointer_viewport(
     fit: Fit,
-    desktop: (u32, u32),
+    surface: (u32, u32),
+    rotation: i32,
     position: (i32, i32),
     shape: (u32, u32),
 ) -> [f32; 4] {
+    let desktop = upright_size(surface, rotation);
     let scale_x = fit.width as f32 / desktop.0.max(1) as f32;
     let scale_y = fit.height as f32 / desktop.1.max(1) as f32;
     [
@@ -146,8 +149,24 @@ mod tests {
             height: 1080,
         };
         assert_eq!(
-            pointer_viewport(fit, (2560, 1440), (1280, 720), (32, 32)),
+            pointer_viewport(fit, (2560, 1440), 1, (1280, 720), (32, 32)),
             [960.0, 540.0, 24.0, 24.0]
+        );
+    }
+
+    #[test]
+    fn pointer_on_a_portrait_source_monitor_keeps_its_desktop_position() {
+        // An 800x600 surface turned 90° is a 600x800 desktop, drawn at twice its size.
+        let fit = Fit {
+            left: 600,
+            top: 0,
+            width: 1200,
+            height: 1600,
+        };
+        // PointerPosition is on the upright desktop, so the shape is drawn as it comes.
+        assert_eq!(
+            pointer_viewport(fit, (800, 600), 2, (300, 400), (32, 16)),
+            [1200.0, 800.0, 64.0, 32.0]
         );
     }
 
@@ -160,7 +179,7 @@ mod tests {
             height: 810,
         };
         assert_eq!(
-            pointer_viewport(fit, (2560, 1080), (-4, 0), (32, 32)),
+            pointer_viewport(fit, (2560, 1080), 1, (-4, 0), (32, 32)),
             [-3.0, 135.0, 24.0, 24.0]
         );
     }
