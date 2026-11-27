@@ -17,7 +17,7 @@ Terms in bold in `GLOSSARY.md` are used with exactly that meaning here. `docs/ad
 - Two Windows PCs. The sender runs the game; the receiver runs OBS.
 - A capture card connected to the receiver over USB, with its HDMI input plugged into the sender's graphics card. Tested cards: Elgato HD60 X and AVerMedia Live Gamer Mini.
 - The card display is set to **Extend** in Windows, never Duplicate.
-- The card display is plugged into the same graphics card as the source monitor, so the picture is never copied between graphics cards.
+- The card display may be plugged into the same graphics card as the source monitor, or into another one (a second GPU or the integrated GPU); then the mirror converts the picture on the source monitor's card and Windows copies it across (ADR 0003).
 - The source monitor may run with Windows HDR on or off. The card display is always SDR.
 
 ## 3. Goals and non-goals
