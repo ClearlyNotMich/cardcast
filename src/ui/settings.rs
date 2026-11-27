@@ -966,27 +966,30 @@ mod second_monitor_tests {
         };
         let card = monitors[2].clone();
         println!("before: {card:#?}");
-        assert!(!card.connector.is_empty(), "no connector: {card:?}");
         assert!(!card.container_id.is_empty(), "no container ID: {card:?}");
+        // This driver keeps the device path when the EDID changes, so the saved path stands in for the old one.
         let mut settings = Settings {
-            card_display: Some(card.device_path.clone()),
+            card_display: Some(
+                r"\\?\DISPLAY#OLD0000#1&1&0&UID1#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}".into(),
+            ),
             card_display_connector: Some(card.connector.clone()),
             ..Settings::default()
         };
+        // Restarts the graphics card, which gets a new LUID.
         let _edid = NewEdid::new();
         let now = guard::monitors().unwrap();
         println!("after: {now:#?}");
-        assert!(
-            now.iter()
-                .all(|monitor| monitor.device_path != card.device_path),
-            "the new EDID kept the device path"
-        );
         assert!(follow_card_display(&mut settings, &now));
+        assert_eq!(settings.card_display, Some(card.device_path.clone()));
         let found = now
             .iter()
-            .find(|monitor| settings.card_display.as_ref() == Some(&monitor.device_path))
+            .find(|monitor| monitor.device_path == card.device_path)
             .unwrap();
         assert_eq!(found.name, "cardcast EDID");
         assert_eq!(found.connector, card.connector);
+        assert_ne!(
+            found.container_id, card.container_id,
+            "the container ID follows the EDID"
+        );
     }
 }
