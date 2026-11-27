@@ -8,7 +8,7 @@ mod guard;
     not(test),
     allow(
         dead_code,
-        reason = "the Copy command (issue #39) and Linux DDC/CI (issue #46) call the rest; its tests run everywhere"
+        reason = "Linux DDC/CI (issue #46) calls the rest; its tests run everywhere"
     )
 )]
 mod input;

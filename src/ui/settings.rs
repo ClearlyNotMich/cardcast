@@ -47,6 +47,9 @@ pub struct StatusLine {
     pub choose_sound_output: bool,
     /// The guard's notice; kept until the guard clears it or the user dismisses it.
     pub guard: Option<String>,
+    /// Input switching's notice: not built here, no monitor offers it, or a switch failed; kept
+    /// until input switching is switched off, the input lists are read again or a switch works.
+    pub input: Option<String>,
     /// The notice the user dismissed; the guard re-sends it after every display change.
     dismissed_guard: Option<String>,
     /// The display watcher could not start, or parts are not built for this platform yet; kept
@@ -64,6 +67,7 @@ impl StatusLine {
             audio: None,
             choose_sound_output: false,
             guard: None,
+            input: None,
             dismissed_guard: None,
             displays: None,
             other: None,
@@ -102,7 +106,13 @@ impl StatusLine {
     #[cfg(test)]
     pub fn text(&self) -> String {
         let mut text = self.mirror.text();
-        let problems = [&self.audio, &self.guard, &self.displays, &self.other];
+        let problems = [
+            &self.audio,
+            &self.guard,
+            &self.input,
+            &self.displays,
+            &self.other,
+        ];
         for problem in problems.into_iter().flatten() {
             text.push_str(" | ");
             text.push_str(problem);
@@ -125,6 +135,7 @@ impl StatusLine {
             self.slow_mirror.as_deref(),
             self.audio.as_deref(),
             self.guard.as_deref(),
+            self.input.as_deref(),
             self.displays.as_deref(),
             self.other.as_deref(),
         ]
@@ -375,10 +386,12 @@ pub struct Settings {
     /// The card display's connector ([`Monitor::connector`]), to find it when its device path changes.
     pub card_display_connector: Option<String>,
     pub guard_enabled: bool,
+    /// The settings cog's one toggle (SPEC section 11); while off, nothing is sent over DDC/CI.
+    pub input_switching: bool,
 }
 
 impl Default for Settings {
-    /// The guard is on: it does nothing until the card display is chosen.
+    /// The guard is on: it does nothing until the card display is chosen. Input switching is off.
     fn default() -> Self {
         Self {
             source_monitor: None,
@@ -388,6 +401,7 @@ impl Default for Settings {
             sound_output: SoundOutput::Automatic,
             card_display_connector: None,
             guard_enabled: true,
+            input_switching: false,
         }
     }
 }
@@ -461,6 +475,7 @@ impl Settings {
         }
         text.push_str(&format!("sound_output={}\n", self.sound_output.to_text()));
         text.push_str(&format!("guard_enabled={}\n", self.guard_enabled));
+        text.push_str(&format!("input_switching={}\n", self.input_switching));
         text
     }
 
@@ -479,6 +494,7 @@ impl Settings {
                     settings.sound_output = SoundOutput::from_text(value.as_deref().unwrap_or(""));
                 }
                 "guard_enabled" => settings.guard_enabled = value.as_deref() == Some("true"),
+                "input_switching" => settings.input_switching = value.as_deref() == Some("true"),
                 _ => {}
             }
         }
@@ -520,6 +536,7 @@ mod tests {
             sound_output: SoundOutput::Device("{0.0.0.00000000}.{hdmi}".into()),
             card_display_connector: Some(r"\\?\PCI#VEN_8086#3&1&0#{guid} target 4353".into()),
             guard_enabled: true,
+            input_switching: true,
         };
         assert_eq!(Settings::from_text(&saved.to_text()), saved);
     }
@@ -622,6 +639,14 @@ mod tests {
         assert!(Settings::default().guard_enabled);
         assert!(Settings::from_text("").guard_enabled);
         assert!(!Settings::from_text("guard_enabled=false\n").guard_enabled);
+    }
+
+    #[test]
+    fn input_switching_is_off_in_a_fresh_settings_file() {
+        assert!(!Settings::default().input_switching);
+        assert!(!Settings::from_text("").input_switching);
+        assert!(!Settings::from_text("input_switching=yes\n").input_switching);
+        assert!(Settings::from_text("input_switching=true\n").input_switching);
     }
 
     fn monitor(device_path: &str, primary: bool) -> Monitor {
@@ -1248,6 +1273,7 @@ mod tests {
         let guard_only = Settings {
             send_windows_to: Some("primary".into()),
             guard_enabled: false,
+            input_switching: true,
             ..before.clone()
         };
         assert!(!restarts_on_change(true, &before, &guard_only));

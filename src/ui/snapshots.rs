@@ -262,6 +262,96 @@ fn snapshot_role_menu_opens_on_a_monitor_click() {
     harness.snapshot("role_menu");
 }
 
+/// Input switching on: the source monitor (DisplayPort 1, HDMI 1, HDMI 2) and the side monitor
+/// (DisplayPort 1, HDMI 1) have input lists, the others don't answer DDC/CI.
+fn with_input_lists(mut window: SettingsWindow) -> SettingsWindow {
+    window.settings.input_switching = true;
+    window.input_lists = window
+        .monitors
+        .iter()
+        .map(|monitor| Probe {
+            device_path: monitor.device_path.clone(),
+            id: input::MonitorId {
+                serial: (monitor.device_path == "source").then(|| "4GZY5P3".into()),
+                name: monitor.name.clone(),
+            },
+            inputs: match monitor.device_path.as_str() {
+                "source" => Some(vec![0x0F, 0x11, 0x12]),
+                "side" => Some(vec![0x0F, 0x11]),
+                _ => None,
+            },
+        })
+        .collect();
+    window
+}
+
+#[test]
+fn snapshot_input_switch_button() {
+    let mut window = with_input_lists(sender(Status::Running));
+    window.frame_rate.shown = Some(60.0);
+    snapshot("input_switch_button", window);
+}
+
+#[test]
+fn snapshot_settings_cog_open() {
+    let _device = one_device_at_a_time();
+    let mut harness = harness(with_input_lists(sender(Status::Stopped)));
+    harness.get_by_label("Settings").click();
+    harness.run();
+    harness.snapshot("settings_cog_open");
+}
+
+#[test]
+fn snapshot_input_menu_ticks_the_current_input() {
+    let _device = one_device_at_a_time();
+    let mut window = with_input_lists(sender(Status::Stopped));
+    window.current_input = Some(("source".into(), 0x0F));
+    let mut harness = harness(window);
+    harness.get_by_label("Inputs of Dell AW2523HF").click();
+    harness.run();
+    // The input button opens its own menu; egui keeps one menu open, so not the tile's role menu.
+    assert!(harness.query_by_label("HDMI 2").is_some());
+    harness.snapshot("input_menu");
+}
+
+#[test]
+fn the_input_menu_reads_the_current_input_as_it_opens_and_switches() {
+    let _device = one_device_at_a_time();
+    let mut window = with_input_lists(sender(Status::Stopped));
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let recording = opened.clone();
+    window.input_thread = Some(
+        input::InputThread::spawn(
+            |_: &Monitor| None,
+            move |monitor: &Monitor| {
+                recording.lock().unwrap().push(monitor.device_path.clone());
+                None
+            },
+            || {},
+        )
+        .unwrap(),
+    );
+    let mut harness = harness(window);
+    let wait_for = |count: usize| {
+        let start = Instant::now();
+        while opened.lock().unwrap().len() < count {
+            assert!(
+                start.elapsed().as_secs() < 10,
+                "{:?}",
+                opened.lock().unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    harness.get_by_label("Inputs of Dell AW2523HF").click();
+    harness.run();
+    wait_for(1);
+    harness.get_by_label("HDMI 1").click();
+    harness.run();
+    wait_for(2);
+    assert_eq!(*opened.lock().unwrap(), ["source", "source"]);
+}
+
 #[test]
 fn the_guard_switch_is_read_once_and_its_text_toggles_it() {
     let mut harness = Harness::new_ui_state(

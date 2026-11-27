@@ -4,6 +4,7 @@
 use super::look::{self, Role, Tone};
 use super::settings::{self, Settings, Status};
 use crate::guard::Monitor;
+use crate::input::{self, Job, MonitorId, Probe};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke,
     StrokeKind, epaint::RectShape, pos2, vec2,
@@ -58,8 +59,16 @@ fn caption(text: &str) -> RichText {
         .color(look::TEXT_DIM)
 }
 
-/// The top bar: the cardcast mark and name, and the mirror's state with the frame rate.
-pub fn header(ui: &mut egui::Ui, status: &Status, frame_rate: Option<f32>, time: Option<f64>) {
+/// The top bar: the cardcast mark and name, the mirror's state with the frame rate, and the
+/// settings cog with the input switching toggle and its `notice`.
+pub fn header(
+    ui: &mut egui::Ui,
+    status: &Status,
+    frame_rate: Option<f32>,
+    time: Option<f64>,
+    input_switching: &mut bool,
+    notice: Option<&str>,
+) {
     let rect = ui.max_rect();
     // A faint accent wash from the left, like the glow on capture-app title bars.
     let mut wash = egui::Mesh::default();
@@ -92,9 +101,53 @@ pub fn header(ui: &mut egui::Ui, status: &Status, frame_rate: Option<f32>, time:
         );
         ui.label(RichText::new("sender").small().color(look::TEXT_DIM));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            settings_cog(ui, input_switching, notice);
             status_pill(ui, status, frame_rate, time);
         });
     });
+}
+
+/// The cog at the top right; it opens a panel with the one toggle, "Input switching".
+fn settings_cog(ui: &mut egui::Ui, input_switching: &mut bool, notice: Option<&str>) {
+    let (rect, response) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, "Settings"));
+    let response = response.on_hover_text("Settings");
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+    let colour = if open || response.hovered() {
+        look::TEXT
+    } else {
+        look::TEXT_DIM
+    };
+    cog(ui.painter(), rect.center(), colour);
+    egui::Popup::menu(&response)
+        .align(egui::RectAlign::BOTTOM_END)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.label(caption("SETTINGS"));
+            switch(
+                ui,
+                input_switching,
+                "Input switching",
+                "Switch monitor inputs over DDC/CI from the live layout",
+            );
+            if let (true, Some(notice)) = (*input_switching, notice) {
+                ui.label(RichText::new(notice).small().color(look::BUSY));
+            }
+        });
+}
+
+/// A cog; the default font has none.
+fn cog(painter: &egui::Painter, centre: Pos2, colour: Color32) {
+    for tooth in 0..8_u8 {
+        let angle = f32::from(tooth) * std::f32::consts::TAU / 8.0;
+        let direction = vec2(angle.cos(), angle.sin());
+        painter.line_segment(
+            [centre + direction * 5.0, centre + direction * 9.0],
+            Stroke::new(3.5, colour),
+        );
+    }
+    painter.circle_filled(centre, 6.5, colour);
+    painter.circle_filled(centre, 2.5, look::PANEL);
 }
 
 /// Two overlapping screens, the source monitor's and the card display's colours.
@@ -178,9 +231,18 @@ pub fn indicator(painter: &egui::Painter, centre: Pos2, status: &Status, time: O
     }
 }
 
+/// What the live layout's input switch buttons show.
+pub struct Inputs<'a> {
+    /// The input lists last read, in the monitor list's order.
+    pub lists: &'a [Probe],
+    /// The current input of the monitor whose input menu opened last: its device path and the value.
+    pub current: Option<&'a (String, u8)>,
+}
+
 /// The live layout: the sender's monitors as Windows arranges them, to scale, `height` high.
 /// Each shows its graphics card and the roles it is chosen for, and clicking it chooses them; a chosen card display that is not connected is a dashed placeholder. While the
 /// mirror runs, the picture travels along an arc from the source monitor to the card display.
+/// A monitor with an input list gets an input switch button; returns what its menu asks of the input thread.
 pub fn layout_map(
     ui: &mut egui::Ui,
     monitors: &[Monitor],
@@ -188,7 +250,8 @@ pub fn layout_map(
     status: &Status,
     time: Option<f64>,
     height: f32,
-) {
+    inputs: &Inputs,
+) -> Option<Job> {
     let size = vec2(ui.available_width(), height);
     let (area, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter_at(area);
@@ -212,7 +275,7 @@ pub fn layout_map(
             FontId::proportional(14.0),
             look::TEXT_DIM,
         );
-        return;
+        return None;
     }
     let connected = |path: &Option<String>| {
         monitors
@@ -231,6 +294,7 @@ pub fn layout_map(
     let live = *status == Status::Running;
     let clash = settings::role_problem(settings, monitors).is_some();
     let mut ends = [None, None];
+    let mut asked = None;
     for (monitor, rect) in monitors.iter().zip(&rects) {
         let roles: Vec<Role> = Role::ALL
             .into_iter()
@@ -263,6 +327,13 @@ pub fn layout_map(
             problem,
         );
         role_menu(&response, monitor, monitors, settings);
+        if let Some(index) = inputs
+            .lists
+            .iter()
+            .position(|list| list.device_path == monitor.device_path)
+        {
+            asked = input_switch(ui, monitor, *rect, inputs, index).or(asked);
+        }
     }
     if let (Some(placeholder), Some(rect)) = (&missing_card_display, rects.last()) {
         placeholder_tile(&painter, *rect);
@@ -287,6 +358,104 @@ pub fn layout_map(
             time,
         );
     }
+    asked
+}
+
+/// The input switch button at a tile's bottom right, for a monitor with an input list (`index` in
+/// `inputs.lists`). Its menu lists the inputs with the current one ticked, read as it opens; each
+/// input switches the monitor, and its Copy command copies the command doing the same.
+fn input_switch(
+    ui: &mut egui::Ui,
+    monitor: &Monitor,
+    tile: Rect,
+    inputs: &Inputs,
+    index: usize,
+) -> Option<Job> {
+    let list = inputs.lists.get(index)?.inputs.as_deref()?;
+    // Bottom right: role badges are narrower than names, so they leave the corner free.
+    let rect = Rect::from_min_size(tile.right_bottom() - vec2(28.0, 28.0), vec2(20.0, 20.0));
+    let response = ui.interact(
+        rect,
+        ui.scope_id().with(("inputs", &monitor.device_path)),
+        Sense::click(),
+    );
+    let label = format!("Inputs of {}", monitor.name);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
+    let response = response.on_hover_text("Switch this monitor's input");
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+    let mut asked = (response.clicked() && !open).then(|| Job::Read(monitor.clone()));
+    let colour = if open || response.hovered() {
+        look::TEXT
+    } else {
+        look::TEXT_DIM
+    };
+    let painter = ui.painter();
+    painter.rect_filled(rect, 5, look::BACKGROUND.gamma_multiply(0.85));
+    painter.rect_stroke(rect, 5, Stroke::new(1.0, colour), StrokeKind::Inside);
+    // Two arrows, one each way.
+    let at = |x: f32, y: f32| rect.lerp_inside(vec2(x, y));
+    for points in [
+        [at(0.22, 0.36), at(0.78, 0.36), at(0.62, 0.22)],
+        [at(0.78, 0.64), at(0.22, 0.64), at(0.38, 0.78)],
+    ] {
+        painter.add(Shape::line(points.to_vec(), Stroke::new(1.5, colour)));
+    }
+
+    let current = inputs
+        .current
+        .filter(|(device_path, _)| *device_path == monitor.device_path)
+        .map(|(_, value)| *value);
+    let ids: Vec<MonitorId> = inputs.lists.iter().map(|list| list.id.clone()).collect();
+    let command_monitor = input::command_monitor(&ids, index);
+    egui::Popup::menu(&response)
+        .align(egui::RectAlign::RIGHT_START)
+        .align_alternatives(&[egui::RectAlign::LEFT_START, egui::RectAlign::BOTTOM_START])
+        .show(|ui| {
+            ui.label(RichText::new(&monitor.name).strong().color(look::TEXT));
+            egui::Grid::new(("input menu", &monitor.device_path))
+                .num_columns(2)
+                .show(ui, |ui| {
+                    for &value in list {
+                        let switch = ui
+                            .horizontal(|ui| {
+                                let (tick, _) =
+                                    ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                                if current == Some(value) {
+                                    check_mark(ui.painter(), tick, look::LIVE);
+                                }
+                                ui.add(
+                                    egui::Button::new(
+                                        RichText::new(input::input_name(value)).color(look::TEXT),
+                                    )
+                                    .frame(false),
+                                )
+                            })
+                            .inner;
+                        if switch.clicked() && current != Some(value) {
+                            asked = Some(Job::Switch(monitor.clone(), value));
+                        }
+                        if let Some(wanted) = command_monitor
+                            && ui
+                                .link(RichText::new("Copy command").small())
+                                .on_hover_text("For a Stream Deck key or a shortcut")
+                                .clicked()
+                        {
+                            ui.ctx().copy_text(input::copy_command(wanted, value));
+                        }
+                        ui.end_row();
+                    }
+                });
+            if command_monitor.is_none() {
+                ui.label(
+                    RichText::new(
+                        "No command can pick this monitor: another has the same serial and name.",
+                    )
+                    .small()
+                    .color(look::TEXT_DIM),
+                );
+            }
+        });
+    asked
 }
 
 /// The roles a clicked monitor can take ([`Role::offers`]); the current ones are ticked. It opens
