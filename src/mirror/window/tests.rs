@@ -318,7 +318,8 @@ fn second_monitor_card_display_on_another_graphics_card_is_mirrored() {
     let counted = presents.load(Ordering::Relaxed) - at_start;
     let per_second = counted as f64 / start.elapsed().as_secs_f64();
     let refresh = f64::from(card_display.refresh_hz);
-    println!(
+    let _ = writeln!(
+        std::io::stderr(),
         "{per_second:.1} presents per second across graphics cards on a {refresh} Hz card display"
     );
     assert!(
