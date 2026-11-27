@@ -46,9 +46,9 @@ jobs:
           swaymsg output HEADLESS-1 scale 1.5 transform 90
           swaymsg -t get_outputs
           failed=0
-          CARDCAST_EXPECT_MONITORS='HEADLESS-1 720x1280 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary' \
+          CARDCAST_EXPECT_MONITORS='HEADLESS-1 480x853 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary' \
             cargo test guard::linux::tests::desktop_lists -- --nocapture || failed=1
-          CARDCAST_PLUG_COMMAND='swaymsg create_output' CARDCAST_PLUGGED=HEADLESS-3 \
+          CARDCAST_PLUG_COMMAND='swaymsg create_output' CARDCAST_PLUGGED=HEADLESS-9 \
           CARDCAST_EXPECT_PLUGGED='HEADLESS-1 720x1280 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary; HEADLESS-3 1920x1080 1920x1080+1760+0' \
             cargo test guard::linux::tests::desktop_hotplug -- --nocapture || failed=1
           exit $failed
