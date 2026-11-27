@@ -21,8 +21,13 @@ const INPUT_SELECT: u8 = 0x60;
 /// The DDC/CI address on a monitor's i2c bus, and the EDID's.
 const DDC_CI: u8 = 0x37;
 const EDID: u8 = 0x50;
-/// linux/i2c-dev.h: sets the address the next read and write go to.
+/// linux/i2c-dev.h: sets the address the next read and write go to; FORCE even while a kernel
+/// driver holds the address, which ddcutil 3.0.2 retries with after EBUSY (its `--force-slave-address`).
 const I2C_SLAVE: libc::Ioctl = 0x0703;
+const I2C_SLAVE_FORCE: libc::Ioctl = 0x0706;
+/// What the status line and command mode say when cardcast can't use the i2c buses at all.
+pub const NO_MODULE: &str = "Load the i2c-dev module: run sudo modprobe i2c-dev, and copy cardcast's packaging/linux/modules-load.d/i2c-dev.conf to /etc/modules-load.d/ so it loads at every start.";
+pub const NO_PERMISSION: &str = "No permission for the monitor's i2c bus: install cardcast's udev rule: copy packaging/linux/udev/rules.d/60-cardcast-i2c.rules to /etc/udev/rules.d/, then run sudo udevadm control --reload and sudo udevadm trigger, or restart.";
 /// DDC/CI 1.1 section 5: retry at least 3 times on no answer.
 const ATTEMPTS: usize = 4;
 /// The longest capabilities string read; real ones are a few hundred bytes.
@@ -37,6 +42,9 @@ pub struct Place {
 
 /// Every connected monitor with an EDID, named by it as the settings window names them.
 pub fn monitors() -> Result<Vec<(MonitorId, Place)>, String> {
+    if let Some(problem) = access_problem() {
+        return Err(problem.to_owned());
+    }
     Ok(drm_connectors()
         .into_iter()
         .filter(|(_, _, edid)| !edid.is_empty())
@@ -58,6 +66,52 @@ pub fn serial(monitor: &Monitor) -> Option<String> {
 /// Opens a monitor from the settings window's list over DDC/CI, as [`open`] does.
 pub fn open_monitor(monitor: &Monitor) -> Option<Box<dyn Ddc>> {
     open(place(monitor)?)
+}
+
+/// Why cardcast can't reach any monitor over i2c-dev, from opening every graphics card's bus.
+pub fn access_problem() -> Option<&'static str> {
+    let mut buses: Vec<u32> = std::fs::read_dir("/sys/class/drm")
+        .map(|entries| {
+            entries
+                .flatten()
+                .flat_map(|entry| {
+                    // A card's buses are on its device, a DisplayPort AUX bus on its connector.
+                    let mut buses = buses_in(&entry.path().join("device"));
+                    buses.extend(buses_in(&entry.path()));
+                    buses
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    buses.sort_unstable();
+    buses.dedup();
+    let opened: Vec<_> = buses
+        .iter()
+        .map(|bus| {
+            File::options()
+                .read(true)
+                .write(true)
+                .open(format!("/dev/i2c-{bus}"))
+                .map(drop)
+                .map_err(|error| error.kind())
+        })
+        .collect();
+    i2c_problem(&opened)
+}
+
+/// The problem from opening each graphics card bus's `/dev/i2c-N`: none when one opens or there
+/// are none, else missing permission (no udev rule) before missing nodes (no i2c-dev module).
+pub fn i2c_problem(opened: &[Result<(), std::io::ErrorKind>]) -> Option<&'static str> {
+    use std::io::ErrorKind::{NotFound, PermissionDenied};
+    if opened.iter().any(Result::is_ok) {
+        None
+    } else if opened.contains(&Err(PermissionDenied)) {
+        Some(NO_PERMISSION)
+    } else if opened.contains(&Err(NotFound)) {
+        Some(NO_MODULE)
+    } else {
+        None
+    }
 }
 
 /// The connector of `monitor`, whose `connector` is `<card> <connector name>` (guard's Linux list).
@@ -168,9 +222,20 @@ fn device(bus: u32, address: u8) -> Option<File> {
         .write(true)
         .open(format!("/dev/i2c-{bus}"))
         .ok()?;
-    // SAFETY: the fd is open for the call; I2C_SLAVE takes the address as a plain integer argument.
-    let set = unsafe { libc::ioctl(file.as_raw_fd(), I2C_SLAVE, libc::c_ulong::from(address)) };
-    (set == 0).then_some(file)
+    let set = |request| {
+        // SAFETY: the fd is open for the call; both requests take the address as a plain integer.
+        let set = unsafe { libc::ioctl(file.as_raw_fd(), request, libc::c_ulong::from(address)) };
+        if set == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    match set(I2C_SLAVE) {
+        Err(error) if error.raw_os_error() == Some(libc::EBUSY) => set(I2C_SLAVE_FORCE).ok()?,
+        result => result.ok()?,
+    }
+    Some(file)
 }
 
 /// The EDID base block at address 0x50 of `bus`, as the monitor sends it.
@@ -413,5 +478,24 @@ mod tests {
         assert_eq!(pick_bus(&monitor, &[], &[0, 2, 3], read), None);
         assert_eq!(pick_bus(&[], &[], &[0, 1], read), None, "no EDID");
         assert_eq!(pick_bus(&edid(3), &[], &[3], read), Some(3));
+    }
+
+    #[test]
+    fn a_bus_cardcast_may_not_open_is_said_plainly() {
+        use std::io::ErrorKind::{NotFound, PermissionDenied};
+        assert_eq!(i2c_problem(&[]), None, "no graphics card bus: no answer");
+        assert_eq!(i2c_problem(&[Ok(()), Err(PermissionDenied)]), None);
+        assert_eq!(
+            i2c_problem(&[Err(NotFound), Err(NotFound)]),
+            Some(NO_MODULE)
+        );
+        assert_eq!(
+            i2c_problem(&[Err(PermissionDenied), Err(PermissionDenied)]),
+            Some(NO_PERMISSION)
+        );
+        assert!(NO_MODULE.starts_with("Load the i2c-dev module: "));
+        assert!(NO_PERMISSION.starts_with(
+            "No permission for the monitor's i2c bus: install cardcast's udev rule: "
+        ));
     }
 }

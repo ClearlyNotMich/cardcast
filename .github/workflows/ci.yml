@@ -64,8 +64,11 @@ jobs:
         run: |
           mkdir cardcast-linux-x86_64
           cp target/release/cardcast LICENSE README.md cardcast-linux-x86_64/
+          mkdir cardcast-linux-x86_64/packaging && cp -r packaging/linux cardcast-linux-x86_64/packaging/
           tar -czf cardcast-linux-x86_64.tar.gz cardcast-linux-x86_64
           tar -tvzf cardcast-linux-x86_64.tar.gz | grep -q -- '-rwx.* cardcast-linux-x86_64/cardcast$'
+          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/udev/rules.d/60-cardcast-i2c.rules$'
+          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/modules-load.d/i2c-dev.conf$'
       - if: runner.os == 'Linux'
         uses: actions/upload-artifact@v7
         with:

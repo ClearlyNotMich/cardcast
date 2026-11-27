@@ -13,6 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+/// The program's name in commands.
+const EXE: &str = if cfg!(windows) {
+    "cardcast.exe"
+} else {
+    "cardcast"
+};
+
 /// A monitor's DDC/CI connection. Every call blocks, the capabilities string for up to seconds (docs/win32-ddc.md).
 pub trait Ddc {
     /// The capabilities string, or `None` when the monitor doesn't answer.
@@ -297,7 +304,7 @@ pub struct InputRequest {
 pub fn parse_input_command(args: &[String]) -> Result<InputRequest, String> {
     let not_understood = |what: &str| {
         format!(
-            "Not understood: {what}. Use: cardcast.exe input <monitor> <input>, or cardcast.exe input <monitor> toggle <input> <input>, where <input> is dp, dp2, hdmi1, hdmi2 or 0x01 to 0xFF."
+            "Not understood: {what}. Use: {EXE} input <monitor> <input>, or {EXE} input <monitor> toggle <input> <input>, where <input> is dp, dp2, hdmi1, hdmi2 or 0x01 to 0xFF."
         )
     };
     let value = |word: &String| {
@@ -360,6 +367,10 @@ pub fn decide_switch(
 
 /// The input thread for the settings window; `wake` asks it to repaint when a report is waiting.
 pub fn new_input_thread(wake: impl Fn() + Send + 'static) -> Result<InputThread, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(problem) = linux::access_problem() {
+        return Err(problem.to_owned());
+    }
     InputThread::spawn(ddc::serial, ddc::open_monitor, wake)
 }
 
@@ -578,10 +589,8 @@ pub fn command_line(exe: &str, monitor: &str, value: u8) -> String {
 
 /// [`command_line`] for this cardcast, as the Copy command button copies it.
 pub fn copy_command(monitor: &str, value: u8) -> String {
-    let exe = std::env::current_exe().map_or_else(
-        |_| "cardcast.exe".to_owned(),
-        |exe| exe.display().to_string(),
-    );
+    let exe =
+        std::env::current_exe().map_or_else(|_| EXE.to_owned(), |exe| exe.display().to_string());
     command_line(&exe, monitor, value)
 }
 
@@ -1042,6 +1051,8 @@ mod tests {
             );
             assert_eq!(code, 2, "{command:?}");
             assert!(line.starts_with("Not understood: "), "{command:?}: {line}");
+            let usage = format!("Use: {EXE} input <monitor> <input>, or {EXE} input");
+            assert!(line.contains(&usage), "{line}");
         }
     }
 
