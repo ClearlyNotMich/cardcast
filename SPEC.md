@@ -56,7 +56,7 @@ The mirror follows the same three steps as OBS's fullscreen projector, and the p
 Behaviour:
 
 - Pacing comes from the card display. A 500 Hz source monitor shown on a 60 Hz card display produces 60 draws per second, and older frames are skipped.
-- cardcast never changes display modes. The user sets the card display's resolution and refresh rate in Windows.
+- cardcast never changes display modes. The user sets the card display's resolution and refresh rate in Windows; 60 Hz is the usual case, and 120 or 240 Hz works when the capture card supports it. Nothing in cardcast assumes 60 Hz.
 - The mouse pointer is visible in the mirror whenever it is on the source monitor.
 - When capture access is lost (resolution change, a game entering or leaving exclusive fullscreen, a permission prompt), capture is re-created without restarting the program.
 - When the card display disappears, the mirror stops and waits. When it returns, the mirror starts again.
@@ -87,7 +87,8 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 
 - Built with `egui` (`eframe`). It must use no CPU while minimised.
 - Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, a "Sound output: <choice> · Change" line under it, Start/Stop button, guard checkbox, and the status: the header names the state (starting, running, waiting for card display, waiting for source monitor, restarting, stopped by an error), and a line under the controls gives the error, restart reason or notice in plain words when there is one.
-- Dropdowns show each monitor's name, resolution and refresh rate.
+- Dropdowns show each monitor's name, resolution and refresh rate. The dropdowns and the live layout's role menu offer a monitor only for a role it can take: the card display is never the source monitor, the "send windows to" monitor or the primary monitor. If Windows makes the card display the primary monitor, the live layout says so and Start refuses, with the same text. Settings saved by an older version with the source monitor or "send windows to" on the card display load with that choice cleared, and the status line says so.
+- When a running mirror stays under 90% of the card display's refresh rate for a few seconds, the status line says so in plain words.
 - Settings are saved when changed and loaded at launch. Few settings, safe defaults: an invalid choice is refused, not warned about.
 - "Change" opens a dialog with one dropdown (Automatic, the playback devices except the audio source, No audio) and Save / Cancel. When Automatic finds no sound output, the status line says so in plain words and shows a "Choose sound output" button that opens the same dialog. The audio source dropdown never offers the sound output in use.
 - The window repaints on user input or when the mirror or window guard reports a status change. While the mirror starts, runs or restarts, its status indicator and the dots travelling along the live layout's arc animate at most about 30 times a second while the window has focus. Without focus nothing animates, and only a running mirror's frame rate refreshes, once a second; never while minimised.
