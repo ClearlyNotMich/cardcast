@@ -373,8 +373,13 @@ fn graphics_cards() -> Vec<(String, String)> {
 #[cfg(all(test, windows))]
 pub mod second_monitor {
     use super::Monitor;
+    use std::io::Write as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_ROTATION_ROTATE90,
+        SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SetDisplayConfig,
+    };
 
     const ENV: &str = "CARDCAST_SECOND_MONITOR";
 
@@ -498,6 +503,83 @@ pub mod second_monitor {
             .is_ok_and(|status| status.success())
     }
 
+    /// A monitor turned to portrait; it is turned back on drop.
+    pub struct Rotated {
+        device_path: String,
+        paths: Vec<DISPLAYCONFIG_PATH_INFO>,
+        modes: Vec<DISPLAYCONFIG_MODE_INFO>,
+    }
+
+    impl Rotated {
+        /// Turns the monitor with `device_path` 90°, keeping its source mode: `SetDisplayConfig`
+        /// takes it unswapped (docs/win32-pitfalls.md).
+        pub fn portrait(device_path: &str) -> Self {
+            let (paths, modes) = super::display_config().unwrap_or_else(|error| panic!("{error}"));
+            let original = Self {
+                device_path: device_path.to_owned(),
+                paths: paths.clone(),
+                modes: modes.clone(),
+            };
+            let mut paths = paths;
+            let path = paths
+                .iter_mut()
+                .find(|path| super::device_path(path).is_some_and(|(p, _)| p == device_path))
+                .unwrap_or_else(|| panic!("no display path for {device_path}"));
+            path.targetInfo.rotation = DISPLAYCONFIG_ROTATION_ROTATE90;
+            let result = apply(&paths, &modes);
+            log(&format!("rotate 90: {result}"));
+            assert_eq!(result, 0, "SetDisplayConfig could not rotate the monitor");
+            original
+        }
+
+        /// Waits until the monitor's desktop is landscape; false on timeout.
+        fn wait_for_landscape(&self) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                let landscape = super::monitors().is_ok_and(|monitors| {
+                    monitors.iter().any(|monitor| {
+                        monitor.device_path == self.device_path && monitor.width > monitor.height
+                    })
+                });
+                if landscape {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        }
+    }
+
+    impl Drop for Rotated {
+        /// Waits until the monitor is landscape again so later tests don't run on a rotated
+        /// monitor, and panics if it isn't; while a failed test unwinds it only logs, since a
+        /// second panic would abort the test run.
+        fn drop(&mut self) {
+            let result = apply(&self.paths, &self.modes);
+            let back = result == 0 && self.wait_for_landscape();
+            log(&format!("rotation put back: {result}, landscape: {back}"));
+            if !back && !std::thread::panicking() {
+                panic!("could not turn {} back to landscape", self.device_path);
+            }
+        }
+    }
+
+    fn apply(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &[DISPLAYCONFIG_MODE_INFO]) -> i32 {
+        // SAFETY: both slices come from QueryDisplayConfig and stay alive for the call.
+        unsafe {
+            SetDisplayConfig(
+                Some(paths),
+                Some(modes),
+                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+            )
+        }
+    }
+
+    /// Written to stderr directly: libtest captures only the print macros, and CI runs without --nocapture.
+    pub fn log(line: &str) {
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+
     /// Polls until `done` holds; panics after `limit`.
     pub fn wait_for(what: &str, limit: Duration, mut done: impl FnMut() -> bool) {
         let start = Instant::now();
@@ -566,70 +648,12 @@ mod tests {
         );
     }
 
-    use super::second_monitor::wait_for;
-    use std::io::Write as _;
-    use windows::Win32::Devices::Display::{
-        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_ROTATION_ROTATE90,
-        SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SetDisplayConfig,
-    };
-    use windows::Win32::Foundation::{ERROR_BAD_CONFIGURATION, LPARAM, RECT};
+    use super::second_monitor::{Rotated, log, wait_for};
+    use windows::Win32::Foundation::{LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::{
         EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
     };
     use windows::core::BOOL;
-
-    /// A monitor turned to portrait; its rotation is put back on drop.
-    struct Rotated(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
-
-    impl Rotated {
-        fn portrait(device_path: &str) -> Self {
-            let (paths, modes) = super::display_config().unwrap_or_else(|error| panic!("{error}"));
-            let original = Self(paths.clone(), modes.clone());
-            let (mut paths, mut modes) = (paths, modes);
-            let path = paths
-                .iter_mut()
-                .find(|path| super::device_path(path).is_some_and(|(p, _)| p == device_path))
-                .unwrap_or_else(|| panic!("no display path for {device_path}"));
-            path.targetInfo.rotation = DISPLAYCONFIG_ROTATION_ROTATE90;
-            // SAFETY: without QDC_VIRTUAL_MODE_AWARE the union holds modeInfoIdx.
-            let mode = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
-            let mut result = apply(&paths, &modes);
-            log(&format!("rotate 90, source mode as before: {result}"));
-            if result == ERROR_BAD_CONFIGURATION.0 as i32 {
-                // SAFETY: the mode a path's source index points to is a source mode.
-                let mut source = unsafe { modes[mode].Anonymous.sourceMode };
-                (source.width, source.height) = (source.height, source.width);
-                modes[mode].Anonymous.sourceMode = source;
-                result = apply(&paths, &modes);
-                log(&format!("rotate 90, source mode swapped: {result}"));
-            }
-            assert_eq!(result, 0, "SetDisplayConfig could not rotate the monitor");
-            original
-        }
-    }
-
-    impl Drop for Rotated {
-        /// Never panics: it also runs while a failed test unwinds.
-        fn drop(&mut self) {
-            log(&format!("rotation put back: {}", apply(&self.0, &self.1)));
-        }
-    }
-
-    fn apply(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &[DISPLAYCONFIG_MODE_INFO]) -> i32 {
-        // SAFETY: both slices come from QueryDisplayConfig and stay alive for the call.
-        unsafe {
-            SetDisplayConfig(
-                Some(paths),
-                Some(modes),
-                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG,
-            )
-        }
-    }
-
-    /// Written to stderr directly: libtest captures only the print macros, and CI runs without --nocapture.
-    fn log(line: &str) {
-        let _ = writeln!(std::io::stderr(), "{line}");
-    }
 
     /// Each monitor's GDI name and `rcMonitor`, the desktop rectangle Windows reports.
     fn desktop_rects() -> Vec<(String, RECT)> {

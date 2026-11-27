@@ -231,6 +231,37 @@ pub fn fit(picture: (u32, u32), screen: (u32, u32)) -> Fit {
     }
 }
 
+/// The size of the desktop a duplicated surface of `surface` size shows. The surface stays
+/// unrotated with the desktop turned inside it, so 90° and 270° swap width and height.
+/// `rotation` is `DXGI_OUTDUPL_DESC.Rotation`: 2 is 90°, 3 is 180°, 4 is 270°, anything else none.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows capture calls it")
+)]
+pub fn upright_size(surface: (u32, u32), rotation: i32) -> (u32, u32) {
+    if matches!(rotation, 2 | 4) {
+        (surface.1, surface.0)
+    } else {
+        surface
+    }
+}
+
+/// The texture coordinates in a duplicated surface turned by `rotation` (as in `upright_size`)
+/// of the upright desktop's top-left, top-right, bottom-left and bottom-right corners. Microsoft's
+/// Desktop Duplication sample turns it the same way (docs/win32-mirror-audio.md).
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "only the Windows capture calls it")
+)]
+pub fn corner_uvs(rotation: i32) -> [[f32; 2]; 4] {
+    match rotation {
+        2 => [[0.0, 1.0], [0.0, 0.0], [1.0, 1.0], [1.0, 0.0]],
+        3 => [[1.0, 1.0], [0.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        4 => [[1.0, 0.0], [1.0, 1.0], [0.0, 0.0], [0.0, 1.0]],
+        _ => [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+    }
+}
+
 /// A DXGI output: the graphics card (adapter) that owns it and its GDI name (`\\.\DISPLAYn`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Output {
@@ -494,6 +525,68 @@ mod tests {
         assert_eq!(fit((1366, 768), (1920, 1080)), at(0, 0, 1920, 1079));
         // 1080 × 1000 / 1001 = 1078.92 → 1079, centred with the odd pixel on the right.
         assert_eq!(fit((1000, 1001), (1920, 1080)), at(420, 0, 1079, 1080));
+    }
+
+    /// Where surface pixel (x, y) lands on the upright desktop (`width` x `height`), the way
+    /// Microsoft's Desktop Duplication sample places dirty rectangles (`SetDirtyVert`).
+    fn on_desktop(rotation: i32, (x, y): (f32, f32), (width, height): (f32, f32)) -> (f32, f32) {
+        match rotation {
+            2 => (width - y, x),
+            3 => (width - x, height - y),
+            4 => (y, height - x),
+            _ => (x, y),
+        }
+    }
+
+    #[test]
+    fn each_rotation_samples_the_surface_pixel_that_shows_there() {
+        let surface = (800.0, 600.0);
+        let point = (100.0, 50.0);
+        // DXGI_MODE_ROTATION: identity, 90°, 180°, 270°.
+        for rotation in [1, 2, 3, 4] {
+            let (width, height) = upright_size((800, 600), rotation);
+            let desktop = (width as f32, height as f32);
+            let (x, y) = on_desktop(rotation, point, desktop);
+            let (u, v) = (x / desktop.0, y / desktop.1);
+            // The quad interpolates its corners' texture coordinates.
+            let [top_left, top_right, bottom_left, bottom_right] = corner_uvs(rotation);
+            let sampled: Vec<f32> = (0..2)
+                .map(|axis| {
+                    let top = top_left[axis] + (top_right[axis] - top_left[axis]) * u;
+                    let bottom = bottom_left[axis] + (bottom_right[axis] - bottom_left[axis]) * u;
+                    top + (bottom - top) * v
+                })
+                .collect();
+            let expected = [point.0 / surface.0, point.1 / surface.1];
+            assert!(
+                (sampled[0] - expected[0]).abs() < 1e-6 && (sampled[1] - expected[1]).abs() < 1e-6,
+                "rotation {rotation}: sampled {sampled:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unrotated_or_unspecified_picture_is_sampled_as_it_is() {
+        assert_eq!(corner_uvs(0), corner_uvs(1));
+        assert_eq!(
+            corner_uvs(1),
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+        );
+    }
+
+    #[test]
+    fn a_portrait_source_monitor_is_fitted_by_its_upright_size() {
+        // A 1920x1080 surface turned 90° or 270° is a 1080x1920 desktop: pillarboxed on 1920x1080.
+        for rotation in [2, 4] {
+            assert_eq!(upright_size((1920, 1080), rotation), (1080, 1920));
+            assert_eq!(
+                fit(upright_size((1920, 1080), rotation), (1920, 1080)),
+                at(656, 0, 608, 1080)
+            );
+        }
+        for rotation in [0, 1, 3] {
+            assert_eq!(upright_size((1920, 1080), rotation), (1920, 1080));
+        }
     }
 
     #[test]

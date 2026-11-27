@@ -169,6 +169,7 @@ fn hdr_shader_matches_the_sdr_maths() {
         &target,
         &picture.view,
         [0.0, 0.0, width as f32, 1.0],
+        1,
         Paint::Hdr(scale),
     );
     for (x, &value) in (0..width).zip(&linear) {
@@ -271,7 +272,8 @@ fn duplicating_the_monitor_draws_its_colour() {
     let _duplicating = duplicating();
     let monitor = crate::guard::monitors().unwrap().remove(0);
     let (device, context, output) = device();
-    duplicate_and_check_colour(&monitor, &device, &context, &output);
+    let size = (monitor.width, monitor.height);
+    duplicate_and_check_colour(&monitor, size, &device, &context, &output);
 }
 
 #[test]
@@ -283,37 +285,98 @@ fn second_monitor_duplicating_it_draws_its_colour() {
     let _duplicating = duplicating();
     let (adapter, output) = output_named(&second.gdi_name);
     let (device, context, output) = device_on(&adapter, output);
-    duplicate_and_check_colour(second, &device, &context, &output);
+    let size = (second.width, second.height);
+    duplicate_and_check_colour(second, size, &device, &context, &output);
 }
 
-/// Covers `monitor` with a colour, duplicates `output` (that monitor's) and checks the colour arrives.
+#[test]
+fn second_monitor_rotated_monitor_mirrors_upright_and_fitted() {
+    use crate::guard::second_monitor::{Rotated, wait_for};
+    let Some(monitors) = crate::guard::second_monitor::monitors(2) else {
+        return;
+    };
+    // The rightmost, so turning it leaves no gap between monitors.
+    let turned = monitors.iter().max_by_key(|monitor| monitor.left).unwrap();
+    let _duplicating = duplicating();
+    let _rotated = Rotated::portrait(&turned.device_path);
+    let mut portrait = None;
+    wait_for(
+        "the monitor list to show the monitor in portrait",
+        Duration::from_secs(10),
+        || {
+            portrait = crate::guard::monitors().ok().and_then(|monitors| {
+                monitors.into_iter().find(|monitor| {
+                    monitor.device_path == turned.device_path && monitor.height > monitor.width
+                })
+            });
+            portrait.is_some()
+        },
+    );
+    let portrait = portrait.unwrap();
+    let (adapter, output) = output_named(&portrait.gdi_name);
+    let (device, context, output) = device_on(&adapter, output);
+    // A landscape card display, so the portrait picture is pillarboxed.
+    let card_display = (portrait.height, portrait.width);
+    duplicate_and_check_colour(&portrait, card_display, &device, &context, &output);
+}
+
+/// Covers the top-left quarter of `monitor` with a colour, duplicates `output` (that monitor's)
+/// into a `card_display` of that size, and checks the picture has the monitor's size and shows
+/// the colour upright: in the top-left quarter of the fitted picture and no other.
 fn duplicate_and_check_colour(
     monitor: &crate::guard::Monitor,
+    card_display: (u32, u32),
     device: &ID3D11Device,
     context: &ID3D11DeviceContext1,
     output: &IDXGIOutput,
 ) {
-    // Keep the pointer away from the pixel that is checked.
+    // Keep the pointer away from the pixels that are checked.
     // SAFETY: plain call.
     let _ = unsafe { SetCursorPos(monitor.left, monitor.top) };
+    let quarter = crate::guard::Monitor {
+        width: monitor.width / 2,
+        height: monitor.height / 2,
+        ..monitor.clone()
+    };
     // RGB(200, 40, 120); COLORREF is 0x00BBGGRR.
-    let window = ColourWindow::cover(monitor, COLORREF(0x0078_28c8));
+    let window = ColourWindow::cover(&quarter, COLORREF(0x0078_28c8));
+    let colour = [120, 40, 200];
     let mut desktop = Desktop::open(device, output, &monitor.device_path).unwrap();
-    let size = (monitor.width, monitor.height);
-    let (texture, target) = render_target(device, size);
-    let centre = (size.0 / 2, size.1 / 2);
-    let mut got = [0; 4];
+    let (texture, target) = render_target(device, card_display);
+    // The centres of the top-left, top-right, bottom-left and bottom-right quarters.
+    let quarters = |fit: crate::mirror::Fit| {
+        [(1, 1), (3, 1), (1, 3), (3, 3)]
+            .map(|(x, y)| (fit.left + fit.width * x / 4, fit.top + fit.height * y / 4))
+    };
+    let expected = [true, false, false, false];
+    let (mut fit, mut got) = (crate::mirror::fit((0, 0), card_display), [[0; 4]; 4]);
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         window.pump();
-        let fit = crate::mirror::fit(desktop.size(), size);
+        fit = crate::mirror::fit(desktop.size(), card_display);
         desktop.draw(context, &target, fit).unwrap();
-        got = pixel(device, context, &texture, centre);
-        if got[..3] == [120, 40, 200] {
+        got = quarters(fit).map(|at| pixel(device, context, &texture, at));
+        if got.map(|pixel| pixel[..3] == colour) == expected {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(desktop.size(), size, "captured picture has the wrong size");
-    assert_eq!(&got[..3], &[120, 40, 200], "captured colour (BGR)");
+    crate::guard::second_monitor::log(&format!(
+        "{} {}x{}: picture {:?} (rotation {}), fit {fit:?}, quarters (BGRA) {got:?}",
+        monitor.gdi_name,
+        monitor.width,
+        monitor.height,
+        desktop.size(),
+        desktop.rotation
+    ));
+    assert_eq!(
+        desktop.size(),
+        (monitor.width, monitor.height),
+        "captured picture has the wrong size"
+    );
+    assert_eq!(
+        got.map(|pixel| pixel[..3] == colour),
+        expected,
+        "colour (BGR {colour:?}) in the top-left, top-right, bottom-left and bottom-right quarter: {got:?}"
+    );
 }
