@@ -1,6 +1,6 @@
 use super::portal::{answered, request_path, select_options};
 use super::*;
-use crate::mirror::{Frame, Pixels};
+use crate::mirror::{Frame, Pixels, Release};
 use zbus::zvariant::Value;
 
 fn monitor(left: i32, top: i32, size: (u32, u32), layout_size: (u32, u32)) -> Monitor {
@@ -21,39 +21,191 @@ fn monitor(left: i32, top: i32, size: (u32, u32), layout_size: (u32, u32)) -> Mo
     }
 }
 
+fn other(left: i32, size: (u32, u32)) -> Monitor {
+    Monitor {
+        device_path: "ELG1 card".into(),
+        gdi_name: "HDMI-A-2".into(),
+        name: "Elgato1080HDR".into(),
+        primary: false,
+        ..monitor(left, 0, size, size)
+    }
+}
+
+/// What `started` decides with `source` among `monitors`, for a stream at `position` with `size`
+/// whose `Start` gave token "new"; `opened` says whether it opened the stream.
+fn decide(
+    source: &Monitor,
+    monitors: &[Monitor],
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+    open: Result<(), Ended>,
+) -> (Result<(), Ended>, Option<String>, bool) {
+    let opened = std::cell::Cell::new(false);
+    let capture = started(source, monitors, position, size, Some("new".into()), || {
+        opened.set(true);
+        open.map(|()| Box::new(Still) as Box<dyn Picture + Send>)
+    });
+    (
+        capture.picture.map(|_| ()),
+        capture.restore_token,
+        opened.get(),
+    )
+}
+
+/// A picture that never changes, for `started`'s tests.
+struct Still;
+
+impl Picture for Still {
+    fn size(&self) -> (u32, u32) {
+        (0, 0)
+    }
+    fn take_frame(&mut self) -> Result<Option<Frame>, Ended> {
+        Ok(None)
+    }
+}
+
 #[test]
-fn the_stream_at_the_source_monitors_position_shows_it() {
+fn the_stream_at_the_source_monitors_position_is_opened_and_its_token_kept() {
     let source = monitor(1920, 0, (2560, 1440), (1707, 960));
-    assert!(shows(&source, Some((1920, 0)), Some((1707, 960))));
-    // Another monitor's stream, even one of the same size.
-    assert!(!shows(&source, Some((0, 0)), Some((1707, 960))));
-}
-
-#[test]
-fn without_a_position_the_size_on_the_desktop_or_in_pixels_decides() {
-    let source = monitor(1920, 0, (2560, 1440), (1707, 960));
-    assert!(shows(&source, None, Some((1707, 960))));
-    assert!(shows(&source, None, Some((2560, 1440))));
-    assert!(!shows(&source, None, Some((1920, 1080))));
-}
-
-#[test]
-fn a_stream_with_neither_is_taken_as_the_source_monitor() {
-    assert!(shows(
-        &monitor(0, 0, (1920, 1080), (1920, 1080)),
-        None,
-        None
-    ));
-}
-
-#[test]
-fn a_wrong_monitor_stops_the_mirror_and_names_the_source_monitor() {
+    // Another monitor of the same size doesn't matter: the position tells them apart.
+    let monitors = [source.clone(), other(0, (1707, 960))];
     assert_eq!(
-        not_the_source_monitor(&monitor(0, 0, (1920, 1080), (1920, 1080))),
+        decide(
+            &source,
+            &monitors,
+            Some((1920, 0)),
+            Some((1707, 960)),
+            Ok(())
+        ),
+        (Ok(()), Some("new".into()), true)
+    );
+}
+
+#[test]
+fn another_monitors_stream_is_not_opened_and_its_token_dropped() {
+    let source = monitor(1920, 0, (2560, 1440), (1707, 960));
+    let monitors = [source.clone(), other(0, (1920, 1080))];
+    let wrong = Err(not_the_source_monitor(&source));
+    assert_eq!(
+        decide(&source, &monitors, Some((0, 0)), Some((1707, 960)), Ok(())),
+        (wrong.clone(), None, false)
+    );
+    assert_eq!(
+        decide(&source, &monitors, None, Some((1920, 1080)), Ok(())),
+        (wrong, None, false)
+    );
+}
+
+#[test]
+fn without_a_position_a_size_only_the_source_monitor_has_decides() {
+    let source = monitor(1920, 0, (2560, 1440), (1707, 960));
+    let monitors = [source.clone(), other(0, (1920, 1080))];
+    for size in [(1707, 960), (2560, 1440)] {
+        assert_eq!(
+            decide(&source, &monitors, None, Some(size), Ok(())),
+            (Ok(()), Some("new".into()), true)
+        );
+    }
+}
+
+#[test]
+fn a_stream_that_could_be_another_monitor_is_refused_not_guessed() {
+    let source = monitor(1920, 0, (1920, 1080), (1920, 1080));
+    let monitors = [source.clone(), other(0, (1920, 1080))];
+    let unknown = Err(cannot_tell(&source));
+    // Two monitors of that size, then no position or size at all.
+    assert_eq!(
+        decide(&source, &monitors, None, Some((1920, 1080)), Ok(())),
+        (unknown.clone(), None, false)
+    );
+    assert_eq!(
+        decide(&source, &monitors[..1], None, None, Ok(())),
+        (unknown, None, false)
+    );
+}
+
+#[test]
+fn a_stream_that_fails_to_open_keeps_the_new_token_so_a_restart_shows_no_dialog() {
+    let source = monitor(0, 0, (1920, 1080), (1920, 1080));
+    let failed = Ended::Restart("Could not open the screen capture stream.".into());
+    assert_eq!(
+        decide(
+            &source,
+            std::slice::from_ref(&source),
+            Some((0, 0)),
+            None,
+            Err(failed.clone())
+        ),
+        (Err(failed), Some("new".into()), true)
+    );
+}
+
+#[test]
+fn a_refused_stream_says_why_and_names_the_source_monitor() {
+    let source = monitor(0, 0, (1920, 1080), (1920, 1080));
+    assert_eq!(
+        not_the_source_monitor(&source),
         Ended::Stop(
             "The monitor shared in the screen-sharing dialog is not the source monitor. Press Start and share DELL AW2523HF.".into()
         )
     );
+    assert_eq!(
+        cannot_tell(&source),
+        Ended::Stop(
+            "cardcast can't tell which monitor the screen-sharing dialog shared, so it doesn't show it. Make the source monitor, DELL AW2523HF, the only one of its size, or use a desktop whose portal says where the shared monitor is.".into()
+        )
+    );
+}
+
+/// A frame whose buffer counts its releases.
+fn held_frame(released: &std::sync::Arc<std::sync::atomic::AtomicU32>) -> Frame {
+    let released = released.clone();
+    Frame {
+        width: 1,
+        height: 1,
+        fourcc: XRGB8888,
+        pixels: Pixels::Memory {
+            bytes: vec![0; 4],
+            stride: 4,
+        },
+        release: Release::new(move || {
+            released.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }),
+    }
+}
+
+#[test]
+fn a_frame_gives_its_buffer_back_once_when_dropped() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let released = std::sync::Arc::new(AtomicU32::new(0));
+    let frame = held_frame(&released);
+    assert_eq!(released.load(Ordering::Relaxed), 0, "released while held");
+    drop(frame);
+    assert_eq!(released.load(Ordering::Relaxed), 1);
+    // A copy holds nothing.
+    drop(Release::default());
+}
+
+#[test]
+fn a_frame_replaced_before_it_is_taken_gives_its_buffer_back() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let (first, second) = (
+        std::sync::Arc::new(AtomicU32::new(0)),
+        std::sync::Arc::new(AtomicU32::new(0)),
+    );
+    let mut latest = super::stream::Latest::default();
+    latest.put(held_frame(&first));
+    latest.put(held_frame(&second));
+    assert_eq!(
+        first.load(Ordering::Relaxed),
+        1,
+        "the replaced frame is still held"
+    );
+    // The taken frame stays held until the present drops it.
+    let taken = latest.frame.take();
+    assert_eq!(second.load(Ordering::Relaxed), 0);
+    drop(taken);
+    assert_eq!(second.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -177,11 +329,14 @@ fn desktop_captures_a_frame_of_the_source_monitor() {
         .unwrap_or_else(|| panic!("no output {output} in {monitors:#?}"));
     // Linear and implicit layouts are offered too, so the DMA-BUF offer is negotiated; a desktop
     // without DMA-BUF (sway on pixman) falls back to shared memory.
-    let mut capture =
-        capture(source, None, &[0, (1 << 56) - 1]).unwrap_or_else(|ended| panic!("{ended:?}"));
+    let mut capture = capture(source, &monitors, None, &[0, (1 << 56) - 1]);
+    let picture = capture
+        .picture
+        .as_mut()
+        .unwrap_or_else(|ended| panic!("{ended:?}"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let frame = loop {
-        if let Some(frame) = capture.picture.take_frame().unwrap() {
+        if let Some(frame) = picture.take_frame().unwrap() {
             break frame;
         }
         assert!(std::time::Instant::now() < deadline, "no frame came");
@@ -192,7 +347,7 @@ fn desktop_captures_a_frame_of_the_source_monitor() {
         frame.width,
         frame.height,
         frame.fourcc,
-        capture.picture.size(),
+        picture.size(),
         capture.restore_token
     );
     // The portal hands a token only for a persistent permission (`persist_mode`).

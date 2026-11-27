@@ -20,77 +20,123 @@ pub const ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
 pub const XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
 pub const ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
 
-/// A started capture of the source monitor.
+/// A capture of the source monitor, started or failed.
 pub struct Capture {
-    pub picture: Box<dyn Picture + Send>,
-    /// The portal's token to save in settings in place of the one passed to [`capture`], which a
-    /// start spends; `None` clears it (X11 has none).
+    pub picture: Result<Box<dyn Picture + Send>, Ended>,
+    /// The token to save in settings in place of the one passed to [`capture`], started or not:
+    /// the portal's new one once the source monitor was shared (single-use, so the old one is
+    /// spent); `None`, clearing it, when the portal failed or shared another monitor. X11 keeps
+    /// the old one.
     pub restore_token: Option<String>,
 }
 
-/// Starts capturing `source_monitor`: on Wayland through the portal, whose dialog shows unless
-/// `restore_token` (saved in settings) restores the last choice; on X11 with MIT-SHM. `modifiers`
-/// are the DMA-BUF layouts the present can import; with none, frames come in memory. On failure
-/// the saved token is spent, so clear it.
+/// Starts capturing `source_monitor`, one of `monitors`: on Wayland through the portal, whose
+/// dialog shows unless `restore_token` (saved in settings) restores the last choice; on X11 with
+/// MIT-SHM. `modifiers` are the DMA-BUF layouts the present can import; with none, frames come in
+/// memory. Blocks while the portal's dialog is open.
 pub fn capture(
     source_monitor: &Monitor,
+    monitors: &[Monitor],
     restore_token: Option<&str>,
     modifiers: &[u64],
-) -> Result<Capture, Ended> {
+) -> Capture {
     match desktop::detect(|name| std::env::var(name).ok()) {
-        Some(Desktop::X11) => Ok(Capture {
-            picture: Box::new(x11::Shm::open(source_monitor)?),
-            restore_token: None,
-        }),
-        Some(_) => {
-            let portal::Shared {
+        Some(Desktop::X11) => Capture {
+            picture: x11::Shm::open(source_monitor)
+                .map(|shm| Box::new(shm) as Box<dyn Picture + Send>),
+            restore_token: restore_token.map(str::to_owned),
+        },
+        Some(_) => match portal::share(restore_token) {
+            Ok(portal::Shared {
                 remote,
                 node,
                 position,
                 size,
                 restore_token,
                 session,
-            } = portal::share(restore_token)?;
-            if !shows(source_monitor, position, size) {
-                return Err(not_the_source_monitor(source_monitor));
-            }
-            Ok(Capture {
-                picture: Box::new(stream::Stream::open(
-                    remote,
-                    node,
-                    modifiers,
-                    Box::new(session),
-                )?),
+            }) => started(
+                source_monitor,
+                monitors,
+                position,
+                size,
                 restore_token,
-            })
-        }
-        None => Err(Ended::Stop(
-            "No desktop session to capture the source monitor from.".into(),
-        )),
+                || {
+                    stream::Stream::open(remote, node, modifiers, Box::new(session))
+                        .map(|stream| Box::new(stream) as Box<dyn Picture + Send>)
+                },
+            ),
+            Err(ended) => Capture {
+                picture: Err(ended),
+                restore_token: None,
+            },
+        },
+        None => Capture {
+            picture: Err(Ended::Stop(
+                "No desktop session to capture the source monitor from.".into(),
+            )),
+            restore_token: restore_token.map(str::to_owned),
+        },
     }
 }
 
-/// Whether the portal's stream, at `position` with `size` in the desktop's coordinates (either
-/// may be missing), shows `monitor`. Monitors never overlap, so the position decides; without
-/// it the size must be the monitor's, on the desktop or in pixels; with neither, it can't be told.
-pub fn shows(monitor: &Monitor, position: Option<(i32, i32)>, size: Option<(i32, i32)>) -> bool {
+/// After the portal's `Start` shared a stream at `position` with `size` (either may be missing)
+/// and gave `restore_token`: `open`s the stream if it is `source_monitor`'s, keeping the token even
+/// if the stream fails to open, so a restart shows no dialog. Another monitor's stream, or one that
+/// can't be told apart from another, is refused and its token dropped, so the next Start asks.
+pub fn started(
+    source_monitor: &Monitor,
+    monitors: &[Monitor],
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+    restore_token: Option<String>,
+    open: impl FnOnce() -> Result<Box<dyn Picture + Send>, Ended>,
+) -> Capture {
     let as_size =
         |(width, height): (u32, u32)| i32::try_from(width).ok().zip(i32::try_from(height).ok());
-    match (position, size) {
-        (Some(position), _) => position == (monitor.left, monitor.top),
-        (None, Some(size)) => {
-            Some(size) == as_size(monitor.layout_size)
-                || Some(size) == as_size((monitor.width, monitor.height))
+    let sized = |monitor: &Monitor, size| {
+        Some(size) == as_size(monitor.layout_size)
+            || Some(size) == as_size((monitor.width, monitor.height))
+    };
+    // Monitors never overlap, so a position names one; a size only if no other monitor has it.
+    let shared = match (position, size) {
+        (Some(position), _) if position == (source_monitor.left, source_monitor.top) => Ok(()),
+        (Some(_), _) => Err(not_the_source_monitor(source_monitor)),
+        (None, Some(size)) if !sized(source_monitor, size) => {
+            Err(not_the_source_monitor(source_monitor))
         }
-        (None, None) => true,
+        (None, Some(size))
+            if !monitors.iter().any(|monitor| {
+                monitor.device_path != source_monitor.device_path && sized(monitor, size)
+            }) =>
+        {
+            Ok(())
+        }
+        _ => Err(cannot_tell(source_monitor)),
+    };
+    match shared {
+        Ok(()) => Capture {
+            picture: open(),
+            restore_token,
+        },
+        Err(ended) => Capture {
+            picture: Err(ended),
+            restore_token: None,
+        },
     }
 }
 
-/// The user shared another monitor in the dialog. Its token would restore that one, so it is
-/// not kept, and only the user can pick again: the mirror stops.
+/// The user shared another monitor in the dialog; only the user can pick again, so the mirror stops.
 fn not_the_source_monitor(source_monitor: &Monitor) -> Ended {
     Ended::Stop(format!(
         "The monitor shared in the screen-sharing dialog is not the source monitor. Press Start and share {}.",
+        source_monitor.name
+    ))
+}
+
+/// The portal didn't say where the shared monitor is, and its size (if given) fits another one too.
+fn cannot_tell(source_monitor: &Monitor) -> Ended {
+    Ended::Stop(format!(
+        "cardcast can't tell which monitor the screen-sharing dialog shared, so it doesn't show it. Make the source monitor, {}, the only one of its size, or use a desktop whose portal says where the shared monitor is.",
         source_monitor.name
     ))
 }

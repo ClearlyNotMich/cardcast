@@ -32,15 +32,41 @@ interface `org.freedesktop.portal.ScreenCast` [1], over the zbus 5 the tree alre
 cardcast keeps the bus connection open as long as the stream, and doesn't call `Session.Close`;
 dropping the stream drops the connection.
 
-**Matching the stream to the source monitor** (`linux::shows`): monitors never overlap, so the
-stream's `position` must be the source monitor's top-left; without a position its `size` must be
-the monitor's size on the desktop or in pixels; with neither it can't be told and is taken. A
-different monitor stops the mirror ("…is not the source monitor. Press Start and share NAME.") and
-its token is not kept, so the next Start shows the dialog.
+**Matching the stream to the source monitor** (`linux::started`): monitors never overlap, so a
+`position` names one: it must be the source monitor's top-left. Without a position, the `size`
+(on the desktop or in pixels) must be the source monitor's and no other monitor's. Anything else
+is refused, never guessed: another monitor ("…is not the source monitor. Press Start and share
+NAME.") or a stream that can't be told apart (same size as another monitor, or neither position nor
+size). A refused stream's token is not kept, so the next Start shows the dialog.
 
 **The restore token** is saved in settings (`restore_token=` in `settings.txt`). `linux::capture`
-takes the saved one and returns the new one to save; any failure spends the old one, so the caller
-clears it. Wiring it between `Settings` and the mirror is #43's, which owns the Linux `Mirror`.
+takes the saved one and returns `Capture { picture, restore_token }`; the caller always saves
+`restore_token`. Once `Start` shared the source monitor it is the new token, even if the PipeWire
+stream then fails to open, so the automatic restart shows no dialog; after a portal failure or a
+refused stream it is `None`; on X11 it is the old one. Wiring it between `Settings` and the mirror
+is #43's, which owns the Linux `Mirror`.
+
+## What the present gets (`mirror::Frame`)
+
+`Picture::take_frame() -> Result<Option<Frame>, Ended>`: the newest frame since the last call,
+`None` if none came, `Err` once the stream ended.
+
+```rust
+pub struct Frame { pub width: u32, pub height: u32, pub fourcc: u32, pub pixels: Pixels, pub release: Release }
+pub enum Pixels {
+    Memory { bytes: Vec<u8>, stride: u32 },
+    DmaBuf { fd: OwnedFd, offset: u32, stride: u32, modifier: u64 },
+}
+```
+
+A DMA-BUF frame holds its PipeWire buffer: the compositor doesn't render into that plane again
+until the `Frame` (its `Release`) is dropped, which sends the buffer back to the PipeWire thread to
+queue. A frame replaced before the present took it is dropped, and so released, the same way. The
+stream asks for 3 to 16 buffers (`Buffers.buffers`), so with one frame held by the present and one
+waiting the compositor still has one to draw in; the present must drop each frame once it no
+longer reads the plane (after the import's GPU work is done), or the stream stalls. A buffer the
+stream removed meanwhile (a new format) is not queued back. Memory frames are copies: their buffer
+goes back at once and their `Release` does nothing. `Release::default()` is the no-op, for tests.
 
 ## The PipeWire stream (`mirror/linux/stream.rs`)
 
@@ -57,8 +83,9 @@ On `param_changed` for the `Format`, a negotiated modifier (`SPA_VIDEO_FLAG_MODI
 DMA-BUF: cardcast sets `Buffers.dataType` to `1 << DmaBuf`, else `1 << MemFd | 1 << MemPtr` [3].
 Each `process` takes the newest buffer:
 
-- **DmaBuf**: a duplicate of the plane's fd, with the chunk's offset and stride and the format's
-  modifier, for the present to import (wgpu: research section 1). Single plane only.
+- **DmaBuf**: a duplicate of the plane's fd (a negative fd is skipped), with the chunk's offset
+  and stride and the format's modifier, for the present to import (wgpu: research section 1); the
+  buffer is held until the frame is dropped (above). Single plane only.
 - **MemFd**: read with `pread` from the fd at `mapoffset + chunk.offset`, not mapped. Measured in
   CI's container (Ubuntu 26.04, xdg-desktop-portal-wlr): its shared-memory buffers carry only
   `SPA_DATA_FLAG_MAPPABLE`, not `READABLE`, and reading PipeWire's own mapping

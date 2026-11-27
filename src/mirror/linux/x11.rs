@@ -2,7 +2,7 @@
 //! rectangle of the root window into a shared segment each frame, a CPU copy, and XFixes gives the
 //! pointer, drawn in as the portal's embedded cursor would be.
 
-use super::super::{Ended, Frame, Picture, Pixels};
+use super::super::{Ended, Frame, Picture, Pixels, Release};
 use super::{Pointer, XRGB8888, draw_pointer};
 use crate::guard::Monitor;
 use std::error::Error;
@@ -122,6 +122,7 @@ impl Shm {
                 bytes,
                 stride: width * 4,
             },
+            release: Release::default(),
         })
     }
 }

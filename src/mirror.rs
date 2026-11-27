@@ -88,6 +88,42 @@ pub struct Frame {
     /// The DRM fourcc of its pixels: [`linux::XRGB8888`] and its kin.
     pub fourcc: u32,
     pub pixels: Pixels,
+    /// Gives the capture's buffer back when the frame is dropped; a copy holds none.
+    #[allow(dead_code, reason = "never read: dropping it gives the buffer back")]
+    pub release: Release,
+}
+
+/// Gives a [`Frame`]'s buffer back to the capture once, when dropped. The capture has only a few
+/// buffers, so the present drops a frame as soon as it no longer reads its pixels.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub struct Release(Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(target_os = "linux")]
+impl Release {
+    pub fn new(give_back: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(give_back)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Some(give_back) = self.0.take() {
+            give_back();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for Release {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(if self.0.is_some() {
+            "Release(held)"
+        } else {
+            "Release(none)"
+        })
+    }
 }
 
 /// Where a [`Frame`]'s pixels are.
@@ -101,8 +137,8 @@ pub enum Pixels {
     /// A copy in memory, `stride` bytes per row: PipeWire's shared-memory fallback, or MIT-SHM on X11.
     Memory { bytes: Vec<u8>, stride: u32 },
     /// One plane the compositor rendered on the graphics card, to import there without a copy
-    /// (`docs/linux-capture.md`). The compositor may draw the next picture into it once a newer
-    /// frame came, so import it before taking the next one.
+    /// (`docs/linux-capture.md`). The compositor doesn't draw into it again until the frame (its
+    /// [`Release`]) is dropped, so keep the frame while the present reads the plane, no longer.
     DmaBuf {
         fd: std::os::fd::OwnedFd,
         offset: u32,

@@ -2,31 +2,57 @@
 //! first with the present's modifiers, shared memory as the fallback; the newest frame waits in
 //! [`Stream`] for the present to take it.
 
-use super::super::{Ended, Frame, Picture, Pixels};
+use super::super::{Ended, Frame, Picture, Pixels, Release};
 use super::{fourcc, rows};
 use pipewire as pw;
 use pw::spa;
 use pw::spa::param::video::{VideoFlags, VideoFormat, VideoInfoRaw};
 use pw::spa::pod::{ChoiceValue, Object, Pod, Property, PropertyFlags, Value};
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Fraction, Rectangle, SpaTypes};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs::File;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
+use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
 
 /// What the PipeWire thread hands the present.
 #[derive(Debug, Default)]
-struct Latest {
-    frame: Option<Frame>,
+pub struct Latest {
+    pub frame: Option<Frame>,
     size: (u32, u32),
     ended: Option<Ended>,
 }
 
+impl Latest {
+    /// Puts `frame` up for the present; one it never took is dropped, giving its buffer back.
+    pub fn put(&mut self, frame: Frame) {
+        self.size = (frame.width, frame.height);
+        self.frame = Some(frame);
+    }
+}
+
+/// What the PipeWire thread is asked to do from other threads.
+enum Message {
+    Quit,
+    /// Give a buffer a dropped frame held back to the stream.
+    Release(Held),
+}
+
+/// A buffer dequeued from the stream and held for a frame.
+struct Held(NonNull<pw::sys::pw_buffer>);
+
+// SAFETY: the pointer is only passed back to the PipeWire thread, which alone dereferences it,
+// and only while the stream still has the buffer (`live`).
+unsafe impl Send for Held {}
+
 /// The stream, read on its own PipeWire thread.
 pub struct Stream {
     latest: Arc<Mutex<Latest>>,
-    quit: pw::channel::Sender<()>,
+    messages: pw::channel::Sender<Message>,
     thread: Option<JoinHandle<()>>,
     /// Whatever keeps the stream's source alive, such as the portal session; dropped after the thread.
     _source: Box<dyn Send>,
@@ -42,19 +68,21 @@ impl Stream {
         source: Box<dyn Send>,
     ) -> Result<Self, Ended> {
         let latest = Arc::new(Mutex::new(Latest::default()));
-        let (quit, quit_receiver) = pw::channel::channel();
+        let (messages, receiver) = pw::channel::channel();
         let (ready, started) = mpsc::channel();
         let thread = {
-            let (latest, modifiers) = (latest.clone(), modifiers.to_vec());
+            let (latest, modifiers, sender) =
+                (latest.clone(), modifiers.to_vec(), messages.clone());
             std::thread::spawn(move || {
-                if let Err(error) = run(remote, node, &modifiers, latest, quit_receiver, &ready) {
+                let channel = (sender, receiver);
+                if let Err(error) = run(remote, node, &modifiers, latest, channel, &ready) {
                     let _ = ready.send(Err(error));
                 }
             })
         };
         let stream = Self {
             latest,
-            quit,
+            messages,
             thread: Some(thread),
             _source: source,
         };
@@ -72,7 +100,7 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        let _ = self.quit.send(());
+        let _ = self.messages.send(Message::Quit);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -102,7 +130,7 @@ fn run(
     node: u32,
     modifiers: &[u64],
     latest: Arc<Mutex<Latest>>,
-    quit: pw::channel::Receiver<()>,
+    (releases, messages): (pw::channel::Sender<Message>, pw::channel::Receiver<Message>),
     ready: &mpsc::Sender<Result<(), String>>,
 ) -> Result<(), String> {
     pw::init();
@@ -123,6 +151,8 @@ fn run(
     )
     .map_err(|error| error.to_string())?;
     let ended = latest.clone();
+    // The buffers the stream has now; a held one it removed (on a new format) isn't given back.
+    let live = Rc::new(RefCell::new(HashSet::<usize>::new()));
     let _listener = stream
         .add_local_listener_with_user_data(VideoInfoRaw::new())
         .state_changed(move |_, _, _, state| {
@@ -149,69 +179,59 @@ fn run(
                 let _ = stream.update_params(&mut [buffers]);
             }
         })
-        .process(move |stream, format| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
-                return;
-            };
-            let size = format.size();
-            let Some(fourcc) = fourcc(format.format()) else {
-                return;
-            };
-            let Some(data) = buffer.datas_mut().first_mut() else {
-                return;
-            };
-            let chunk = data.chunk();
-            if chunk.flags().contains(spa::buffer::ChunkFlags::CORRUPTED) {
-                return;
+        .add_buffer({
+            let live = live.clone();
+            move |_, _, buffer| {
+                live.borrow_mut().insert(buffer as usize);
             }
-            let (offset, stride) = (chunk.offset(), u32::try_from(chunk.stride()).unwrap_or(0));
-            let stride = if stride == 0 { size.width * 4 } else { stride };
-            let kind = data.type_();
-            let pixels = if kind == spa::buffer::DataType::MemPtr {
-                // In cardcast's own memory, so PipeWire gives the pointer.
-                let Some(bytes) = data
-                    .data()
-                    .and_then(|bytes| rows(bytes, offset, stride, size.height))
-                else {
-                    return;
-                };
-                Pixels::Memory {
-                    bytes: bytes.to_vec(),
-                    stride,
-                }
-            } else {
-                // SAFETY: the buffer owns this fd and stays dequeued while it is borrowed here.
-                let fd = unsafe { BorrowedFd::borrow_raw(data.fd()) };
-                let Ok(fd) = fd.try_clone_to_owned() else {
-                    return;
-                };
-                if kind == spa::buffer::DataType::DmaBuf {
-                    Pixels::DmaBuf {
-                        fd,
-                        offset,
-                        stride,
-                        modifier: format.modifier(),
-                    }
-                } else {
-                    // Shared memory is read, not mapped: producers such as xdg-desktop-portal-wlr
-                    // don't mark it readable, so PipeWire's own mapping can't be read.
-                    let mut bytes =
-                        vec![0; usize::try_from(stride * size.height).unwrap_or_default()];
-                    let at = u64::from(data.as_raw().mapoffset) + u64::from(offset);
-                    if File::from(fd).read_exact_at(&mut bytes, at).is_err() {
-                        return;
-                    }
-                    Pixels::Memory { bytes, stride }
-                }
+        })
+        .remove_buffer({
+            let live = live.clone();
+            move |_, _, buffer| {
+                live.borrow_mut().remove(&(buffer as usize));
+            }
+        })
+        .process(move |stream, format| {
+            // SAFETY: `stream` is this thread's live stream; the buffer it hands out is cardcast's
+            // until queued back.
+            let Some(buffer) =
+                NonNull::new(unsafe { pw::sys::pw_stream_dequeue_buffer(stream.as_raw_ptr()) })
+            else {
+                return;
             };
-            let mut latest = latest.lock().unwrap_or_else(PoisonError::into_inner);
-            latest.size = (size.width, size.height);
-            latest.frame = Some(Frame {
-                width: size.width,
-                height: size.height,
-                fourcc,
-                pixels,
-            });
+            let give_back = || {
+                // SAFETY: dequeued from this stream just above and not queued since.
+                unsafe { pw::sys::pw_stream_queue_buffer(stream.as_raw_ptr(), buffer.as_ptr()) };
+            };
+            // SAFETY: a dequeued buffer stays valid until queued back.
+            let Some(pixels) = (unsafe { pixels(buffer, format) }) else {
+                give_back();
+                return;
+            };
+            let (Some(fourcc), size) = (fourcc(format.format()), format.size()) else {
+                give_back();
+                return;
+            };
+            // A copy needs the buffer no longer; a DMA-BUF plane is held until its frame is dropped.
+            let release = if matches!(pixels, Pixels::DmaBuf { .. }) {
+                let (releases, held) = (releases.clone(), Held(buffer));
+                Release::new(move || {
+                    let _ = releases.send(Message::Release(held));
+                })
+            } else {
+                give_back();
+                Release::default()
+            };
+            latest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .put(Frame {
+                    width: size.width,
+                    height: size.height,
+                    fourcc,
+                    pixels,
+                    release,
+                });
         })
         .register()
         .map_err(|error| error.to_string())?;
@@ -233,9 +253,19 @@ fn run(
         )
         .map_err(|error| error.to_string())?;
 
-    let _quit = quit.attach(main_loop.loop_(), {
-        let main_loop = main_loop.clone();
-        move |()| main_loop.quit()
+    let _messages = messages.attach(main_loop.loop_(), {
+        let (main_loop, stream) = (main_loop.clone(), stream.clone());
+        move |message| match message {
+            Message::Quit => main_loop.quit(),
+            Message::Release(Held(buffer)) => {
+                if live.borrow().contains(&(buffer.as_ptr() as usize)) {
+                    // SAFETY: the stream still has this buffer, dequeued for a frame now dropped.
+                    unsafe {
+                        pw::sys::pw_stream_queue_buffer(stream.as_raw_ptr(), buffer.as_ptr())
+                    };
+                }
+            }
+        }
     });
     let _ = ready.send(Ok(()));
     main_loop.run();
@@ -342,17 +372,89 @@ fn buffers(dma_buf: bool) -> Object {
     Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: spa::param::ParamType::Buffers.as_raw(),
-        properties: vec![Property::new(
-            spa::sys::SPA_PARAM_BUFFERS_dataType,
-            Value::Choice(ChoiceValue::Int(Choice(
-                ChoiceFlags::empty(),
-                ChoiceEnum::Flags {
-                    default: types,
-                    flags: vec![types],
-                },
-            ))),
-        )],
+        properties: vec![
+            // One held by the present, one waiting for it, and one for the compositor to draw in.
+            Property::new(
+                spa::sys::SPA_PARAM_BUFFERS_buffers,
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Range {
+                        default: 4,
+                        min: 3,
+                        max: 16,
+                    },
+                ))),
+            ),
+            Property::new(
+                spa::sys::SPA_PARAM_BUFFERS_dataType,
+                Value::Choice(ChoiceValue::Int(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Flags {
+                        default: types,
+                        flags: vec![types],
+                    },
+                ))),
+            ),
+        ],
     }
+}
+
+/// The pixels of `buffer`'s first plane as `format` says: a DMA-BUF fd to hold, or a copy of
+/// shared memory. `None` if it has no usable plane.
+///
+/// # Safety
+/// `buffer` is dequeued from the stream and not queued back.
+unsafe fn pixels(buffer: NonNull<pw::sys::pw_buffer>, format: &VideoInfoRaw) -> Option<Pixels> {
+    // SAFETY: the caller's buffer is valid; PipeWire fills `buffer` and `datas` before handing it out.
+    let data = unsafe {
+        let spa_buffer = buffer.as_ref().buffer.as_mut()?;
+        if spa_buffer.n_datas == 0 {
+            return None;
+        }
+        // `Data` is a transparent wrapper of `spa_data`.
+        spa_buffer.datas.cast::<spa::buffer::Data>().as_mut()?
+    };
+    let size = format.size();
+    let chunk = data.chunk();
+    if chunk.flags().contains(spa::buffer::ChunkFlags::CORRUPTED) {
+        return None;
+    }
+    let (offset, stride) = (chunk.offset(), u32::try_from(chunk.stride()).unwrap_or(0));
+    let stride = if stride == 0 { size.width * 4 } else { stride };
+    let kind = data.type_();
+    if kind == spa::buffer::DataType::MemPtr {
+        // In cardcast's own memory, so PipeWire gives the pointer.
+        let bytes = data
+            .data()
+            .and_then(|bytes| rows(bytes, offset, stride, size.height))?;
+        return Some(Pixels::Memory {
+            bytes: bytes.to_vec(),
+            stride,
+        });
+    }
+    let raw_fd = data.fd();
+    if raw_fd < 0 {
+        return None;
+    }
+    // SAFETY: the fd is not negative, and PipeWire keeps it open while the buffer is dequeued,
+    // which outlasts this borrow: it is only duplicated.
+    let fd = unsafe { BorrowedFd::borrow_raw(raw_fd) }
+        .try_clone_to_owned()
+        .ok()?;
+    if kind == spa::buffer::DataType::DmaBuf {
+        return Some(Pixels::DmaBuf {
+            fd,
+            offset,
+            stride,
+            modifier: format.modifier(),
+        });
+    }
+    // Shared memory is read, not mapped: producers such as xdg-desktop-portal-wlr don't mark it
+    // readable, so PipeWire's own mapping can't be read.
+    let mut bytes = vec![0; usize::try_from(stride * size.height).ok()?];
+    let at = u64::from(data.as_raw().mapoffset) + u64::from(offset);
+    File::from(fd).read_exact_at(&mut bytes, at).ok()?;
+    Some(Pixels::Memory { bytes, stride })
 }
 
 /// `object` as pod bytes.
