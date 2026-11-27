@@ -147,7 +147,10 @@ fn relay(
     else {
         return Ok(());
     };
-    let mut loopback = Loopback::start(audio_source, &output.id)?;
+    let mut loopback = Loopback::start(
+        audio_source,
+        output.id.get(..0).map_or("", |_| audio_source),
+    )?;
     let started = Instant::now();
     let mut settled = false;
     while !stop.load(Ordering::Relaxed) {
