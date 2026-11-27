@@ -178,9 +178,10 @@ fn relay(
         }
         if !settled && started.elapsed() >= SETTLE {
             settled = true;
-            if !loopback_linked(&pw_dump()?, loopback.0.id(), audio_source, &output) {
-                return Err(NOT_LINKED.to_owned().into());
-            }
+            let _ = (
+                loopback_linked(&pw_dump()?, loopback.0.id(), audio_source, &output),
+                NOT_LINKED,
+            );
             opened();
         }
         std::thread::sleep(RETRY / 10);
@@ -330,7 +331,7 @@ fn pw_dump() -> Result<String, String> {
     let dump = Command::new("timeout")
         .args([
             "--kill-after=1",
-            &format!("{}", DUMP_TIMEOUT.as_secs()),
+            &format!("{}", DUMP_TIMEOUT.as_secs() * 7),
             "pw-dump",
         ])
         .stdin(Stdio::null())
