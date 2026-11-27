@@ -525,7 +525,7 @@ impl Picture for Desktop {
             Paint::Copy
         };
         self.painter
-            .paint(context, target, &frame.view, viewport, 1, paint);
+            .paint(context, target, &frame.view, viewport, self.rotation, paint);
         if let (true, Some(image)) = (self.pointer.visible, &self.pointer.image) {
             let viewport = pointer_viewport(
                 fit,
