@@ -268,9 +268,7 @@ fn second_monitor_mirror_starts_on_it_and_presents() {
 }
 
 #[test]
-fn second_monitor_card_display_on_another_graphics_card_is_mirrored() {
-    // SPIKE (research-cross-gpu, not for merge): Desktop Duplication on the source monitor's
-    // graphics card, swap chain on the card display's window on another graphics card.
+fn second_monitor_card_display_on_another_graphics_card_is_refused() {
     let Some(monitors) = crate::guard::second_monitor::monitors(2) else {
         return;
     };
@@ -282,11 +280,6 @@ fn second_monitor_card_display_on_another_graphics_card_is_mirrored() {
             .unwrap()
             .adapter
     };
-    let name = |index: u32| {
-        // SAFETY: index came from `outputs` on this factory.
-        let description = unsafe { factory.EnumAdapters1(index).unwrap().GetDesc1() }.unwrap();
-        crate::guard::wide_to_string(&description.Description)
-    };
     // The job's primary monitor sits on the runner's own graphics card, the virtual monitors on the virtual one.
     let source_monitor = &monitors[0];
     let Some(card_display) = monitors
@@ -295,42 +288,17 @@ fn second_monitor_card_display_on_another_graphics_card_is_mirrored() {
     else {
         panic!("no monitor on a graphics card other than the primary monitor's");
     };
-    // Written to stderr directly: libtest captures only the print macros, and CI runs without --nocapture.
-    use std::io::Write;
-    let _ = writeln!(
-        std::io::stderr(),
-        "source monitor on adapter {} ({}), card display on adapter {} ({})",
-        adapter(source_monitor),
-        name(adapter(source_monitor)),
-        adapter(card_display),
-        name(adapter(card_display))
-    );
-    // The refusal test that used `end` is replaced by this spike.
-    let _ = end;
     let _duplicating = duplicating();
     let mut mirror = MirrorWindow::new(|| {});
     mirror.start(source_monitor, card_display).unwrap();
-    shows_picture(&mut mirror);
-    let presents = &mirror.running.as_ref().unwrap().presents;
-    std::thread::sleep(Duration::from_millis(500));
-    let (start, at_start) = (Instant::now(), presents.load(Ordering::Relaxed));
-    std::thread::sleep(Duration::from_secs(5));
-    let counted = presents.load(Ordering::Relaxed) - at_start;
-    let per_second = counted as f64 / start.elapsed().as_secs_f64();
-    let refresh = f64::from(card_display.refresh_hz);
-    let _ = writeln!(
-        std::io::stderr(),
-        "{per_second:.1} presents per second across graphics cards on a {refresh} Hz card display"
+    let refused = end(&mut mirror);
+    assert_eq!(
+        refused,
+        Ended::Stop(
+            "The source monitor and the card display are on different graphics cards. Plug both into the same one.".into()
+        )
     );
-    assert!(
-        mirror.is_running(),
-        "the mirror ended: {:?}",
-        mirror.take_end()
-    );
-    assert!(
-        per_second >= refresh * 0.5,
-        "{per_second:.1} presents per second"
-    );
+    assert!(!mirror.is_running());
 }
 
 #[test]
