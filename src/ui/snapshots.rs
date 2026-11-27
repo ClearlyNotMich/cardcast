@@ -119,6 +119,7 @@ fn sender(status: Status) -> SettingsWindow {
     window
 }
 
+/// Callers hold `one_device_at_a_time()` for as long as the harness lives.
 fn harness(window: SettingsWindow) -> Harness<'static, SettingsWindow> {
     Harness::builder()
         .with_size([780.0, 780.0])
@@ -183,6 +184,7 @@ fn snapshot_card_display_is_primary() {
 /// The card display dropdown leaves out the source monitor and the primary monitor.
 #[test]
 fn snapshot_card_display_dropdown() {
+    let _device = one_device_at_a_time();
     let mut harness = harness(sender(Status::Stopped));
     harness
         .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Card display")
