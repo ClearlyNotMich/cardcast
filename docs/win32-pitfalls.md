@@ -55,6 +55,7 @@ Do: keep the callback short and defer work to the message loop. Don't: install t
 - `SM_CXSCREEN` / `SM_CYSCREEN` give the primary monitor only. Use `MonitorFromRect` + `GetMonitorInfo` (`rcMonitor`, `rcWork`), and don't assume a monitor rect starts at (0,0). [Positioning objects on a multiple display setup](https://learn.microsoft.com/en-us/windows/win32/gdi/positioning-objects-on-a-multiple-display-setup)
 
 Do: use `i32` everywhere and test with negative monitor rects. Don't: use `u32` coordinates or screen-size metrics.
+Do: swap a `DISPLAYCONFIG_SOURCE_MODE`'s width and height when the path's `targetInfo.rotation` is 90 or 270; measured on the CI runner's virtual monitor turned 90° with `SetDisplayConfig`, its source mode stayed 800x600 while `rcMonitor` was 600x800 ([run](https://github.com/ClearlyNotMich/cardcast/actions/runs/46050167136/job/140679209981)). Don't: take the source mode as the monitor's desktop size.
 
 ## Focus and z-order
 
