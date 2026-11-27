@@ -64,7 +64,7 @@ jobs:
         name: Mirror capture on Xvfb
         env:
           CARDCAST_CAPTURE: screen
-          CARDCAST_EXPECT_COLOUR: '#cc6634'
+          CARDCAST_EXPECT_COLOUR: '#cc6633'
         run: xvfb-run -s '-screen 0 1280x1024x24 -noreset' sh -c 'xsetroot -solid "#cc6633" && cargo test mirror::linux::tests::desktop_captures -- --nocapture'
       - if: runner.os == 'Linux'
         name: Mirror capture through the portal on headless sway
