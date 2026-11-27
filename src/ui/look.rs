@@ -314,6 +314,7 @@ mod tests {
             primary: left == 0 && top == 0,
             left,
             top,
+            graphics_card: String::new(),
         }
     }
 

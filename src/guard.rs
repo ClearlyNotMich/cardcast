@@ -56,6 +56,8 @@ pub struct Monitor {
     /// Top-left corner on the desktop.
     pub left: i32,
     pub top: i32,
+    /// Name of the graphics card the monitor is plugged into, as DXGI lists it; empty if unknown.
+    pub graphics_card: String,
 }
 
 /// What the settings window needs from the window guard and pointer guard.
@@ -123,6 +125,11 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             primary,
             left,
             top: 0,
+            graphics_card: if device_path == "stand-in-card" {
+                "Stand-in integrated graphics".into()
+            } else {
+                "Stand-in graphics card".into()
+            },
         };
     // Arranged as on the sender: the source monitor left of the primary monitor, the card display right of it.
     Ok(vec![
@@ -231,6 +238,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
 
     let failed = |what: &str| format!("Could not list monitors. ({what})");
     let (paths, modes) = display_config()?;
+    let cards = graphics_cards();
     let mut monitors = Vec::new();
     for (index, path) in paths.iter().enumerate() {
         let Some((device_path, name)) = device_path(path) else {
@@ -254,9 +262,15 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         // SAFETY: the mode a path's source index points to is a source mode.
         let source_mode = unsafe { mode.Anonymous.sourceMode };
         let rate = path.targetInfo.refreshRate;
+        let gdi_name = wide_to_string(&source.viewGdiDeviceName);
+        let graphics_card = cards
+            .iter()
+            .find(|(output, _)| output.eq_ignore_ascii_case(&gdi_name))
+            .map(|(_, card)| card.clone())
+            .unwrap_or_default();
         monitors.push(Monitor {
             device_path,
-            gdi_name: wide_to_string(&source.viewGdiDeviceName),
+            gdi_name,
             name: if name.is_empty() {
                 format!("Monitor {}", index + 1)
             } else {
@@ -271,9 +285,38 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             primary: source_mode.position.x == 0 && source_mode.position.y == 0,
             left: source_mode.position.x,
             top: source_mode.position.y,
+            graphics_card,
         });
     }
     Ok(monitors)
+}
+
+/// Each DXGI output's GDI name with the name of the graphics card DXGI lists it under, the card
+/// the mirror's device goes on (`mirror::find_output` matches the same way).
+#[cfg(windows)]
+fn graphics_cards() -> Vec<(String, String)> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    let mut cards = Vec::new();
+    // SAFETY: plain factory creation.
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+        return cards;
+    };
+    // SAFETY: enumeration ends at the first index that fails (DXGI_ERROR_NOT_FOUND).
+    for adapter in (0..).map_while(|index| unsafe { factory.EnumAdapters1(index) }.ok()) {
+        // SAFETY: plain description read.
+        let Ok(description) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        let card = wide_to_string(&description.Description);
+        // SAFETY: as above, per output.
+        for output in (0..).map_while(|index| unsafe { adapter.EnumOutputs(index) }.ok()) {
+            // SAFETY: plain description read.
+            if let Ok(output) = unsafe { output.GetDesc() } {
+                cards.push((wide_to_string(&output.DeviceName), card.clone()));
+            }
+        }
+    }
+    cards
 }
 
 /// Helpers for the tests the CI `second-monitor` job runs: it adds two virtual monitors on one

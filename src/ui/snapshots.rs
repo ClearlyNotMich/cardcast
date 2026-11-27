@@ -18,6 +18,7 @@ fn monitor(device_path: &str, name: &str, size: (u32, u32), hz: u32, at: (i32, i
         primary: at == (0, 0),
         left: at.0,
         top: at.1,
+        graphics_card: String::new(),
     }
 }
 
