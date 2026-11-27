@@ -22,7 +22,7 @@ mod linux;
     not(windows),
     allow(
         dead_code,
-        reason = "only the Windows window guard calls it; its tests run everywhere"
+        reason = "the mirror check is Windows-only (the Linux mirror is no client window); its tests run everywhere"
     )
 )]
 mod placement;
@@ -104,26 +104,32 @@ pub fn new_guard(wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
     Box::new(window_guard::WindowGuard::new(wake))
 }
 
-/// The Linux guards are not built yet (#36), so while the guard checkbox is on it says so.
+/// The window guard on X11 and Plasma; elsewhere on Linux (#36) it says while it is on that it does
+/// not work there yet.
 #[cfg(not(windows))]
-pub fn new_guard(_wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
-    Box::new(NotOnLinuxYet::default())
+pub fn new_guard(wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
+    match desktop::detect(|name| std::env::var(name).ok()) {
+        Some(found @ (desktop::Desktop::X11 | desktop::Desktop::PlasmaWayland)) => {
+            Box::new(linux::WindowGuard::new(found, monitors, wake))
+        }
+        _ => Box::new(NotOnThisDesktopYet::default()),
+    }
 }
 
 #[cfg(not(windows))]
 #[derive(Default)]
-struct NotOnLinuxYet {
+struct NotOnThisDesktopYet {
     enabled: bool,
     report: Option<GuardReport>,
 }
 
 #[cfg(not(windows))]
-impl Guard for NotOnLinuxYet {
+impl Guard for NotOnThisDesktopYet {
     fn update(&mut self, enabled: bool, _card: Option<&str>, _send_windows_to: Option<&str>) {
         self.enabled = enabled;
         self.report = Some(if enabled {
             GuardReport::Notice(
-                "The window guard and pointer guard do not work on Linux yet.".into(),
+                "The window guard and pointer guard do not work on this desktop yet.".into(),
             )
         } else {
             GuardReport::Clear
@@ -724,11 +730,12 @@ mod linux_tests {
     use super::*;
 
     #[test]
-    fn on_linux_the_guard_says_it_does_not_run_yet_while_it_is_on() {
+    fn on_a_desktop_without_a_helper_the_guard_says_it_does_not_run_yet_while_it_is_on() {
         let not_yet = GuardReport::Notice(
-            "The window guard and pointer guard do not work on Linux yet.".into(),
+            "The window guard and pointer guard do not work on this desktop yet.".into(),
         );
-        let mut guard = new_guard(|| {});
+        // Not `new_guard`: on a Plasma or X11 desktop that would guard the developer's windows.
+        let mut guard = NotOnThisDesktopYet::default();
         assert_eq!(guard.take_report(), None);
         guard.update(true, Some("card"), None);
         assert_eq!(guard.take_report(), Some(not_yet.clone()));
