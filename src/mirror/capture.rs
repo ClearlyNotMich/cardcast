@@ -4,7 +4,9 @@
 
 use super::pointer::{pointer_image, pointer_viewport};
 use super::window::Picture;
-use super::{Ended, Fit, recreate_capture_in_place, start_failed, white_scale};
+use super::{
+    Ended, Fit, corner_uvs, recreate_capture_in_place, start_failed, upright_size, white_scale,
+};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::E_POINTER;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -32,19 +34,21 @@ use windows::core::{Interface, PCSTR, s};
 /// How long to wait before re-creating a lost duplication (desktop switch, mode change, prompt).
 const RETRY: Duration = Duration::from_millis(250);
 
-/// Full-screen quad from four vertex ids; `copy` passes an 8-bit picture through, `hdr` turns
+/// Full-screen quad from four vertex ids, its corners sampled at `corners` (`super::corner_uvs`)
+/// so a rotated picture is drawn upright; `copy` passes an 8-bit picture through, `hdr` turns
 /// linear scRGB into sRGB SDR exactly as `super::sdr_from_hdr` does.
 const SHADERS: &str = r"
 Texture2D picture : register(t0);
 SamplerState smooth : register(s0);
-cbuffer Hdr : register(b0) { float white_scale; };
+cbuffer Draw : register(b0) { float4 corners[4]; float white_scale; };
 
 struct Pixel { float4 position : SV_Position; float2 uv : TEXCOORD0; };
 
 Pixel vertex_main(uint id : SV_VertexID) {
     Pixel pixel;
-    pixel.uv = float2(id & 1, id >> 1);
-    pixel.position = float4(pixel.uv.x * 2 - 1, 1 - pixel.uv.y * 2, 0, 1);
+    float2 corner = float2(id & 1, id >> 1);
+    pixel.uv = corners[id].xy;
+    pixel.position = float4(corner.x * 2 - 1, 1 - corner.y * 2, 0, 1);
     return pixel;
 }
 
@@ -77,7 +81,7 @@ pub struct Painter {
     hdr: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     blend: ID3D11BlendState,
-    white: ID3D11Buffer,
+    constants: ID3D11Buffer,
 }
 
 /// Shader compiles in this process; the tests check there are only three.
@@ -141,7 +145,7 @@ fn created<T>(value: Option<T>) -> windows::core::Result<T> {
 impl Painter {
     pub fn new(device: &ID3D11Device) -> windows::core::Result<Self> {
         let [vertex_code, copy_code, hdr_code] = bytecode()?;
-        let (mut vertex, mut copy, mut hdr, mut sampler, mut blend, mut white) =
+        let (mut vertex, mut copy, mut hdr, mut sampler, mut blend, mut constants) =
             (None, None, None, None, None, None);
         let pointer_blend = D3D11_RENDER_TARGET_BLEND_DESC {
             BlendEnable: true.into(),
@@ -178,13 +182,14 @@ impl Painter {
             )?;
             device.CreateBuffer(
                 &D3D11_BUFFER_DESC {
-                    ByteWidth: 16,
+                    // `Draw` in SHADERS: four float4 corners, then white_scale padded to 16 bytes.
+                    ByteWidth: 80,
                     Usage: D3D11_USAGE_DEFAULT,
                     BindFlags: D3D11_BIND_CONSTANT_BUFFER.0.cast_unsigned(),
                     ..Default::default()
                 },
                 None,
-                Some(&mut white),
+                Some(&mut constants),
             )?;
         }
         Ok(Self {
@@ -193,20 +198,32 @@ impl Painter {
             hdr: created(hdr)?,
             sampler: created(sampler)?,
             blend: created(blend)?,
-            white: created(white)?,
+            constants: created(constants)?,
         })
     }
 
-    /// Draws `view` stretched over `viewport` (left, top, width, height) of `target`.
+    /// Draws `view` turned by `rotation` (`super::corner_uvs`) and stretched over `viewport`
+    /// (left, top, width, height) of `target`.
     pub fn paint(
         &self,
         context: &ID3D11DeviceContext1,
         target: &ID3D11RenderTargetView,
         view: &ID3D11ShaderResourceView,
         viewport: [f32; 4],
+        rotation: i32,
         paint: Paint,
     ) {
         let [left, top, width, height] = viewport;
+        let white_scale = match paint {
+            Paint::Hdr(scale) => scale,
+            Paint::Copy | Paint::Blend => 1.0,
+        };
+        let mut constants = [0.0f32; 20];
+        for (at, [u, v]) in corner_uvs(rotation).into_iter().enumerate() {
+            constants[at * 4] = u;
+            constants[at * 4 + 1] = v;
+        }
+        constants[16] = white_scale;
         // SAFETY: every object bound here belongs to the context's device and lives through the draw.
         unsafe {
             context.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
@@ -220,21 +237,12 @@ impl Painter {
             }]));
             context.IASetInputLayout(None);
             context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+            context.UpdateSubresource(&self.constants, 0, None, constants.as_ptr().cast(), 0, 0);
+            context.VSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
+            context.PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
             context.VSSetShader(&self.vertex, None);
             match paint {
-                Paint::Hdr(scale) => {
-                    let constants = [scale, 0.0, 0.0, 0.0];
-                    context.UpdateSubresource(
-                        &self.white,
-                        0,
-                        None,
-                        constants.as_ptr().cast(),
-                        0,
-                        0,
-                    );
-                    context.PSSetConstantBuffers(0, Some(&[Some(self.white.clone())]));
-                    context.PSSetShader(&self.hdr, None);
-                }
+                Paint::Hdr(_) => context.PSSetShader(&self.hdr, None),
                 Paint::Copy | Paint::Blend => context.PSSetShader(&self.copy, None),
             }
             context.PSSetShaderResources(0, Some(&[Some(view.clone())]));
@@ -323,6 +331,8 @@ pub struct Desktop {
     duplication: Option<IDXGIOutputDuplication>,
     retry_at: Instant,
     white_scale: f32,
+    /// `DXGI_OUTDUPL_DESC.Rotation` of the current duplication.
+    rotation: i32,
     frame: Option<Texture>,
     pointer: Pointer,
 }
@@ -357,6 +367,7 @@ impl Desktop {
             duplication: None,
             retry_at: Instant::now(),
             white_scale: 1.0,
+            rotation: 1,
             frame: None,
             pointer: Pointer::default(),
         };
@@ -378,7 +389,11 @@ impl Desktop {
         // shortcut: the SDR white level is read when capture starts or is re-created; a slider change while running needs a restart.
         self.white_scale = white_scale(sdr_white_level(&self.device_path).unwrap_or(0));
         // SAFETY: the device is on the output's graphics card; formats outlives the call.
-        self.duplication = Some(unsafe { self.output.DuplicateOutput1(&self.device, 0, formats) }?);
+        let duplication = unsafe { self.output.DuplicateOutput1(&self.device, 0, formats) }?;
+        // A rotation change is a mode change, which loses access and re-creates the duplication.
+        // SAFETY: plain description read.
+        self.rotation = unsafe { duplication.GetDesc() }.Rotation.0;
+        self.duplication = Some(duplication);
         Ok(())
     }
 
@@ -467,13 +482,13 @@ impl Desktop {
 }
 
 impl Picture for Desktop {
+    /// The source monitor's desktop size, upright.
     fn size(&self) -> (u32, u32) {
-        self.frame
-            .as_ref()
-            .map_or((0, 0), |frame| (frame.width, frame.height))
+        self.frame.as_ref().map_or((0, 0), |frame| {
+            upright_size((frame.width, frame.height), self.rotation)
+        })
     }
 
-    // shortcut: a rotated source monitor shows un-rotated (the duplication does not rotate); add rotation if anyone mirrors a portrait monitor.
     fn draw(
         &mut self,
         context: &ID3D11DeviceContext1,
@@ -510,16 +525,18 @@ impl Picture for Desktop {
             Paint::Copy
         };
         self.painter
-            .paint(context, target, &frame.view, viewport, paint);
+            .paint(context, target, &frame.view, viewport, self.rotation, paint);
         if let (true, Some(image)) = (self.pointer.visible, &self.pointer.image) {
             let viewport = pointer_viewport(
                 fit,
                 (frame.width, frame.height),
+                self.rotation,
                 self.pointer.position,
                 (image.width, image.height),
             );
+            // The shape comes upright (see `pointer_viewport`), so it is drawn unrotated.
             self.painter
-                .paint(context, target, &image.view, viewport, Paint::Blend);
+                .paint(context, target, &image.view, viewport, 1, Paint::Blend);
         }
         Ok(())
     }
