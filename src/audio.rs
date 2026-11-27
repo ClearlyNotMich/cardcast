@@ -52,8 +52,8 @@ pub trait Relay {
 pub enum RelayReport {
     /// It keeps failing, for this reason in plain words.
     Failing(String),
-    /// Automatic found no sound output, in plain words; the user can choose one or No audio.
-    NoSoundOutput(String),
+    /// Automatic found no sound output ([`NO_SOUND_OUTPUT`]); the user can choose one or No audio.
+    NoSoundOutput,
     /// It relays again after a reported failure.
     Relaying,
 }
@@ -132,11 +132,12 @@ pub struct AudioDevice {
     pub container_id: String,
 }
 
+/// The status line when Automatic finds no sound output, next to a "Choose sound output" button.
+pub const NO_SOUND_OUTPUT: &str = "Can't find the capture card's sound output. Choose it, or choose No audio if the capture card has no sound.";
+
 /// Where the audio source is played for the `output` setting, or `None` for No audio: the chosen
-/// playback device while it is connected, else Automatic: the one playback device in the card
-/// display's container (Windows gives a monitor and its HDMI or DisplayPort sound output the same
-/// container ID), else the one playback device other than the audio source named after the card
-/// display. The error is the status line's report.
+/// playback device while it is connected, else [`automatic`] without the audio source. The error
+/// is the status line's report.
 pub fn card_output<'a>(
     devices: &'a [AudioDevice],
     audio_source: &str,
@@ -163,6 +164,45 @@ pub fn card_output<'a>(
         }
         SoundOutput::Automatic => {}
     }
+    automatic(
+        devices,
+        Some(audio_source),
+        card_display_container,
+        card_display_name,
+    )
+    .map(Some)
+    .ok_or(RelayReport::NoSoundOutput)
+}
+
+/// The playback device `output` plays to, whatever the audio source: the chosen one while it is
+/// connected, else what [`automatic`] finds; `None` for No audio or when nothing is found.
+pub fn sound_output_device<'a>(
+    devices: &'a [AudioDevice],
+    output: &SoundOutput,
+    card_display_container: &str,
+    card_display_name: &str,
+) -> Option<&'a AudioDevice> {
+    match output {
+        SoundOutput::NoAudio => None,
+        SoundOutput::Device(id) => devices
+            .iter()
+            .find(|device| &device.id == id)
+            .or_else(|| automatic(devices, None, card_display_container, card_display_name)),
+        SoundOutput::Automatic => {
+            automatic(devices, None, card_display_container, card_display_name)
+        }
+    }
+}
+
+/// Automatic: the one playback device in the card display's container (Windows gives a monitor
+/// and its HDMI or DisplayPort sound output the same container ID), else the one playback device
+/// named after the card display; never `audio_source`, so `None` when that is the only match.
+fn automatic<'a>(
+    devices: &'a [AudioDevice],
+    audio_source: Option<&str>,
+    card_display_container: &str,
+    card_display_name: &str,
+) -> Option<&'a AudioDevice> {
     let mut in_container = devices.iter().filter(|device| {
         !card_display_container.is_empty()
             && device
@@ -170,38 +210,17 @@ pub fn card_output<'a>(
                 .eq_ignore_ascii_case(card_display_container)
     });
     if let (Some(device), None) = (in_container.next(), in_container.next()) {
-        if device.id == audio_source {
-            return Err(
-                "The audio source is the card display's own sound output. Choose another audio source."
-                    .to_owned()
-                    .into(),
-            );
-        }
-        return Ok(Some(device));
+        return (Some(device.id.as_str()) != audio_source).then_some(device);
     }
     let card_display_name = card_display_name.trim();
-    let named: Vec<&AudioDevice> = devices
-        .iter()
-        .filter(|device| {
-            device.id != audio_source
-                && without_number(&device.description).eq_ignore_ascii_case(card_display_name)
-        })
-        .collect();
-    if let [device] = named[..] {
-        return Ok(Some(device));
+    let mut named = devices.iter().filter(|device| {
+        Some(device.id.as_str()) != audio_source
+            && without_number(&device.description).eq_ignore_ascii_case(card_display_name)
+    });
+    match (named.next(), named.next()) {
+        (Some(device), None) => Some(device),
+        _ => None,
     }
-    let container = if card_display_container.is_empty() {
-        "Windows gave the card display no container ID"
-    } else {
-        "no playback device is in the card display's container"
-    };
-    let name = match named.len() {
-        0 => format!("no other playback device is named {card_display_name}"),
-        count => format!("{count} are named {card_display_name}"),
-    };
-    Err(RelayReport::NoSoundOutput(format!(
-        "Sound output not found: {container}, and {name}. Choose one, or No audio if the capture card has none."
-    )))
 }
 
 /// A playback device's name without the number Windows puts in front when names repeat
@@ -331,10 +350,8 @@ mod tests {
         )
     }
 
-    fn not_found(problem: &str) -> Result<Option<&'static AudioDevice>, RelayReport> {
-        Err(RelayReport::NoSoundOutput(format!(
-            "Sound output not found: {problem}. Choose one, or No audio if the capture card has none."
-        )))
+    fn not_found() -> Result<Option<&'static AudioDevice>, RelayReport> {
+        Err(RelayReport::NoSoundOutput)
     }
 
     #[test]
@@ -351,9 +368,7 @@ mod tests {
         let devices = sender_devices();
         assert_eq!(
             automatic(&devices, "headphones", "", "Elgato 1080p"),
-            not_found(
-                "Windows gave the card display no container ID, and no other playback device is named Elgato 1080p"
-            )
+            not_found()
         );
         assert_eq!(
             automatic(
@@ -362,9 +377,7 @@ mod tests {
                 "container of the TV",
                 "Elgato 1080p"
             ),
-            not_found(
-                "no playback device is in the card display's container, and no other playback device is named Elgato 1080p"
-            )
+            not_found()
         );
     }
 
@@ -408,10 +421,8 @@ mod tests {
         let devices = sender_devices();
         assert_eq!(
             automatic(&devices, "hdmi-card", CARD, "Elgato 1080p"),
-            Err(RelayReport::Failing(
-                "The audio source is the card display's own sound output. Choose another audio source."
-                    .into()
-            ))
+            not_found(),
+            "the audio source never plays into itself"
         );
     }
 
@@ -447,21 +458,13 @@ mod tests {
             device("hdmi-card", "1- HD60 X"),
             device("other-card", "2- HD60 X"),
         ];
-        assert_eq!(
-            automatic(&devices, "headphones", "", "HD60 X"),
-            not_found("Windows gave the card display no container ID, and 2 are named HD60 X")
-        );
+        assert_eq!(automatic(&devices, "headphones", "", "HD60 X"), not_found());
     }
 
     #[test]
     fn only_the_audio_source_with_the_name_is_not_found() {
         let devices = sender_devices();
-        assert_eq!(
-            automatic(&devices, "hdmi-card", "", "HD60 X"),
-            not_found(
-                "Windows gave the card display no container ID, and no other playback device is named HD60 X"
-            )
-        );
+        assert_eq!(automatic(&devices, "hdmi-card", "", "HD60 X"), not_found());
     }
 
     #[test]
@@ -549,5 +552,13 @@ mod tests {
             assert_eq!(SoundOutput::from_text(output.to_text()), output);
         }
         assert_eq!(SoundOutput::from_text(""), SoundOutput::Automatic);
+    }
+
+    #[test]
+    fn the_not_found_text_is_plain() {
+        assert_eq!(
+            NO_SOUND_OUTPUT,
+            "Can't find the capture card's sound output. Choose it, or choose No audio if the capture card has no sound."
+        );
     }
 }

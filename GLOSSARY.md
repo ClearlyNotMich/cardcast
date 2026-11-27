@@ -40,6 +40,10 @@ _Avoid_: Cursor lock, mouse fence
 The one playback device on the sender whose sound is carried to the receiver.
 _Avoid_: Channel, audio track
 
+**Connector**:
+The graphics card output the card display is plugged into: the graphics card plus that output's target id in Windows. It stays when the capture card changes its EDID, so cardcast finds the card display by it when the card display's device path changes.
+_Avoid_: Port, output, socket
+
 **Sound output**:
 The playback device on the sender that the audio source is played to, so the capture card carries it: Automatic (the card display's own sound output), a chosen playback device, or No audio for a capture card without sound.
 _Avoid_: Audio sink, target device, card audio

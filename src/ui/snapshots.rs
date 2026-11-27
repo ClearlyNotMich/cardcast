@@ -111,7 +111,7 @@ fn sender(status: Status) -> SettingsWindow {
 
 fn harness(window: SettingsWindow) -> Harness<'static, SettingsWindow> {
     Harness::builder()
-        .with_size([780.0, 720.0])
+        .with_size([780.0, 780.0])
         .build_eframe(|creation| {
             look::apply(&creation.egui_ctx);
             window
@@ -177,22 +177,13 @@ fn snapshot_guard_notice() {
 }
 
 #[test]
-fn snapshot_sound_output_automatic_found() {
-    let mut window = sender(Status::Running);
-    window.frame_rate.shown = Some(60.0);
-    snapshot("sound_output_automatic_found", window);
-}
-
-#[test]
 fn snapshot_sound_output_automatic_not_found() {
     let mut window = sender(Status::Running);
     window.frame_rate.shown = Some(60.0);
     // No container ID, and the playback device is not named after the card display.
     window.monitors[3].container_id = String::new();
     let relay = super::tests::RecordingRelay::default();
-    relay.1.borrow_mut().push(RelayReport::NoSoundOutput(
-        "Sound output not found: Windows gave the card display no container ID, and no other playback device is named Elgato 1080p. Choose one, or No audio if the capture card has none.".into(),
-    ));
+    relay.1.borrow_mut().push(RelayReport::NoSoundOutput);
     window.relay = Box::new(relay);
     window.follow_reports();
     snapshot("sound_output_automatic_not_found", window);

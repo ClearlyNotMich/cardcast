@@ -44,6 +44,8 @@ The settings window has these controls. Each monitor dropdown shows the monitor'
 
 Choices are saved when you change them. Changing the source monitor, card display or audio source while the mirror runs or waits restarts it on the new choice at once. A new sound output restarts only the audio. On launch the mirror starts by itself, and the window starts minimised if it does. Closing the window quits cardcast.
 
+cardcast also remembers the connector the card display is plugged into, so it finds the card display again when the capture card changes its name (for example a different EDID mode). A different monitor plugged into that connector therefore becomes the card display, unless it is the source monitor, the "send windows to" monitor or the primary monitor; then cardcast keeps waiting for the card display.
+
 If the capture card or the source monitor is unplugged, the mirror stops and the status line says which one it waits for. When it is plugged back in, the mirror and audio resume by themselves.
 
 ## Window guard and pointer guard

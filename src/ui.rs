@@ -20,7 +20,7 @@ use std::time::Instant;
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([780.0, 720.0])
+            .with_inner_size([780.0, 780.0])
             .with_min_inner_size([560.0, 560.0]),
         ..Default::default()
     };
@@ -246,8 +246,8 @@ impl SettingsWindow {
                 self.status.audio = Some(problem);
                 self.status.choose_sound_output = false;
             }
-            Some(RelayReport::NoSoundOutput(problem)) => {
-                self.status.audio = Some(problem);
+            Some(RelayReport::NoSoundOutput) => {
+                self.status.audio = Some(audio::NO_SOUND_OUTPUT.into());
                 self.status.choose_sound_output = true;
             }
             Some(RelayReport::Relaying) => {
@@ -272,9 +272,7 @@ impl SettingsWindow {
     /// Re-reads the monitors after a display change and follows the source monitor and card display.
     fn follow_displays(&mut self) {
         // A card display's sound output comes and goes with it.
-        if let Ok(devices) = audio::playback_devices() {
-            self.playback_devices = devices;
-        }
+        self.take_playback_devices(audio::playback_devices());
         match guard::monitors() {
             Ok(monitors) => self.follow_monitors(monitors),
             Err(error) => self.status.other = Some(error),
@@ -348,6 +346,12 @@ impl SettingsWindow {
     }
 
     fn audio_dropdown(&mut self, ui: &mut egui::Ui) {
+        let card_display = self
+            .monitors
+            .iter()
+            .find(|monitor| self.settings.card_display.as_ref() == Some(&monitor.device_path));
+        let choices =
+            settings::audio_source_choices(&self.playback_devices, &self.settings, card_display);
         let selected = &mut self.settings.audio_source;
         let shown = self
             .playback_devices
@@ -359,7 +363,7 @@ impl SettingsWindow {
             .selected_text(shown)
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                for device in &self.playback_devices {
+                for device in &choices {
                     ui.selectable_value(selected, Some(device.id.clone()), &device.name);
                 }
             })
@@ -386,11 +390,17 @@ impl SettingsWindow {
         });
     }
 
+    /// A fresh list of playback devices; a failed one keeps the old list and says why.
+    fn take_playback_devices(&mut self, devices: Result<Vec<AudioDevice>, String>) {
+        match devices {
+            Ok(devices) => self.playback_devices = devices,
+            Err(error) => self.status.other = Some(error),
+        }
+    }
+
     /// Opens the sound output dialog with the saved choice, on a fresh list of playback devices.
     fn choose_sound_output(&mut self) {
-        if let Ok(devices) = audio::playback_devices() {
-            self.playback_devices = devices;
-        }
+        self.take_playback_devices(audio::playback_devices());
         self.choosing_sound_output = Some(self.settings.sound_output.clone());
     }
 
@@ -959,6 +969,23 @@ mod tests {
     }
 
     #[test]
+    fn playback_devices_that_cannot_be_listed_are_kept_and_reported() {
+        let mut window = window("card");
+        window.playback_devices = vec![AudioDevice {
+            id: "speakers".into(),
+            name: "Speakers".into(),
+            description: "Speakers".into(),
+            container_id: String::new(),
+        }];
+        window.take_playback_devices(Err("Could not list playback devices.".into()));
+        assert_eq!(window.playback_devices.len(), 1);
+        assert_eq!(
+            window.status.text(),
+            "Stopped | Could not list playback devices."
+        );
+    }
+
+    #[test]
     fn no_audio_runs_the_mirror_without_the_relay() {
         let (mut window, relay) = with_relay(window("card"), Some("speakers"));
         window.settings.sound_output = SoundOutput::NoAudio;
@@ -992,12 +1019,12 @@ mod tests {
     fn no_sound_output_found_offers_to_choose_it_and_the_mirror_keeps_running() {
         let (mut window, relay) = with_relay(window("card"), Some("speakers"));
         window.start();
-        relay
-            .1
-            .borrow_mut()
-            .push(RelayReport::NoSoundOutput("Could not find it.".into()));
+        relay.1.borrow_mut().push(RelayReport::NoSoundOutput);
         window.follow_reports();
-        assert_eq!(window.status.text(), "Running | Could not find it.");
+        assert_eq!(
+            window.status.text(),
+            "Running | Can't find the capture card's sound output. Choose it, or choose No audio if the capture card has no sound."
+        );
         assert!(window.status.choose_sound_output);
         assert!(window.mirror.is_running());
         relay.1.borrow_mut().push(RelayReport::Relaying);

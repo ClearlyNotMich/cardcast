@@ -240,7 +240,8 @@ pub fn starts_on_launch(settings: &Settings) -> bool {
 
 /// Keeps the saved card display found: a new EDID (Display EDID mode on a capture card) gives it
 /// a new device path on the same connector, so a card display missing by its path is the monitor
-/// on its saved connector, and takes that monitor's path. The connector of the card display found
+/// on its saved connector (unless it is the primary monitor or has another role), and takes
+/// that monitor's path. The connector of the card display found
 /// is saved too. Returns whether the settings changed, so they are saved.
 pub fn follow_card_display(settings: &mut Settings, monitors: &[Monitor]) -> bool {
     let Some(card_path) = &settings.card_display else {
@@ -251,9 +252,14 @@ pub fn follow_card_display(settings: &mut Settings, monitors: &[Monitor]) -> boo
         .iter()
         .find(|monitor| &monitor.device_path == card_path)
         .or_else(|| {
-            monitors
-                .iter()
-                .find(|monitor| !saved_connector.is_empty() && monitor.connector == saved_connector)
+            // Never another role's monitor or the primary monitor: the mirror would cover it.
+            let taken = [&settings.source_monitor, &settings.send_windows_to];
+            monitors.iter().find(|monitor| {
+                !saved_connector.is_empty()
+                    && monitor.connector == saved_connector
+                    && !monitor.primary
+                    && !taken.contains(&&Some(monitor.device_path.clone()))
+            })
         });
     let Some(card_display) = found.filter(|monitor| !monitor.connector.is_empty()) else {
         return false;
@@ -304,6 +310,27 @@ pub fn sound_output_label(
         Ok(Some(device)) => format!("Automatic · {}", device.name),
         _ => "Automatic · not found".into(),
     }
+}
+
+/// The audio source dropdown's choices: every playback device but the sound output in use (the
+/// chosen one, or what Automatic finds for the card display), so the two never collide.
+pub fn audio_source_choices<'a>(
+    devices: &'a [AudioDevice],
+    settings: &Settings,
+    card_display: Option<&Monitor>,
+) -> Vec<&'a AudioDevice> {
+    let in_use = card_display.and_then(|card_display| {
+        audio::sound_output_device(
+            devices,
+            &settings.sound_output,
+            &card_display.container_id,
+            &card_display.name,
+        )
+    });
+    devices
+        .iter()
+        .filter(|device| Some(&device.id) != in_use.map(|in_use| &in_use.id))
+        .collect()
 }
 
 /// The sound output dialog's choices: Automatic, every playback device but the audio source, No audio.
@@ -518,6 +545,28 @@ mod tests {
     }
 
     #[test]
+    fn audio_source_choices_leave_out_the_sound_output_in_use() {
+        let (devices, card) = sound_devices();
+        let names = |output| -> Vec<String> {
+            audio_source_choices(&devices, &with_output(output), Some(&card))
+                .iter()
+                .map(|device| device.id.clone())
+                .collect()
+        };
+        // Automatic resolves to the card display's own sound output.
+        assert_eq!(names(SoundOutput::Automatic), ["speakers"]);
+        assert_eq!(names(SoundOutput::Device("speakers".into())), ["hdmi"]);
+        // A chosen device that is gone falls back to Automatic.
+        assert_eq!(names(SoundOutput::Device("gone".into())), ["speakers"]);
+        assert_eq!(names(SoundOutput::NoAudio), ["speakers", "hdmi"]);
+        // Nothing resolved without a card display: every device is offered.
+        assert_eq!(
+            audio_source_choices(&devices, &with_output(SoundOutput::Automatic), None).len(),
+            2
+        );
+    }
+
+    #[test]
     fn sound_output_choices_leave_out_the_audio_source() {
         let (devices, _) = sound_devices();
         assert_eq!(
@@ -601,6 +650,38 @@ mod tests {
             settings.card_display_connector.as_deref(),
             Some("gpu target 1")
         );
+    }
+
+    #[test]
+    fn the_connector_never_makes_another_role_or_the_primary_monitor_the_card_display() {
+        for taken in ["source", "send to", "primary"] {
+            let mut settings = Settings {
+                send_windows_to: Some("send to".into()),
+                card_display_connector: Some("gpu target 1".into()),
+                ..chosen("source", "old card")
+            };
+            let unchanged = settings.clone();
+            let mut monitors = vec![
+                on_connector("source", "gpu target 0"),
+                on_connector("send to", "gpu target 2"),
+                Monitor {
+                    primary: true,
+                    ..on_connector("primary", "gpu target 3")
+                },
+            ];
+            monitors
+                .iter_mut()
+                .find(|monitor| monitor.device_path == taken)
+                .unwrap()
+                .connector = "gpu target 1".into();
+            assert!(!follow_card_display(&mut settings, &monitors), "{taken}");
+            assert_eq!(settings, unchanged, "{taken}");
+            assert_eq!(
+                start(&settings, &monitors, &mut StandInMirror::default()),
+                Status::WaitingForCardDisplay,
+                "{taken}"
+            );
+        }
     }
 
     #[test]
