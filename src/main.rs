@@ -4,9 +4,18 @@
 
 mod audio;
 mod guard;
+mod input;
 mod mirror;
 mod ui;
 
 fn main() -> eframe::Result {
+    // With arguments cardcast is in command mode: one input switch, no window (SPEC section 11).
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if !args.is_empty() {
+        std::process::exit(input::command(&args));
+    }
     ui::run()
 }

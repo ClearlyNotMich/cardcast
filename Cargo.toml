@@ -2,11 +2,26 @@
 name = "cardcast"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "GPL-3.0-or-later"
 publish = false
 
 [dependencies]
 eframe = "0.37"
+
+# The Linux monitor list (docs/research/linux-support.md, sections 4 and 8): the versions eframe already pulls in.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
+x11rb = { version = "0.13", features = ["randr", "shm", "xfixes"] }
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# Mirror capture (#42): PipeWire streams from the ScreenCast portal. MIT.
+pipewire = { version = "0.10", features = ["v0_3_65"] }
+# libc (MIT OR Apache-2.0, the version eframe already pulls in): ending `pw-loopback` with cardcast
+# (section 3) and the i2c-dev ioctl for DDC/CI (section 7). serde_json (MIT OR Apache-2.0): the sink
+# list from `pw-dump`.
+libc = "0.2"
+serde_json = "1"
 
 # PNG snapshots of the settings window, rendered on Linux (AGENTS.md, Build and test).
 [target.'cfg(target_os = "linux")'.dev-dependencies]
@@ -32,6 +47,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_Accessibility",
@@ -40,7 +56,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [lints.rust]
-# unsafe is opt-in per module (mirror, guard, audio allow it) so it cannot spread to ui or logic.
+# unsafe is opt-in per module (mirror, guard, audio and input's ddc allow it) so it cannot spread to ui or logic.
 unsafe_code = "deny"
 # Every unsafe operation needs its own explicit block, even inside unsafe fns.
 unsafe_op_in_unsafe_fn = "deny"

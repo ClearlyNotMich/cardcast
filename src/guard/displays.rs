@@ -118,19 +118,17 @@ extern "system" fn window_proc(
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
-/// The container ID of the monitor with this display-configuration device path (a device
-/// interface path): interface → device instance id → devnode → `DEVPKEY_Device_ContainerId`.
-/// Empty if Windows cannot say.
-pub(super) fn container_id(device_path: &str) -> String {
+/// The devnode of the monitor with this display-configuration device path (a device interface
+/// path): interface → device instance id → devnode. `None` if Windows cannot say.
+pub(crate) fn device_node(device_path: &str) -> Option<u32> {
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        CM_Get_DevNode_PropertyW, CM_Get_Device_Interface_PropertyW, CM_LOCATE_DEVNODE_NORMAL,
-        CM_Locate_DevNodeW, CR_SUCCESS, MAX_DEVICE_ID_LEN,
+        CM_Get_Device_Interface_PropertyW, CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW,
+        CR_SUCCESS, MAX_DEVICE_ID_LEN,
     };
     use windows::Win32::Devices::Properties::{
-        DEVPKEY_Device_ContainerId, DEVPKEY_Device_InstanceId, DEVPROP_TYPE_GUID,
-        DEVPROP_TYPE_STRING, DEVPROPTYPE,
+        DEVPKEY_Device_InstanceId, DEVPROP_TYPE_STRING, DEVPROPTYPE,
     };
-    use windows::core::{GUID, PCWSTR};
+    use windows::core::PCWSTR;
 
     let path: Vec<u16> = device_path.encode_utf16().chain([0]).collect();
     let mut instance = [0u16; MAX_DEVICE_ID_LEN as usize];
@@ -148,7 +146,7 @@ pub(super) fn container_id(device_path: &str) -> String {
         )
     };
     if found != CR_SUCCESS || kind != DEVPROP_TYPE_STRING {
-        return String::new();
+        return None;
     }
     let mut node = 0;
     // SAFETY: instance holds the null-terminated id just written (shorter than MAX_DEVICE_ID_LEN).
@@ -159,9 +157,24 @@ pub(super) fn container_id(device_path: &str) -> String {
             CM_LOCATE_DEVNODE_NORMAL,
         )
     };
-    if located != CR_SUCCESS {
+    (located == CR_SUCCESS).then_some(node)
+}
+
+/// The container ID of the monitor with this display-configuration device path: its devnode's
+/// `DEVPKEY_Device_ContainerId`. Empty if Windows cannot say.
+pub(super) fn container_id(device_path: &str) -> String {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_PropertyW, CR_SUCCESS,
+    };
+    use windows::Win32::Devices::Properties::{
+        DEVPKEY_Device_ContainerId, DEVPROP_TYPE_GUID, DEVPROPTYPE,
+    };
+    use windows::core::GUID;
+
+    let Some(node) = device_node(device_path) else {
         return String::new();
-    }
+    };
+    let mut kind = DEVPROPTYPE::default();
     let mut container = GUID::zeroed();
     let mut size = u32::try_from(size_of::<GUID>()).unwrap_or(0);
     // SAFETY: the buffer is one GUID, as `size` says; a bigger value fails instead of being written.

@@ -47,9 +47,13 @@ pub struct StatusLine {
     pub choose_sound_output: bool,
     /// The guard's notice; kept until the guard clears it or the user dismisses it.
     pub guard: Option<String>,
+    /// Input switching's notice: not built here, no monitor offers it, or a switch failed; kept
+    /// until input switching is switched off, the input lists are read again or a switch works.
+    pub input: Option<String>,
     /// The notice the user dismissed; the guard re-sends it after every display change.
     dismissed_guard: Option<String>,
-    /// The display watcher could not start; kept until cardcast restarts.
+    /// The display watcher could not start, or parts are not built for this platform yet; kept
+    /// until cardcast restarts.
     pub displays: Option<String>,
     /// A settings or monitor-list problem; cleared on Start and Stop.
     pub other: Option<String>,
@@ -63,6 +67,7 @@ impl StatusLine {
             audio: None,
             choose_sound_output: false,
             guard: None,
+            input: None,
             dismissed_guard: None,
             displays: None,
             other: None,
@@ -101,7 +106,13 @@ impl StatusLine {
     #[cfg(test)]
     pub fn text(&self) -> String {
         let mut text = self.mirror.text();
-        let problems = [&self.audio, &self.guard, &self.displays, &self.other];
+        let problems = [
+            &self.audio,
+            &self.guard,
+            &self.input,
+            &self.displays,
+            &self.other,
+        ];
         for problem in problems.into_iter().flatten() {
             text.push_str(" | ");
             text.push_str(problem);
@@ -124,6 +135,7 @@ impl StatusLine {
             self.slow_mirror.as_deref(),
             self.audio.as_deref(),
             self.guard.as_deref(),
+            self.input.as_deref(),
             self.displays.as_deref(),
             self.other.as_deref(),
         ]
@@ -374,10 +386,15 @@ pub struct Settings {
     /// The card display's connector ([`Monitor::connector`]), to find it when its device path changes.
     pub card_display_connector: Option<String>,
     pub guard_enabled: bool,
+    /// The settings cog's one toggle (SPEC section 11); while off, nothing is sent over DDC/CI.
+    pub input_switching: bool,
+    /// The Linux screen-sharing portal's `restore_token`, which restores the shared source monitor
+    /// without its dialog (`mirror::linux::capture`); single-use, so each start replaces it.
+    pub restore_token: Option<String>,
 }
 
 impl Default for Settings {
-    /// The guard is on: it does nothing until the card display is chosen.
+    /// The guard is on: it does nothing until the card display is chosen. Input switching is off.
     fn default() -> Self {
         Self {
             source_monitor: None,
@@ -387,6 +404,8 @@ impl Default for Settings {
             sound_output: SoundOutput::Automatic,
             card_display_connector: None,
             guard_enabled: true,
+            input_switching: false,
+            restore_token: None,
         }
     }
 }
@@ -453,6 +472,7 @@ impl Settings {
             ("send_windows_to", &self.send_windows_to),
             ("audio_source", &self.audio_source),
             ("card_display_connector", &self.card_display_connector),
+            ("restore_token", &self.restore_token),
         ] {
             if let Some(value) = value {
                 text.push_str(&format!("{key}={value}\n"));
@@ -460,6 +480,7 @@ impl Settings {
         }
         text.push_str(&format!("sound_output={}\n", self.sound_output.to_text()));
         text.push_str(&format!("guard_enabled={}\n", self.guard_enabled));
+        text.push_str(&format!("input_switching={}\n", self.input_switching));
         text
     }
 
@@ -474,10 +495,12 @@ impl Settings {
                 "send_windows_to" => settings.send_windows_to = value,
                 "audio_source" => settings.audio_source = value,
                 "card_display_connector" => settings.card_display_connector = value,
+                "restore_token" => settings.restore_token = value,
                 "sound_output" => {
                     settings.sound_output = SoundOutput::from_text(value.as_deref().unwrap_or(""));
                 }
                 "guard_enabled" => settings.guard_enabled = value.as_deref() == Some("true"),
+                "input_switching" => settings.input_switching = value.as_deref() == Some("true"),
                 _ => {}
             }
         }
@@ -519,6 +542,8 @@ mod tests {
             sound_output: SoundOutput::Device("{0.0.0.00000000}.{hdmi}".into()),
             card_display_connector: Some(r"\\?\PCI#VEN_8086#3&1&0#{guid} target 4353".into()),
             guard_enabled: true,
+            input_switching: true,
+            restore_token: Some("5d0b8a35-6f4c-4d0e-9a3e-1b2c3d4e5f60".into()),
         };
         assert_eq!(Settings::from_text(&saved.to_text()), saved);
     }
@@ -623,6 +648,14 @@ mod tests {
         assert!(!Settings::from_text("guard_enabled=false\n").guard_enabled);
     }
 
+    #[test]
+    fn input_switching_is_off_in_a_fresh_settings_file() {
+        assert!(!Settings::default().input_switching);
+        assert!(!Settings::from_text("").input_switching);
+        assert!(!Settings::from_text("input_switching=yes\n").input_switching);
+        assert!(Settings::from_text("input_switching=true\n").input_switching);
+    }
+
     fn monitor(device_path: &str, primary: bool) -> Monitor {
         Monitor {
             device_path: device_path.into(),
@@ -630,6 +663,7 @@ mod tests {
             name: device_path.into(),
             width: 1920,
             height: 1080,
+            layout_size: (1920, 1080),
             refresh_hz: 60,
             primary,
             left: 0,
@@ -1246,6 +1280,7 @@ mod tests {
         let guard_only = Settings {
             send_windows_to: Some("primary".into()),
             guard_enabled: false,
+            input_switching: true,
             ..before.clone()
         };
         assert!(!restarts_on_change(true, &before, &guard_only));

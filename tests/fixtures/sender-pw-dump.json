@@ -1,0 +1,128 @@
+[
+  {
+    "id": 0,
+    "type": "PipeWire:Interface:Core",
+    "info": {
+      "version": "1.6.12",
+      "name": "pipewire-0"
+    }
+  },
+  {
+    "id": 43,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "api.alsa.path": "hw:1",
+        "device.bus-path": "pci-0000:01:00.1",
+        "device.description": "AD103 High Definition Audio Controller",
+        "device.name": "alsa_card.pci-0000_01_00.1",
+        "media.class": "Audio/Device",
+        "object.serial": 43
+      }
+    }
+  },
+  {
+    "id": 44,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "api.alsa.path": "hw:4",
+        "device.bus-path": "pci-0000:09:00.0-usb-0:5.4:1.2",
+        "device.description": "OBSBOT Meet 4K",
+        "device.name": "alsa_card.usb-Remo_Tech_Co.__Ltd._OBSBOT_Meet_4K-02",
+        "media.class": "Audio/Device",
+        "object.serial": 44
+      }
+    }
+  },
+  {
+    "id": 45,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "api.alsa.path": "hw:2",
+        "device.bus-path": "pci-0000:0c:00.1",
+        "device.description": "Radeon High Definition Audio Controller",
+        "device.name": "alsa_card.pci-0000_0c_00.1",
+        "media.class": "Audio/Device",
+        "object.serial": 45
+      }
+    }
+  },
+  {
+    "id": 46,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "api.alsa.path": "hw:3",
+        "device.bus-path": "pci-0000:0c:00.6",
+        "device.description": "Ryzen HD Audio Controller",
+        "device.name": "alsa_card.pci-0000_0c_00.6",
+        "media.class": "Audio/Device",
+        "object.serial": 46
+      }
+    }
+  },
+  {
+    "id": 47,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "api.alsa.path": "hw:0",
+        "device.bus-path": "pci-0000:0d:00.0-usb-0:1:1.0",
+        "device.description": "BEACN Studio",
+        "device.name": "alsa_card.usb-BEACN_BEACN_Studio_0031240800178C-00",
+        "media.class": "Audio/Device",
+        "object.serial": 47
+      }
+    }
+  },
+  {
+    "id": 59,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "alsa.name": "USB Audio",
+        "api.alsa.path": "hw:Studio,0",
+        "device.id": 47,
+        "media.class": "Audio/Sink",
+        "node.description": "BEACN Studio Headphones",
+        "node.name": "alsa_output.usb-BEACN_BEACN_Studio_0031240800178C-00.Basic__Headphones__sink",
+        "node.nick": "BEACN Studio",
+        "object.serial": 59
+      }
+    }
+  },
+  {
+    "id": 61,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "alsa.name": "USB Audio",
+        "api.alsa.path": "hw:Studio,0",
+        "device.id": 47,
+        "media.class": "Audio/Source",
+        "node.description": "BEACN Studio Microphone",
+        "node.name": "alsa_input.usb-BEACN_BEACN_Studio_0031240800178C-00.Basic__Mic__source",
+        "node.nick": "BEACN Studio",
+        "object.serial": 61
+      }
+    }
+  },
+  {
+    "id": 56,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "alsa.name": "Elgato1080HDR",
+        "api.alsa.path": "hdmi:2",
+        "device.id": 45,
+        "media.class": "Audio/Sink",
+        "node.description": "Radeon High Definition Audio Controller Digital Stereo (HDMI) [Elgato1080HDR]",
+        "node.name": "alsa_output.pci-0000_0c_00.1.hdmi-stereo",
+        "node.nick": "Elgato1080HDR",
+        "object.serial": 4691
+      }
+    }
+  }
+]

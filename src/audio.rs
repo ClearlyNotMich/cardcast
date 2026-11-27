@@ -1,11 +1,13 @@
-//! audio module. Windows calls live here.
+//! audio module. Windows and Linux calls live here.
 
 // unsafe is opt-in per module; see Cargo.toml [lints].
 #![allow(
     unsafe_code,
-    reason = "SPEC allows unsafe only in mirror, guard and audio, for Windows API calls"
+    reason = "SPEC allows unsafe only in mirror, guard and audio, for platform calls"
 )]
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg_attr(
     not(windows),
     allow(
@@ -14,6 +16,8 @@
     )
 )]
 mod pacing;
+#[cfg(target_os = "linux")]
+pub use linux::container_id;
 #[cfg(windows)]
 mod relay;
 #[cfg_attr(
@@ -45,10 +49,6 @@ pub trait Relay {
 
 /// What the relay tells the status line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(windows),
-    allow(dead_code, reason = "only the Windows relay and the tests send them")
-)]
 pub enum RelayReport {
     /// It keeps failing, for this reason in plain words.
     Failing(String),
@@ -101,22 +101,48 @@ pub fn new_relay(wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
     Box::new(relay::WasapiRelay::new(wake))
 }
 
-/// The relay cannot run on Linux, so the settings window gets the stand-in.
-#[cfg(not(windows))]
-pub fn new_relay(_wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
-    Box::new(StandInRelay)
+/// The audio relay; `wake` asks the settings window to repaint when a report is waiting.
+#[cfg(target_os = "linux")]
+pub fn new_relay(wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
+    Box::new(linux::PipeWireRelay::new(wake))
 }
 
-/// Stand-in for Linux; it does nothing.
-#[cfg(not(windows))]
-pub struct StandInRelay;
+/// Lists playback devices on a thread of its own, so a hung PipeWire can't freeze the settings
+/// window; the list arrives through `take`.
+pub struct DeviceLister {
+    list: fn() -> Result<Vec<AudioDevice>, String>,
+    sender: std::sync::mpsc::Sender<Result<Vec<AudioDevice>, String>>,
+    lists: std::sync::mpsc::Receiver<Result<Vec<AudioDevice>, String>>,
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
 
-#[cfg(not(windows))]
-impl Relay for StandInRelay {
-    fn start(&mut self, _source: &str, _output: &SoundOutput, _container: &str, _name: &str) {}
-    fn stop(&mut self) {}
-    fn take_report(&mut self) -> Option<RelayReport> {
-        None
+impl DeviceLister {
+    /// `list` lists the devices ([`playback_devices`]); `wake` asks the settings window to
+    /// repaint when a list is waiting.
+    pub fn new(
+        list: fn() -> Result<Vec<AudioDevice>, String>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let (sender, lists) = std::sync::mpsc::channel();
+        Self {
+            list,
+            sender,
+            lists,
+            wake: std::sync::Arc::new(wake),
+        }
+    }
+
+    pub fn list(&self) {
+        let (list, sender, wake) = (self.list, self.sender.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let _ = sender.send(list());
+            wake();
+        });
+    }
+
+    /// The latest list, if one arrived.
+    pub fn take(&self) -> Option<Result<Vec<AudioDevice>, String>> {
+        self.lists.try_iter().last()
     }
 }
 
@@ -234,16 +260,8 @@ fn without_number(name: &str) -> &str {
     }
 }
 
-/// Stand-in playback devices so the settings window can be laid out on Linux.
-#[cfg(not(windows))]
-pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
-    Ok(vec![AudioDevice {
-        id: "stand-in-speakers".into(),
-        name: "Stand-in speakers".into(),
-        description: "Speakers".into(),
-        container_id: String::new(),
-    }])
-}
+#[cfg(target_os = "linux")]
+pub use linux::playback_devices;
 
 /// Active playback devices from WASAPI.
 #[cfg(windows)]

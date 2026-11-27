@@ -6,8 +6,18 @@
     reason = "SPEC allows unsafe only in mirror, guard and audio, for Windows API calls"
 )]
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the Linux guard and mirror helpers (#36) pick with it; its tests run everywhere"
+    )
+)]
+pub mod desktop;
 #[cfg(windows)]
 mod displays;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg_attr(
     not(windows),
     allow(
@@ -29,40 +39,43 @@ mod window_guard;
 
 #[cfg(windows)]
 pub use displays::DisplayWatcher;
+#[cfg(windows)]
+pub(crate) use displays::device_node;
 
-/// Linux has no display changes to hear; this stand-in never wakes.
-#[cfg(not(windows))]
-pub struct DisplayWatcher;
-
-#[cfg(not(windows))]
-impl DisplayWatcher {
-    pub fn new(_wake: impl Fn() + Send + 'static) -> Result<Self, String> {
-        Ok(Self)
-    }
-}
+#[cfg(target_os = "linux")]
+pub use linux::{DisplayWatcher, monitors};
 
 /// A monitor on the sender, as shown in the settings dropdowns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Monitor {
-    /// Display-configuration device path; the stable key saved in settings.
+    /// The stable key saved in settings: the display-configuration device path on Windows; on Linux
+    /// the EDID's product and serial (`DEL42B9 4GZY5P3`), else the connector.
     pub device_path: String,
-    /// GDI name of the source the monitor shows (`\\.\DISPLAYn`); changes between boots, so never saved.
+    /// GDI name of the source the monitor shows (`\\.\DISPLAYn`); on Linux the desktop's output
+    /// name (`HDMI-A-2`). Changes between boots, so never saved.
     pub gdi_name: String,
     pub name: String,
+    /// The resolution in real pixels, after the monitor's rotation; the dropdowns show it and the mirror uses it.
     pub width: u32,
     pub height: u32,
+    /// The size in the desktop's coordinates, which `left` and `top` are in; the live layout draws
+    /// it. On Wayland these are logical pixels, so a scaled monitor's is smaller than its resolution;
+    /// on Windows it is the resolution, and on X11 too unless `xrandr --scale` stretches it.
+    pub layout_size: (u32, u32),
     pub refresh_hz: u32,
     pub primary: bool,
     /// Top-left corner on the desktop.
     pub left: i32,
     pub top: i32,
-    /// Name of the graphics card the monitor is plugged into, as DXGI lists it; empty if unknown.
+    /// Name of the graphics card the monitor is plugged into, as DXGI (on Linux pci.ids) lists it;
+    /// empty if unknown.
     pub graphics_card: String,
     /// The physical device the monitor is part of (`DEVPKEY_Device_ContainerId`), shared with its
-    /// HDMI or DisplayPort sound output; empty if unknown.
+    /// HDMI or DisplayPort sound output; on Linux `audio::container_id`. Empty if unknown.
     pub container_id: String,
-    /// The graphics card's device path and the target id of the video output the monitor is on;
-    /// unlike `device_path` it stays when the monitor's EDID (its name) changes. Empty if unknown.
+    /// The graphics card's device path and the target id of the video output the monitor is on (on
+    /// Linux its PCI address and DRM connector, `0000:0c:00.0 HDMI-A-2`); unlike `device_path` it
+    /// stays when the monitor's EDID (its name) changes. Empty if unknown.
     pub connector: String,
 }
 
@@ -91,84 +104,41 @@ pub fn new_guard(wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
     Box::new(window_guard::WindowGuard::new(wake))
 }
 
-/// The guard cannot run on Linux, so the settings window gets the stand-in.
+/// The Linux guards are not built yet (#36), so while the guard checkbox is on it says so.
 #[cfg(not(windows))]
 pub fn new_guard(_wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
-    Box::new(StandInGuard::default())
-}
-
-/// Stand-in for Linux; it only remembers the checkbox.
-#[cfg(not(windows))]
-#[derive(Debug, Default)]
-pub struct StandInGuard {
-    pub enabled: bool,
+    Box::new(NotOnLinuxYet::default())
 }
 
 #[cfg(not(windows))]
-impl Guard for StandInGuard {
+#[derive(Default)]
+struct NotOnLinuxYet {
+    enabled: bool,
+    report: Option<GuardReport>,
+}
+
+#[cfg(not(windows))]
+impl Guard for NotOnLinuxYet {
     fn update(&mut self, enabled: bool, _card: Option<&str>, _send_windows_to: Option<&str>) {
         self.enabled = enabled;
+        self.report = Some(if enabled {
+            GuardReport::Notice(
+                "The window guard and pointer guard do not work on Linux yet.".into(),
+            )
+        } else {
+            GuardReport::Clear
+        });
     }
 
     fn take_report(&mut self) -> Option<GuardReport> {
-        None
+        self.report.take()
     }
 
-    fn follow_displays(&mut self) {}
-}
-
-/// Stand-in monitors so the settings window can be laid out on Linux.
-#[cfg(not(windows))]
-pub fn monitors() -> Result<Vec<Monitor>, String> {
-    let monitor =
-        |device_path: &str, name: &str, width, height, refresh_hz, primary, left| Monitor {
-            device_path: device_path.into(),
-            gdi_name: String::new(),
-            name: name.into(),
-            width,
-            height,
-            refresh_hz,
-            primary,
-            left,
-            top: 0,
-            graphics_card: if device_path == "stand-in-card" {
-                "Stand-in integrated graphics".into()
-            } else {
-                "Stand-in graphics card".into()
-            },
-            container_id: String::new(),
-            connector: format!("{device_path} connector"),
-        };
-    // Arranged as on the sender: the source monitor left of the primary monitor, the card display right of it.
-    Ok(vec![
-        monitor(
-            "stand-in-source",
-            "Stand-in source monitor",
-            2560,
-            1440,
-            500,
-            false,
-            -2560,
-        ),
-        monitor(
-            "stand-in-primary",
-            "Stand-in primary monitor",
-            1920,
-            1080,
-            144,
-            true,
-            0,
-        ),
-        monitor(
-            "stand-in-card",
-            "Stand-in card display",
-            1920,
-            1080,
-            60,
-            false,
-            1920,
-        ),
-    ])
+    fn follow_displays(&mut self) {
+        if self.enabled {
+            self.update(true, None, None);
+        }
+    }
 }
 
 /// Active display paths and modes from `QueryDisplayConfig`.
@@ -238,13 +208,6 @@ pub(crate) fn device_path(
 
 /// A monitor's size on the desktop. The display configuration gives the source mode before the
 /// monitor's rotation, so a monitor turned to portrait has its width and height swapped.
-#[cfg_attr(
-    not(windows),
-    allow(
-        dead_code,
-        reason = "only the Windows monitor list calls it; its tests run everywhere"
-    )
-)]
 fn desktop_size(width: u32, height: u32, sideways: bool) -> (u32, u32) {
     if sideways {
         (height, width)
@@ -325,6 +288,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             },
             width,
             height,
+            layout_size: (width, height),
             refresh_hz: (rate.Numerator + rate.Denominator / 2)
                 .checked_div(rate.Denominator)
                 .unwrap_or(0),
@@ -752,5 +716,29 @@ mod tests {
                 monitor.gdi_name
             );
         }
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn on_linux_the_guard_says_it_does_not_run_yet_while_it_is_on() {
+        let not_yet = GuardReport::Notice(
+            "The window guard and pointer guard do not work on Linux yet.".into(),
+        );
+        let mut guard = new_guard(|| {});
+        assert_eq!(guard.take_report(), None);
+        guard.update(true, Some("card"), None);
+        assert_eq!(guard.take_report(), Some(not_yet.clone()));
+        assert_eq!(guard.take_report(), None);
+        // A display change re-sends the notice while the guard is on, as the Windows guard does.
+        guard.follow_displays();
+        assert_eq!(guard.take_report(), Some(not_yet));
+        guard.update(false, Some("card"), None);
+        assert_eq!(guard.take_report(), Some(GuardReport::Clear));
+        guard.follow_displays();
+        assert_eq!(guard.take_report(), None);
     }
 }

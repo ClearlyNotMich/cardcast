@@ -2,7 +2,7 @@
 //! drawn once per refresh through a flip-model swap chain on its own thread.
 
 use super::capture::Desktop;
-use super::{Ended, Fit, Mirror, Output, ended, find_output, fit, source_output, start_failed};
+use super::{Ended, Mirror, Output, Picture, ended, find_output, fit, source_output, start_failed};
 use crate::guard::Monitor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
@@ -37,20 +37,6 @@ use windows::core::{Interface, PCWSTR, w};
 /// The mirror window's class; `w!` needs a literal, so it repeats
 /// `crate::guard::placement::MIRROR_WINDOW_CLASS`, which the guard exempts. Change both together.
 const CLASS: PCWSTR = w!("cardcast mirror");
-
-/// What the mirror window draws once per refresh: the captured source monitor (`super::capture::Desktop`).
-pub trait Picture {
-    /// Size of the newest picture in pixels, for the aspect fit.
-    fn size(&self) -> (u32, u32);
-    /// Draws the newest picture into `fit` on `target`, the swap chain's back buffer;
-    /// the rest of the back buffer is already black.
-    fn draw(
-        &mut self,
-        context: &ID3D11DeviceContext1,
-        target: &ID3D11RenderTargetView,
-        fit: Fit,
-    ) -> windows::core::Result<()>;
-}
 
 /// The mirror thread and what tests read from it.
 struct Running {

@@ -8,6 +8,15 @@
 
 #[cfg(windows)]
 mod capture;
+#[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the Linux mirror present (#43) draws its pictures"
+    )
+)]
+pub mod linux;
 #[cfg_attr(
     not(windows),
     allow(
@@ -40,6 +49,102 @@ pub trait Mirror {
     fn presents(&self) -> Option<u64> {
         None
     }
+}
+
+/// What the mirror window draws once per refresh: the captured source monitor (`capture::Desktop`
+/// on Windows; on Linux the portal's PipeWire stream, or MIT-SHM on X11, from `linux::capture`).
+#[cfg_attr(
+    all(target_os = "linux", not(test)),
+    allow(dead_code, reason = "the Linux mirror present (#43) takes the frames")
+)]
+pub trait Picture {
+    /// Size of the newest picture in pixels, for the aspect fit.
+    fn size(&self) -> (u32, u32);
+    /// Draws the newest picture into `fit` on `target`, the swap chain's back buffer;
+    /// the rest of the back buffer is already black.
+    #[cfg(windows)]
+    fn draw(
+        &mut self,
+        context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext1,
+        target: &windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
+        fit: Fit,
+    ) -> windows::core::Result<()>;
+    /// The newest picture since the last call, if a new one came; an error once the capture ended
+    /// (for example the source monitor was unplugged), saying whether a fresh start can fix it.
+    #[cfg(target_os = "linux")]
+    fn take_frame(&mut self) -> Result<Option<Frame>, Ended>;
+}
+
+/// One captured picture of the source monitor, as the Linux capture hands it to the present.
+#[cfg(target_os = "linux")]
+#[cfg_attr(
+    all(target_os = "linux", not(test)),
+    allow(dead_code, reason = "the Linux mirror present (#43) takes the frames")
+)]
+#[derive(Debug)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    /// The DRM fourcc of its pixels: [`linux::XRGB8888`] and its kin.
+    pub fourcc: u32,
+    pub pixels: Pixels,
+    /// Gives the capture's buffer back when the frame is dropped; a copy holds none.
+    #[allow(dead_code, reason = "never read: dropping it gives the buffer back")]
+    pub release: Release,
+}
+
+/// Gives a [`Frame`]'s buffer back to the capture once, when dropped. The capture has only a few
+/// buffers, so the present drops a frame as soon as it no longer reads its pixels.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub struct Release(Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(target_os = "linux")]
+impl Release {
+    pub fn new(give_back: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(give_back)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Some(give_back) = self.0.take() {
+            give_back();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for Release {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(if self.0.is_some() {
+            "Release(held)"
+        } else {
+            "Release(none)"
+        })
+    }
+}
+
+/// Where a [`Frame`]'s pixels are.
+#[cfg(target_os = "linux")]
+#[allow(
+    dead_code,
+    reason = "the Linux mirror present (#43) reads them; the tests read only memory frames"
+)]
+#[derive(Debug)]
+pub enum Pixels {
+    /// A copy in memory, `stride` bytes per row: PipeWire's shared-memory fallback, or MIT-SHM on X11.
+    Memory { bytes: Vec<u8>, stride: u32 },
+    /// One plane the compositor rendered on the graphics card, to import there without a copy
+    /// (`docs/linux-capture.md`). The compositor doesn't draw into it again until the frame (its
+    /// [`Release`]) is dropped, so keep the frame while the present reads the plane, no longer.
+    DmaBuf {
+        fd: std::os::fd::OwnedFd,
+        offset: u32,
+        stride: u32,
+        modifier: u64,
+    },
 }
 
 /// What the settings window does after the mirror failed to start or ended on its own, with the status text.
@@ -123,15 +228,41 @@ pub fn shown_at() -> Option<(i32, i32)> {
     window::shown_at()
 }
 
-/// The mirror cannot run on Linux, so the settings window gets the stand-in.
+/// What the status line keeps saying while the mirror is not built for this platform (#36).
+#[cfg(windows)]
+pub const NOT_BUILT: Option<&str> = None;
+#[cfg(not(windows))]
+pub const NOT_BUILT: Option<&str> = Some("The mirror does not work on Linux yet.");
+
+/// The Linux mirror is not built yet (#36), so every start fails and says so.
 #[cfg(not(windows))]
 pub fn new_mirror(_wake: impl Fn() + Send + Sync + 'static) -> Box<dyn Mirror> {
-    Box::new(StandInMirror::default())
+    Box::new(NotOnLinuxYet)
 }
 
-/// Stand-in for Linux and tests; it remembers whether it was started, `end` ends it on its own,
-/// and `fail_start` fails the next start.
-#[cfg(any(test, not(windows)))]
+#[cfg(not(windows))]
+struct NotOnLinuxYet;
+
+#[cfg(not(windows))]
+impl Mirror for NotOnLinuxYet {
+    fn start(&mut self, _source_monitor: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
+        Err(Ended::Stop(NOT_BUILT.unwrap_or_default().into()))
+    }
+    fn stop(&mut self) {}
+    fn is_running(&self) -> bool {
+        false
+    }
+    fn shows_picture(&self) -> bool {
+        false
+    }
+    fn take_end(&mut self) -> Option<Ended> {
+        None
+    }
+}
+
+/// Stand-in for the tests and snapshots; it remembers whether it was started, `end` ends it on its
+/// own, and `fail_start` fails the next start.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct StandInMirror {
     pub running: bool,
@@ -139,7 +270,7 @@ pub struct StandInMirror {
     pub fail_start: Option<Ended>,
 }
 
-#[cfg(any(test, not(windows)))]
+#[cfg(test)]
 impl Mirror for StandInMirror {
     fn start(&mut self, _source_monitor: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
         if let Some(failure) = self.fail_start.take() {
@@ -334,6 +465,33 @@ pub fn sdr_from_hdr(linear: f32, white_scale: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn on_linux_the_mirror_says_it_does_not_run_yet() {
+        let monitor = Monitor {
+            device_path: "card".into(),
+            gdi_name: String::new(),
+            name: "card".into(),
+            width: 1920,
+            height: 1080,
+            layout_size: (1920, 1080),
+            refresh_hz: 60,
+            primary: false,
+            left: 0,
+            top: 0,
+            graphics_card: String::new(),
+            container_id: String::new(),
+            connector: String::new(),
+        };
+        assert_eq!(NOT_BUILT, Some("The mirror does not work on Linux yet."));
+        let mut mirror = new_mirror(|| {});
+        assert_eq!(
+            mirror.start(&monitor, &monitor),
+            Err(Ended::Stop("The mirror does not work on Linux yet.".into()))
+        );
+        assert!(!mirror.is_running());
+    }
 
     #[test]
     fn a_lost_monitor_graphics_card_or_desktop_restarts_the_mirror() {
@@ -601,6 +759,7 @@ mod tests {
             name: device_path.into(),
             width: 1920,
             height: 1080,
+            layout_size: (1920, 1080),
             refresh_hz: 60,
             primary: false,
             left: 0,

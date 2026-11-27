@@ -1,10 +1,11 @@
 # cardcast
 
-cardcast is a small Windows program for streaming with two PCs and a capture card. It runs on the sender, the PC the game runs on. It does three things:
+cardcast is a small Windows program for streaming with two PCs and a capture card. It runs on the sender, the PC the game runs on. It does these things:
 
 - It shows a mirror of the source monitor on the card display, so the receiver can capture it.
 - It keeps windows and the mouse pointer off the card display.
 - It plays the chosen audio source into the capture card, so the capture card carries sound.
+- It can switch a monitor's input from the live layout or a command, for example on a Stream Deck key (see [Switching a monitor's input](#switching-a-monitors-input)).
 
 The receiver needs no cardcast software. OBS on the receiver adds the capture card as a video source.
 
@@ -79,6 +80,54 @@ cardcast records what the audio source plays and plays it again on the sound out
 
 To choose which programs go to the capture card, use Windows' own per-app sound settings (Settings > System > Sound > Volume mixer): send those programs to the audio source. cardcast has no per-app settings.
 
+On Linux the sound goes through PipeWire, which needs PipeWire 0.3.44 or newer with its command-line tools (`pw-dump`, `pw-loopback`) and WirePlumber 0.4.12 or newer running:
+
+- Arch and CachyOS: `pipewire-audio` and `wireplumber`
+- Debian and Ubuntu: `pipewire-bin` and `wireplumber`
+- Fedora: `pipewire-utils` and `wireplumber`
+
+With an older PipeWire or WirePlumber, cardcast does not start the audio, because the sound could play back into the audio source; the status line says which one to update.
+
+## Switching a monitor's input
+
+cardcast can switch a monitor's input over DDC/CI, as the monitor's own buttons do, for example to show the receiver on the AW2523HF and switch back.
+
+In the settings window, click the cog at the top right and switch on **Input switching** (it is off by default, and then cardcast sends nothing over DDC/CI). cardcast then reads each monitor's inputs, which can take a few seconds. A monitor that lists two or more gets a small button at the bottom right of its tile in the live layout: it lists the inputs with the current one ticked, and clicking one switches the monitor. **Copy command** copies the command below for that monitor and input, ready for a shortcut. DDC/CI can't tell which inputs have a cable plugged in.
+
+Run with arguments, `cardcast.exe` does one switch and exits. It opens no window and doesn't touch the settings, and works whether or not the settings window is open.
+
+```
+cardcast.exe input <monitor> <input>
+cardcast.exe input <monitor> toggle <input> <input>
+```
+
+- `<monitor>` is the monitor's EDID serial (for example `4GZY5P3`) or its name as the settings window shows it (for example `"AW2523HF"`), ignoring case. If two monitors share the name, use the serial.
+- `<input>` is `dp`, `dp2`, `hdmi1`, `hdmi2`, or a value `0x01` to `0xFF` for any other input (some makers use their own value for USB-C). The monitor must list it over DDC/CI.
+- `toggle a b` switches to `b` when the monitor is on `a`, otherwise to `a`.
+
+The exit code is 0 when the monitor took the switch or was already on that input, 1 when the switch failed (no such monitor, an input it doesn't list, or no answer over DDC/CI), and 2 when the command was not understood. One line saying what happened goes to standard error, which you only see when you capture it: in a `.cmd` script, `cardcast.exe input 4GZY5P3 hdmi1 2> result.txt` waits for cardcast, then `%ERRORLEVEL%` is the exit code and `result.txt` holds the line. Typed at a command prompt, cmd doesn't wait for cardcast, so `%ERRORLEVEL%` there is not its exit code.
+
+On Linux the command is `cardcast input <monitor> …`, and it works the same way. cardcast talks to the monitor through `/dev/i2c-*`, which needs the `i2c-dev` kernel module and access for your user, no root. The tarball has both files in `packaging/linux/` (the AUR package will install them for you):
+
+```
+sudo cp packaging/linux/modules-load.d/i2c-dev.conf /etc/modules-load.d/
+sudo cp packaging/linux/udev/rules.d/60-cardcast-i2c.rules /etc/udev/rules.d/
+sudo modprobe i2c-dev
+sudo udevadm control --reload
+sudo udevadm trigger
+```
+
+Or copy the two files and restart. Until then, the status line and the command say which step is missing. With NVIDIA's own driver, some monitors only answer after setting `NVreg_RegistryDwords=RMUseSwI2c=0x01` ([ddcutil](https://www.ddcutil.com/nvidia/)).
+
+A monitor whose input switched away may drop out of Windows, as if unplugged. Then cardcast can't switch it back; use the monitor's own buttons. If it was the source monitor or the card display, the mirror waits for it and resumes when it is back.
+
+### A Stream Deck key
+
+1. Right-click the desktop and choose **New > Shortcut**. For the location, type the command with the full path to `cardcast.exe` in quotes, for example `"C:\Tools\cardcast\cardcast.exe" input 4GZY5P3 toggle dp hdmi1`. Name it, for example `Toggle AW2523HF`.
+2. In the Stream Deck app, drag **System > Open** onto a key, and for **App / File** choose that shortcut (the `.lnk` file).
+
+Pressing the key switches the monitor without taking focus from the game. Don't set a **Shortcut key** on the shortcut instead: Windows ignores shortcut keys while a fullscreen program runs, so they don't work during games.
+
 ## Known limits
 
 - Changing the SDR content brightness slider in Windows while the mirror runs has no effect until the mirror is restarted.
@@ -96,3 +145,7 @@ Open an issue on GitHub at `ClearlyNotMich/cardcast`. Include:
 - the text of the status line,
 - the CI run or commit the `.exe` came from,
 - your monitors and capture card, and whether HDR was on.
+
+## Licence
+
+cardcast is free software under the GNU General Public License, version 3 or (at your option) any later version. See [LICENSE](LICENSE).

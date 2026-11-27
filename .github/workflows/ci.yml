@@ -15,19 +15,131 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The pipewire crate's bindings are generated from PipeWire's headers with libclang (#42).
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       # The settings window snapshots render with wgpu on lavapipe, Mesa's software Vulkan.
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo test
-      - if: runner.os == 'Windows'
-        run: cargo build --release
+      # The Linux monitor list on a desktop (#41): X11 on Xvfb, Wayland on headless sway with a hotplug.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y xvfb sway
+      - if: runner.os == 'Linux'
+        name: Monitor list on Xvfb
+        env:
+          CARDCAST_EXPECT_MONITORS: screen 1280x1024 1280x1024+0+0 primary
+        run: xvfb-run -s '-screen 0 1280x1024x24' cargo test guard::linux::tests::desktop_lists -- --nocapture
+      - if: runner.os == 'Linux'
+        name: Monitor list and hotplug on headless sway
+        env:
+          WLR_BACKENDS: headless
+          WLR_HEADLESS_OUTPUTS: 2
+          WLR_LIBINPUT_NO_DEVICES: 1
+          WLR_RENDERER: pixman
+        run: |
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          sway -c /dev/null &
+          for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.2; done
+          export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
+          export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-? | head -n 1)")
+          # A turned, scaled output: its resolution is 720x1280, its size on the desktop 480x853.
+          # sway can be slow to answer while it starts, so the first command is retried.
+          for _ in $(seq 10); do swaymsg output HEADLESS-1 scale 1.5 transform 90 && break; sleep 1; done
+          swaymsg -t get_outputs
+          failed=0
+          CARDCAST_EXPECT_MONITORS='HEADLESS-1 720x1280 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary' \
+            cargo test guard::linux::tests::desktop_lists -- --nocapture || failed=1
+          CARDCAST_PLUG_COMMAND='swaymsg create_output' CARDCAST_PLUGGED=HEADLESS-3 \
+          CARDCAST_EXPECT_PLUGGED='HEADLESS-1 720x1280 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary; HEADLESS-3 1920x1080 1920x1080+1760+0' \
+            cargo test guard::linux::tests::desktop_hotplug -- --nocapture || failed=1
+          exit $failed
+      # The mirror capture (#42): a frame of a known colour through MIT-SHM on Xvfb, and through
+      # xdg-desktop-portal-wlr and PipeWire on headless sway. -noreset keeps xsetroot's colour.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y swaybg x11-xserver-utils xdg-desktop-portal xdg-desktop-portal-wlr pipewire wireplumber
+      - if: runner.os == 'Linux'
+        name: Mirror capture on Xvfb
+        env:
+          CARDCAST_CAPTURE: screen
+          CARDCAST_EXPECT_COLOUR: '#cc6633'
+        run: xvfb-run -s '-screen 0 1280x1024x24 -noreset' sh -c 'xsetroot -solid "#cc6633" && cargo test mirror::linux::tests::desktop_captures -- --nocapture'
+      - if: runner.os == 'Linux'
+        name: Mirror capture through the portal on headless sway
+        env:
+          WLR_BACKENDS: headless
+          WLR_HEADLESS_OUTPUTS: 2
+          WLR_LIBINPUT_NO_DEVICES: 1
+          WLR_RENDERER: pixman
+          XDG_CURRENT_DESKTOP: sway
+          CARDCAST_CAPTURE: HEADLESS-1
+          CARDCAST_EXPECT_COLOUR: '#3366cc'
+        run: |
+          export XDG_RUNTIME_DIR=$(mktemp -d) XDG_CONFIG_HOME=$(mktemp -d)
+          # xdg-desktop-portal-wlr shares HEADLESS-1 without asking.
+          mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr" "$XDG_CONFIG_HOME/xdg-desktop-portal"
+          printf '[screencast]\noutput_name=HEADLESS-1\nchooser_type=none\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr/config"
+          printf '[preferred]\ndefault=wlr\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
+          printf 'output * bg #3366cc solid_color\n' > "$XDG_CONFIG_HOME/sway.conf"
+          cat > "$RUNNER_TEMP/capture.sh" <<'EOF'
+          pipewire & wireplumber &
+          sway -c "$XDG_CONFIG_HOME/sway.conf" &
+          for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.2; done
+          export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
+          export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-? | head -n 1)")
+          # The portals start on the session bus, so they need the desktop's variables.
+          dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_CONFIG_HOME XDG_RUNTIME_DIR
+          for _ in $(seq 10); do swaymsg -t get_outputs >/dev/null && break; sleep 1; done
+          cargo test mirror::linux::tests::desktop_captures -- --nocapture
+          EOF
+          dbus-run-session -- bash "$RUNNER_TEMP/capture.sh"
+      # The audio relay (#44): PipeWire and WirePlumber with two null sinks, a tone played into one.
+      - if: runner.os == 'Linux'
+        name: Audio relay between two null sinks
+        run: |
+          sudo apt-get install -y pipewire pipewire-bin wireplumber
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          dbus-run-session -- sh -ec '
+            pipewire & pipewire=$!
+            wireplumber & wireplumber=$!
+            for _ in $(seq 50); do wpctl status >/dev/null 2>&1 && break; sleep 0.2; done
+            for sink in source card; do
+              pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=cardcast-$sink node.nick=\"cardcast $sink\" media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"
+            done
+            failed=0
+            CARDCAST_NULL_SINKS=1 cargo test audio::linux::tests::null_sinks -- --nocapture || failed=1
+            # Without WirePlumber nothing links the loopback (#50).
+            kill $wireplumber
+            CARDCAST_NO_WIREPLUMBER=1 cargo test audio::linux::tests::without_wireplumber -- --nocapture || failed=1
+            # A stopped PipeWire never answers pw-dump (#50).
+            kill -STOP $pipewire
+            CARDCAST_PIPEWIRE_STOPPED=1 cargo test audio::linux::tests::a_stopped_pipewire -- --nocapture || failed=1
+            kill -CONT $pipewire
+            exit $failed
+          '
+      - run: cargo build --release
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7
         with:
           name: cardcast-exe
           path: target/release/cardcast.exe
+      # A tarball keeps cardcast's executable bit, which the artifact zip would drop.
+      - if: runner.os == 'Linux'
+        run: |
+          mkdir cardcast-linux-x86_64
+          cp target/release/cardcast LICENSE README.md cardcast-linux-x86_64/
+          mkdir cardcast-linux-x86_64/packaging && cp -r packaging/linux cardcast-linux-x86_64/packaging/
+          tar -czf cardcast-linux-x86_64.tar.gz cardcast-linux-x86_64
+          tar -tvzf cardcast-linux-x86_64.tar.gz | grep -q -- '-rwx.* cardcast-linux-x86_64/cardcast$'
+          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/udev/rules.d/60-cardcast-i2c.rules$'
+          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/modules-load.d/i2c-dev.conf$'
+      - if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cardcast-linux-x86_64.tar.gz
+          path: cardcast-linux-x86_64.tar.gz
       - if: runner.os == 'Windows'
         name: Check embedded DPI manifest
         shell: pwsh
