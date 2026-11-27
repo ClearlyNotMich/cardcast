@@ -1,9 +1,9 @@
 //! The audio relay: WASAPI loopback of the audio source, played on the card display's sound
 //! output, on its own thread. See docs/win32-mirror-audio.md, "WASAPI loopback and rendering".
 
-use super::RelayReport;
 use super::pacing::{self, Drift};
 use super::samples::{self, Format, Sample};
+use super::{RelayReport, SoundOutput};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -71,16 +71,26 @@ impl Drop for WasapiRelay {
 }
 
 impl super::Relay for WasapiRelay {
-    fn start(&mut self, audio_source: &str, card_display_name: &str) {
+    fn start(
+        &mut self,
+        audio_source: &str,
+        output: &SoundOutput,
+        card_display_container: &str,
+        card_display_name: &str,
+    ) {
         self.stop();
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (audio_source, card_display_name) =
-                (audio_source.to_owned(), card_display_name.to_owned());
+            let card_display = (
+                output.clone(),
+                card_display_container.to_owned(),
+                card_display_name.to_owned(),
+            );
+            let audio_source = audio_source.to_owned();
             let (stop, reports, wake) =
                 (stop.clone(), self.report_sender.clone(), self.wake.clone());
             std::thread::spawn(move || {
-                run(&audio_source, &card_display_name, &stop, &reports, &wake);
+                run(&audio_source, &card_display, &stop, &reports, &wake);
             })
         };
         self.running = Some(Running { stop, thread });
@@ -103,7 +113,7 @@ impl super::Relay for WasapiRelay {
 /// Relays until stopped, re-opening both devices after any failure.
 fn run(
     audio_source: &str,
-    card_display_name: &str,
+    card_display: &(SoundOutput, String, String),
     stop: &AtomicBool,
     reports: &Sender<RelayReport>,
     wake: &Wake,
@@ -119,12 +129,12 @@ fn run(
             }
             failures = 0;
         };
-        let Err(error) = relay(audio_source, card_display_name, stop, &mut opened) else {
+        let Err(error) = relay(audio_source, card_display, stop, &mut opened) else {
             break;
         };
         failures += 1;
         if failures == REPORT_AFTER {
-            let _ = reports.send(RelayReport::Failing(error));
+            let _ = reports.send(error);
             wake();
         }
         for _ in 0..10 {
@@ -143,12 +153,22 @@ fn run(
 /// Opens both devices and relays until `stop`; `Ok` only when stopped.
 fn relay(
     audio_source: &str,
-    card_display_name: &str,
+    (output, card_display_container, card_display_name): &(SoundOutput, String, String),
     stop: &AtomicBool,
     opened: &mut dyn FnMut(),
-) -> Result<(), String> {
+) -> Result<(), RelayReport> {
     let devices = super::playback_devices()?;
-    let output = super::card_output(&devices, audio_source, card_display_name)?;
+    let Some(output) = super::card_output(
+        &devices,
+        audio_source,
+        output,
+        card_display_container,
+        card_display_name,
+    )?
+    else {
+        // No audio: the settings window never starts the relay for it.
+        return Ok(());
+    };
     // Declared before the clients so it is closed after them.
     let event = Event::new()?;
     // SAFETY: COM is initialised on this thread by `run`.
@@ -210,7 +230,7 @@ fn relay(
     let _ = unsafe { capture_client.Stop() };
     // SAFETY: as above.
     let _ = unsafe { render_client.Stop() };
-    result
+    result.map_err(RelayReport::from)
 }
 
 /// Moves captured audio into the render stream until `stop`.
@@ -449,7 +469,12 @@ mod tests {
     #[test]
     fn missing_audio_source_reaches_the_status_line_and_stop_is_prompt() {
         let mut relay = WasapiRelay::new(|| {});
-        relay.start("{0.0.0.00000000}.{missing}", "HD60 X");
+        relay.start(
+            "{0.0.0.00000000}.{missing}",
+            &SoundOutput::Automatic,
+            "",
+            "Capture card",
+        );
         let deadline = Instant::now() + Duration::from_secs(15);
         let report = loop {
             if let Some(report) = relay.take_report() {

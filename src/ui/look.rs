@@ -284,6 +284,8 @@ pub fn card_display_placeholder(monitors: &[Monitor]) -> Monitor {
         left,
         top,
         graphics_card: String::new(),
+        container_id: String::new(),
+        connector: String::new(),
     }
 }
 
@@ -363,6 +365,8 @@ mod tests {
             left,
             top,
             graphics_card: String::new(),
+            container_id: String::new(),
+            connector: String::new(),
         }
     }
 
