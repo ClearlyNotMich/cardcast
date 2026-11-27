@@ -51,3 +51,15 @@ _Avoid_: Audio sink, target device, card audio
 **Sender load**:
 The resources the sender spends on sending its screen instead of on the game. Keeping it near zero is the reason the project exists.
 _Avoid_: Overhead, CPU usage
+
+**Input switch**:
+Changing which of a monitor's video inputs (DisplayPort 1, HDMI 1, …) it shows, over DDC/CI, as the monitor's own buttons would. Call a monitor's connections "inputs", never "sources", so they aren't confused with the source monitor.
+_Avoid_: Source switch, KVM, input source
+
+**Input list**:
+The inputs a monitor reports over DDC/CI (the values of VCP 0x60 in its capabilities string). A monitor needs two or more for an input switch. The list doesn't say which inputs have a live cable.
+_Avoid_: Ports, available inputs
+
+**Command mode**:
+`cardcast.exe` started with arguments: it does one task, such as an input switch, with no window, and ends with an exit code. Started without arguments it is the normal program.
+_Avoid_: CLI mode, headless mode, silent mode

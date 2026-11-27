@@ -126,6 +126,7 @@ v1 contains every part below. Each part is handed over as a test build when it i
 | Guard | A window moved to the card display with Win+Shift+Arrow goes to the "send windows to" monitor at once, without taking focus. A window already there at launch does the same. The pointer cannot be parked on the card display. |
 | Mirror | OBS on the receiver shows the source monitor through the capture card at 1080p60, pointer included. With HDR on, colours match the OBS fullscreen projector's. The source monitor still reports 500 Hz. Unplugging and re-plugging the card restores the mirror with no clicks. Restarting cardcast restores the mirror with no clicks. |
 | Audio | The receiver hears the chosen audio source through the capture card, and the sender still hears it normally, with the sound output on Automatic. With No audio the mirror runs without sound. Checked on the reference cards. |
+| Input switch (section 11, after v1) | With the toggle off, nothing is sent over DDC/CI. With it on, the AW2523HF tile lists DisplayPort 1, HDMI 1 and HDMI 2 with the current one ticked, and choosing HDMI 1 switches it. A Stream Deck key running `cardcast.exe input 4GZY5P3 toggle dp hdmi1` through a shortcut switches it there and back while a game has focus, without taking focus; an input it doesn't list exits with 1. If Windows drops the monitor while it shows HDMI 1, the settings window shows the waiting state and the mirror resumes when the monitor is back. Owner-checked; CI runs the unit tests only. |
 
 **Capture check, before the mirror is written.** In OBS on the sender, switch Display Capture's method from Automatic to Windows Graphics Capture with Force SDR on, keep the fullscreen projector running, and play. If the game feels the same, the colours look right on the receiver and no yellow border shows, the mirror uses Windows Graphics Capture. Otherwise it uses Desktop Duplication.
 
@@ -142,3 +143,38 @@ v1 contains every part below. Each part is handed over as a test build when it i
 | HDR to SDR conversion looks different from OBS's | Washed-out or clipped colours on the receiver | Compare against the OBS projector; switch capture method or adjust the conversion |
 | A game in exclusive fullscreen cannot be captured | Black mirror | Recommend borderless mode in the README |
 | Programs running as administrator open on the card display | Window stays lost | Documented limit; revisit if it happens in practice |
+
+## 11. Monitor input switching
+
+Comes after v1 (issue #35). cardcast can switch a monitor's input over DDC/CI, as the monitor's own buttons do, from the live layout or from a command. Sourced facts: `docs/win32-ddc.md`.
+
+- **Universal.** Any monitor that answers DDC/CI. No brand or model names in production code. Input values follow MCCS (VCP 0x60): `0x0F` DisplayPort 1, `0x10` DisplayPort 2, `0x11` HDMI 1, `0x12` HDMI 2. Any other value a monitor lists (for example a maker's own USB-C value) is shown as "Input 0x1B".
+- **Input list.** A monitor's inputs are the values in `60(...)` of its DDC/CI capabilities string. A monitor whose string can't be read or lists fewer than two inputs has no input switch. DDC/CI can't tell whether an input has a live cable, so cardcast never claims it does.
+- **Settings cog.** A small cog at the top right of the settings window opens a panel with one toggle, "Input switching", off by default and saved with the other settings. While it is off, the settings window sends nothing over DDC/CI.
+- **Reading the monitors.** While the toggle is on, cardcast reads every monitor's input list when the toggle is switched on, at launch, and after each display change. All DDC/CI calls run on their own input thread, one monitor at a time, never on the settings window, guard or mirror thread.
+- **Input switch button.** A monitor tile in the live layout whose monitor has an input list gets an input switch button. It opens a menu of that monitor's inputs with the current one ticked; the current input is read when the menu opens. Choosing an input switches the monitor. Each input has a "Copy command" button that copies the command switching this monitor to it, with the full path to `cardcast.exe` and the monitor's serial (its name if it has no serial).
+- **When a monitor leaves.** If Windows drops a monitor after its input switched away, that is an unplug: the existing waiting states apply ("Waiting for source monitor", "Waiting for card display") and the mirror resumes when the monitor is back. A monitor that has left Windows can't be switched back by cardcast; the monitor's own buttons can.
+- **Status texts.** In the status line: "Could not switch <monitor> to <input>: the monitor did not answer over DDC/CI." When the toggle is on and no monitor has an input list: "No monitor offers input switching over DDC/CI."
+
+**Command mode.** Run with arguments, `cardcast.exe` does one input switch and exits. It opens no window, does not read or change the settings, and works whether or not the settings window is open or the toggle is on, because running the command is the user's choice. Run without arguments, it starts as before.
+
+```
+cardcast.exe input <monitor> <input>
+cardcast.exe input <monitor> toggle <input> <input>
+```
+
+- `<monitor>` is the monitor's EDID serial (for example `4GZY5P3`) or its name as cardcast shows it (for example `"AW2523HF"`), both compared ignoring case. A name that fits more than one monitor is refused; use the serial. `\\.\DISPLAYn` names and list positions are not accepted, because they change.
+- `<input>` is `dp`, `dp2`, `hdmi1`, `hdmi2`, or a value `0x01` to `0xFF` for any other input. It must be in the monitor's input list; anything else is refused.
+- `toggle a b` switches to `b` when the monitor is on `a`, otherwise to `a`.
+- A monitor already on the input is left alone and counts as success.
+- One plain line goes to standard error when the caller captured it, for example "Switched AW2523HF to HDMI 1." or "AW2523HF does not list HDMI 2; it lists DisplayPort 1, HDMI 1." Nothing else is shown: no window and no message box, so the game keeps focus.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | The monitor took the switch, or was already on that input |
+| 1 | The switch failed: no such monitor, a name that fits several, no input list, an input it doesn't list, or no answer over DDC/CI |
+| 2 | The command was not understood |
+
+For Stream Deck or a script: make a Windows shortcut whose target is the copied command and point Stream Deck's System → Open at it. Shortcut hotkeys are not recommended, because Windows ignores them while a fullscreen game runs; the README says so.
+
+**Testing.** The CI virtual monitors have no DDC/CI. The capabilities parser, input names, EDID serial, monitor selection, the toggle decision, the command grammar and the exit codes are plain functions with Linux unit tests. The cog and the button are in the snapshots. Real switching is checked by the owner on the sender (section 9).
