@@ -21,13 +21,18 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo test
-      - if: runner.os == 'Windows'
-        run: cargo build --release
+      - run: cargo build --release
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7
         with:
           name: cardcast-exe
           path: target/release/cardcast.exe
+      # The artifact zip drops the executable bit: chmod +x cardcast after unzipping.
+      - if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cardcast-linux
+          path: target/release/cardcast
       - if: runner.os == 'Windows'
         name: Check embedded DPI manifest
         shell: pwsh

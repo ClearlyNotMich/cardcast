@@ -123,15 +123,35 @@ pub fn shown_at() -> Option<(i32, i32)> {
     window::shown_at()
 }
 
-/// The mirror cannot run on Linux, so the settings window gets the stand-in.
+/// The Linux mirror is not built yet (#36), so every start fails and says so.
 #[cfg(not(windows))]
 pub fn new_mirror(_wake: impl Fn() + Send + Sync + 'static) -> Box<dyn Mirror> {
-    Box::new(StandInMirror::default())
+    Box::new(NotOnLinuxYet)
 }
 
-/// Stand-in for Linux and tests; it remembers whether it was started, `end` ends it on its own,
-/// and `fail_start` fails the next start.
-#[cfg(any(test, not(windows)))]
+#[cfg(not(windows))]
+struct NotOnLinuxYet;
+
+#[cfg(not(windows))]
+impl Mirror for NotOnLinuxYet {
+    fn start(&mut self, _source_monitor: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
+        Err(Ended::Stop("The mirror does not work on Linux yet.".into()))
+    }
+    fn stop(&mut self) {}
+    fn is_running(&self) -> bool {
+        false
+    }
+    fn shows_picture(&self) -> bool {
+        false
+    }
+    fn take_end(&mut self) -> Option<Ended> {
+        None
+    }
+}
+
+/// Stand-in for the tests and snapshots; it remembers whether it was started, `end` ends it on its
+/// own, and `fail_start` fails the next start.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct StandInMirror {
     pub running: bool,
@@ -139,7 +159,7 @@ pub struct StandInMirror {
     pub fail_start: Option<Ended>,
 }
 
-#[cfg(any(test, not(windows)))]
+#[cfg(test)]
 impl Mirror for StandInMirror {
     fn start(&mut self, _source_monitor: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
         if let Some(failure) = self.fail_start.take() {
@@ -334,6 +354,31 @@ pub fn sdr_from_hdr(linear: f32, white_scale: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn on_linux_the_mirror_says_it_does_not_run_yet() {
+        let monitor = Monitor {
+            device_path: "card".into(),
+            gdi_name: String::new(),
+            name: "card".into(),
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            primary: false,
+            left: 0,
+            top: 0,
+            graphics_card: String::new(),
+            container_id: String::new(),
+            connector: String::new(),
+        };
+        let mut mirror = new_mirror(|| {});
+        assert_eq!(
+            mirror.start(&monitor, &monitor),
+            Err(Ended::Stop("The mirror does not work on Linux yet.".into()))
+        );
+        assert!(!mirror.is_running());
+    }
 
     #[test]
     fn a_lost_monitor_graphics_card_or_desktop_restarts_the_mirror() {

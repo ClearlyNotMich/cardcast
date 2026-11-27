@@ -68,7 +68,7 @@ impl SettingsWindow {
             Vec::new()
         });
         let playback_devices = audio::playback_devices().unwrap_or_else(|error| {
-            status.other = Some(error);
+            status.other = settings::notices(status.other.take(), Some(error));
             Vec::new()
         });
         let mut settings = Settings::load();

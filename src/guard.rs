@@ -6,6 +6,14 @@
     reason = "SPEC allows unsafe only in mirror, guard and audio, for Windows API calls"
 )]
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the Linux guard and mirror helpers (#36) pick with it; its tests run everywhere"
+    )
+)]
+pub mod desktop;
 #[cfg(windows)]
 mod displays;
 #[cfg_attr(
@@ -30,7 +38,7 @@ mod window_guard;
 #[cfg(windows)]
 pub use displays::DisplayWatcher;
 
-/// Linux has no display changes to hear; this stand-in never wakes.
+/// Linux lists no monitors yet (#36), so there are no display changes to follow; it never wakes.
 #[cfg(not(windows))]
 pub struct DisplayWatcher;
 
@@ -91,84 +99,47 @@ pub fn new_guard(wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
     Box::new(window_guard::WindowGuard::new(wake))
 }
 
-/// The guard cannot run on Linux, so the settings window gets the stand-in.
+/// The Linux guards are not built yet (#36), so while the guard checkbox is on it says so.
 #[cfg(not(windows))]
 pub fn new_guard(_wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
-    Box::new(StandInGuard::default())
-}
-
-/// Stand-in for Linux; it only remembers the checkbox.
-#[cfg(not(windows))]
-#[derive(Debug, Default)]
-pub struct StandInGuard {
-    pub enabled: bool,
+    Box::new(NotOnLinuxYet::default())
 }
 
 #[cfg(not(windows))]
-impl Guard for StandInGuard {
+#[derive(Default)]
+struct NotOnLinuxYet {
+    enabled: bool,
+    report: Option<GuardReport>,
+}
+
+#[cfg(not(windows))]
+impl Guard for NotOnLinuxYet {
     fn update(&mut self, enabled: bool, _card: Option<&str>, _send_windows_to: Option<&str>) {
         self.enabled = enabled;
+        self.report = Some(if enabled {
+            GuardReport::Notice(
+                "The window guard and pointer guard do not work on Linux yet.".into(),
+            )
+        } else {
+            GuardReport::Clear
+        });
     }
 
     fn take_report(&mut self) -> Option<GuardReport> {
-        None
+        self.report.take()
     }
 
-    fn follow_displays(&mut self) {}
+    fn follow_displays(&mut self) {
+        if self.enabled {
+            self.update(true, None, None);
+        }
+    }
 }
 
-/// Stand-in monitors so the settings window can be laid out on Linux.
+/// Linux lists no monitors yet (#36).
 #[cfg(not(windows))]
 pub fn monitors() -> Result<Vec<Monitor>, String> {
-    let monitor =
-        |device_path: &str, name: &str, width, height, refresh_hz, primary, left| Monitor {
-            device_path: device_path.into(),
-            gdi_name: String::new(),
-            name: name.into(),
-            width,
-            height,
-            refresh_hz,
-            primary,
-            left,
-            top: 0,
-            graphics_card: if device_path == "stand-in-card" {
-                "Stand-in integrated graphics".into()
-            } else {
-                "Stand-in graphics card".into()
-            },
-            container_id: String::new(),
-            connector: format!("{device_path} connector"),
-        };
-    // Arranged as on the sender: the source monitor left of the primary monitor, the card display right of it.
-    Ok(vec![
-        monitor(
-            "stand-in-source",
-            "Stand-in source monitor",
-            2560,
-            1440,
-            500,
-            false,
-            -2560,
-        ),
-        monitor(
-            "stand-in-primary",
-            "Stand-in primary monitor",
-            1920,
-            1080,
-            144,
-            true,
-            0,
-        ),
-        monitor(
-            "stand-in-card",
-            "Stand-in card display",
-            1920,
-            1080,
-            60,
-            false,
-            1920,
-        ),
-    ])
+    Err("The monitor list does not work on Linux yet.".into())
 }
 
 /// Active display paths and modes from `QueryDisplayConfig`.
@@ -752,5 +723,37 @@ mod tests {
                 monitor.gdi_name
             );
         }
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod linux_tests {
+    use super::*;
+
+    #[test]
+    fn on_linux_the_monitor_list_says_it_does_not_work_yet() {
+        assert_eq!(
+            monitors(),
+            Err("The monitor list does not work on Linux yet.".into())
+        );
+    }
+
+    #[test]
+    fn on_linux_the_guard_says_it_does_not_run_yet_while_it_is_on() {
+        let not_yet = GuardReport::Notice(
+            "The window guard and pointer guard do not work on Linux yet.".into(),
+        );
+        let mut guard = new_guard(|| {});
+        assert_eq!(guard.take_report(), None);
+        guard.update(true, Some("card"), None);
+        assert_eq!(guard.take_report(), Some(not_yet.clone()));
+        assert_eq!(guard.take_report(), None);
+        // A dismissed notice comes back after a display change, as on Windows.
+        guard.follow_displays();
+        assert_eq!(guard.take_report(), Some(not_yet));
+        guard.update(false, Some("card"), None);
+        assert_eq!(guard.take_report(), Some(GuardReport::Clear));
+        guard.follow_displays();
+        assert_eq!(guard.take_report(), None);
     }
 }

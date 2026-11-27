@@ -101,22 +101,29 @@ pub fn new_relay(wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
     Box::new(relay::WasapiRelay::new(wake))
 }
 
-/// The relay cannot run on Linux, so the settings window gets the stand-in.
+#[cfg(not(windows))]
+const NOT_ON_LINUX_YET: &str = "The audio relay does not work on Linux yet.";
+
+/// The Linux relay is not built yet (#36), so every start reports that.
 #[cfg(not(windows))]
 pub fn new_relay(_wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
-    Box::new(StandInRelay)
+    Box::new(NotOnLinuxYet { started: false })
 }
 
-/// Stand-in for Linux; it does nothing.
+/// `started` until the start's report is taken.
 #[cfg(not(windows))]
-pub struct StandInRelay;
+struct NotOnLinuxYet {
+    started: bool,
+}
 
 #[cfg(not(windows))]
-impl Relay for StandInRelay {
-    fn start(&mut self, _source: &str, _output: &SoundOutput, _container: &str, _name: &str) {}
+impl Relay for NotOnLinuxYet {
+    fn start(&mut self, _source: &str, _output: &SoundOutput, _container: &str, _name: &str) {
+        self.started = true;
+    }
     fn stop(&mut self) {}
     fn take_report(&mut self) -> Option<RelayReport> {
-        None
+        std::mem::take(&mut self.started).then(|| RelayReport::Failing(NOT_ON_LINUX_YET.into()))
     }
 }
 
@@ -234,15 +241,10 @@ fn without_number(name: &str) -> &str {
     }
 }
 
-/// Stand-in playback devices so the settings window can be laid out on Linux.
+/// Linux lists no playback devices yet (#36).
 #[cfg(not(windows))]
 pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
-    Ok(vec![AudioDevice {
-        id: "stand-in-speakers".into(),
-        name: "Stand-in speakers".into(),
-        description: "Speakers".into(),
-        container_id: String::new(),
-    }])
+    Err(NOT_ON_LINUX_YET.into())
 }
 
 /// Active playback devices from WASAPI.
@@ -307,6 +309,21 @@ pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn on_linux_the_audio_relay_says_it_does_not_run_yet() {
+        let not_yet = "The audio relay does not work on Linux yet.";
+        assert_eq!(playback_devices(), Err(not_yet.into()));
+        let mut relay = new_relay(|| {});
+        assert_eq!(relay.take_report(), None);
+        relay.start("speakers", &SoundOutput::Automatic, "card", "Elgato");
+        assert_eq!(
+            relay.take_report(),
+            Some(RelayReport::Failing(not_yet.into()))
+        );
+        assert_eq!(relay.take_report(), None);
+    }
 
     const CARD: &str = "card container";
 
