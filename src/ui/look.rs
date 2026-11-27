@@ -1,7 +1,7 @@
 //! The settings window's look and the plain decisions behind it: colours, status tones, the
 //! repaint policy, the frame rate and the live layout's geometry. No Windows calls.
 
-use super::settings::{Settings, Status};
+use super::settings::{self, Settings, Status};
 use crate::guard::Monitor;
 use eframe::egui::{self, Color32, CornerRadius, Rect, Shadow, Stroke, pos2, vec2};
 use std::time::{Duration, Instant};
@@ -151,27 +151,52 @@ pub fn phase(time: f64, period: f64) -> f32 {
     (time / period).rem_euclid(1.0) as f32
 }
 
+/// How long the mirror keeps up with too few refreshes before the status line says so.
+pub const SLOW_FOR: Duration = Duration::from_secs(3);
+
 /// Frames per second shown on the card display, from the mirror's count of presented frames.
 #[derive(Debug, Default)]
 pub struct FrameRate {
     since: Option<(u64, Instant)>,
     pub shown: Option<f32>,
+    /// The card display's refresh rate at the last sample.
+    refresh_hz: u32,
+    /// Since when the shown rate is under 90% of the card display's refresh rate.
+    slow_since: Option<Instant>,
 }
 
 impl FrameRate {
     /// Measures over at least half a second, so a 30 Hz repaint does not make the number jitter.
-    pub fn sample(&mut self, presents: u64, now: Instant) {
+    /// `refresh_hz` is the card display's; 0 if unknown.
+    pub fn sample(&mut self, presents: u64, refresh_hz: u32, now: Instant) {
+        self.refresh_hz = refresh_hz;
         match self.since {
             // The count only goes down when a restarted mirror started counting again.
             Some((before, at)) if presents >= before => {
                 let elapsed = now.saturating_duration_since(at);
                 if elapsed >= Duration::from_millis(500) {
-                    self.shown = Some((presents - before) as f32 / elapsed.as_secs_f32());
+                    let rate = (presents - before) as f32 / elapsed.as_secs_f32();
+                    self.shown = Some(rate);
                     self.since = Some((presents, now));
+                    self.slow_since =
+                        (rate < 0.9 * refresh_hz as f32).then(|| self.slow_since.unwrap_or(now));
                 }
             }
             _ => self.since = Some((presents, now)),
         }
+    }
+
+    /// The status line's warning once the mirror has stayed under 90% of the card display's
+    /// refresh rate for [`SLOW_FOR`]: the mirror presents once per refresh, so it misses refreshes.
+    pub fn slow_warning(&self, now: Instant) -> Option<String> {
+        let (rate, since) = (self.shown?, self.slow_since?);
+        (now.saturating_duration_since(since) >= SLOW_FOR).then(|| {
+            format!(
+                "The mirror shows only {rate:.0} frames a second on a {} Hz card display. \
+                 Set a lower refresh rate for the card display in Windows.",
+                self.refresh_hz
+            )
+        })
     }
 }
 
@@ -209,6 +234,16 @@ impl Role {
             Self::CardDisplay => &mut settings.card_display,
             Self::SendWindowsTo => &mut settings.send_windows_to,
         }
+    }
+
+    /// Whether the dropdown and the role menu offer `monitor` for this role: not when it makes a
+    /// [`settings::role_problem`]. A problem that is already there (Windows made the card display
+    /// the primary monitor) locks no other choice.
+    pub fn offers(self, settings: &Settings, monitors: &[Monitor], monitor: &Monitor) -> bool {
+        let mut chosen = settings.clone();
+        *self.choice(&mut chosen) = Some(monitor.device_path.clone());
+        let problem = settings::role_problem(&chosen, monitors);
+        problem.is_none() || problem == settings::role_problem(settings, monitors)
     }
 
     /// Whether `monitor` is chosen for this role.
@@ -480,6 +515,71 @@ mod tests {
         assert_eq!(settings.card_display.as_deref(), Some("card"));
     }
 
+    /// The source monitor left of the primary monitor, the card display right of it.
+    fn sender() -> (Vec<Monitor>, Settings) {
+        let monitors = vec![
+            monitor("source", -1920, 0, 1920, 1080),
+            monitor("primary", 0, 0, 1920, 1080),
+            monitor("card", 1920, 0, 1920, 1080),
+            monitor("spare", 3840, 0, 1920, 1080),
+        ];
+        let settings = Settings {
+            source_monitor: Some("source".into()),
+            card_display: Some("card".into()),
+            send_windows_to: Some("primary".into()),
+            ..Settings::default()
+        };
+        (monitors, settings)
+    }
+
+    fn offered(role: Role, monitors: &[Monitor], settings: &Settings) -> Vec<String> {
+        monitors
+            .iter()
+            .filter(|monitor| role.offers(settings, monitors, monitor))
+            .map(|monitor| monitor.device_path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_role_is_never_offered_on_a_monitor_it_would_clash_with() {
+        let (monitors, settings) = sender();
+        assert_eq!(
+            offered(Role::CardDisplay, &monitors, &settings),
+            ["card", "spare"],
+            "never the source monitor, the primary or the send windows to monitor"
+        );
+        assert_eq!(
+            offered(Role::SourceMonitor, &monitors, &settings),
+            ["source", "primary", "spare"]
+        );
+        assert_eq!(
+            offered(Role::SendWindowsTo, &monitors, &settings),
+            ["source", "primary", "spare"]
+        );
+        // Nothing chosen yet: only the primary monitor can't be the card display.
+        assert_eq!(
+            offered(Role::CardDisplay, &monitors, &Settings::default()),
+            ["source", "card", "spare"]
+        );
+    }
+
+    #[test]
+    fn a_card_display_that_became_the_primary_monitor_locks_no_other_choice() {
+        let (mut monitors, settings) = sender();
+        // Windows made the card display the primary monitor.
+        monitors[1].primary = false;
+        monitors[2].primary = true;
+        assert_eq!(
+            offered(Role::SourceMonitor, &monitors, &settings),
+            ["source", "primary", "spare"]
+        );
+        assert_eq!(
+            offered(Role::CardDisplay, &monitors, &settings),
+            ["card", "spare"],
+            "the current choice stays, and a new one fixes it"
+        );
+    }
+
     #[test]
     fn the_window_animates_at_30_hz_only_while_seen_with_focus() {
         let running = Status::Running;
@@ -506,16 +606,58 @@ mod tests {
     fn frame_rate_is_measured_over_half_a_second_and_survives_a_restart() {
         let start = Instant::now();
         let mut rate = FrameRate::default();
-        rate.sample(0, start);
-        rate.sample(2, start + Duration::from_millis(33));
+        rate.sample(0, 60, start);
+        rate.sample(2, 60, start + Duration::from_millis(33));
         assert_eq!(rate.shown, None, "measured over too short a time");
-        rate.sample(60, start + Duration::from_secs(1));
+        rate.sample(60, 60, start + Duration::from_secs(1));
         assert_eq!(rate.shown, Some(60.0));
         // A restarted mirror counts from 0 again.
-        rate.sample(0, start + Duration::from_secs(2));
+        rate.sample(0, 60, start + Duration::from_secs(2));
         assert_eq!(rate.shown, Some(60.0));
-        rate.sample(30, start + Duration::from_secs(3));
+        rate.sample(30, 60, start + Duration::from_secs(3));
         assert_eq!(rate.shown, Some(30.0));
+    }
+
+    #[test]
+    fn a_mirror_below_90_percent_of_the_refresh_for_3_seconds_says_so() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut rate = FrameRate::default();
+        rate.sample(0, 120, at(0));
+        // 100 fps on a 120 Hz card display: under 108.
+        rate.sample(50, 120, at(500));
+        assert_eq!(rate.shown, Some(100.0));
+        rate.sample(250, 120, at(2500));
+        assert_eq!(
+            rate.slow_warning(at(2500)),
+            None,
+            "not slow for long enough"
+        );
+        rate.sample(350, 120, at(3500));
+        assert_eq!(
+            rate.slow_warning(at(3500)).as_deref(),
+            Some(
+                "The mirror shows only 100 frames a second on a 120 Hz card display. \
+                 Set a lower refresh rate for the card display in Windows."
+            )
+        );
+        // Keeping up again clears it at once.
+        rate.sample(470, 120, at(4500));
+        assert_eq!(rate.slow_warning(at(4500)), None);
+    }
+
+    #[test]
+    fn a_mirror_that_keeps_up_with_any_refresh_rate_is_not_slow() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        // 55 fps on 60 Hz, 120 on 120 Hz, 240 on 240 Hz, and a card display of unknown refresh.
+        for (fps, hz) in [(55, 60), (120, 120), (240, 240), (30, 0)] {
+            let mut rate = FrameRate::default();
+            for second in 0..=10 {
+                rate.sample(fps * second, hz, at(second));
+            }
+            assert_eq!(rate.slow_warning(at(10)), None, "{fps} fps at {hz} Hz");
+        }
     }
 
     #[test]

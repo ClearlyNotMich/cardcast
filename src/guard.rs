@@ -436,6 +436,61 @@ pub mod second_monitor {
         }
     }
 
+    /// A monitor set to another refresh rate at its resolution, as a user does in Windows' advanced
+    /// display settings; its saved mode is put back on drop.
+    pub struct RefreshRate(Vec<u16>);
+
+    impl RefreshRate {
+        pub fn set(monitor: &Monitor, hz: u32) -> Self {
+            use windows::Win32::Graphics::Gdi::{
+                CDS_TYPE, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
+                DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
+            };
+            let name: Vec<u16> = monitor.gdi_name.encode_utf16().chain([0]).collect();
+            let mode = DEVMODEW {
+                dmSize: u16::try_from(size_of::<DEVMODEW>()).unwrap_or(0),
+                dmFields: DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY,
+                dmPelsWidth: monitor.width,
+                dmPelsHeight: monitor.height,
+                dmDisplayFrequency: hz,
+                ..DEVMODEW::default()
+            };
+            // SAFETY: name is NUL-terminated and mode a DEVMODEW with dmSize set; both outlive the call.
+            let result = unsafe {
+                ChangeDisplaySettingsExW(
+                    windows::core::PCWSTR(name.as_ptr()),
+                    Some(&raw const mode),
+                    None,
+                    CDS_TYPE(0),
+                    None,
+                )
+            };
+            assert_eq!(
+                result, DISP_CHANGE_SUCCESSFUL,
+                "{} could not be set to {hz} Hz",
+                monitor.gdi_name
+            );
+            Self(name)
+        }
+    }
+
+    impl Drop for RefreshRate {
+        /// Never panics: it also runs while a failed test unwinds.
+        fn drop(&mut self) {
+            use windows::Win32::Graphics::Gdi::{CDS_TYPE, ChangeDisplaySettingsExW};
+            // SAFETY: the name is NUL-terminated; no mode with no flags puts back the saved one.
+            let _ = unsafe {
+                ChangeDisplaySettingsExW(
+                    windows::core::PCWSTR(self.0.as_ptr()),
+                    None,
+                    None,
+                    CDS_TYPE(0),
+                    None,
+                )
+            };
+        }
+    }
+
     fn pnputil(action: &str, device: &str) -> bool {
         Command::new("pnputil")
             .args([action, device])

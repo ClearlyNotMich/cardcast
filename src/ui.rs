@@ -71,12 +71,16 @@ impl SettingsWindow {
             status.other = Some(error);
             Vec::new()
         });
-        let mut settings = Settings::load().with_defaults(&monitors);
-        if settings::follow_card_display(&mut settings, &monitors)
+        let mut settings = Settings::load();
+        let cleared = settings.clear_role_clashes();
+        let mut settings = settings.with_defaults(&monitors);
+        let followed = settings::follow_card_display(&mut settings, &monitors);
+        if (cleared.is_some() || followed)
             && let Err(error) = settings.save()
         {
             status.other = Some(error);
         }
+        status.other = cleared.or(status.other);
         let relay_context = context.clone();
         let mirror_context = context.clone();
         let guard_context = context.clone();
@@ -114,9 +118,12 @@ impl SettingsWindow {
     /// Starts the mirror from saved settings; the window minimises once it runs.
     fn launch(&mut self, context: &egui::Context) {
         if settings::starts_on_launch(&self.settings) {
+            // A problem found while loading outlives the start, which clears the status line's.
+            let loaded = self.status.other.take();
             self.minimise_when_running = true;
             self.start();
             self.follow_mirror(context);
+            self.status.other = self.status.other.take().or(loaded);
         }
     }
 
@@ -321,7 +328,13 @@ impl SettingsWindow {
         }
     }
 
+    /// Offers only the monitors the role can take ([`Role::offers`]).
     fn monitor_dropdown(&mut self, ui: &mut egui::Ui, role: Role) {
+        let offered: Vec<&Monitor> = self
+            .monitors
+            .iter()
+            .filter(|monitor| role.offers(&self.settings, &self.monitors, monitor))
+            .collect();
         let selected = role.choice(&mut self.settings);
         let shown = self
             .monitors
@@ -333,7 +346,7 @@ impl SettingsWindow {
             .selected_text(shown)
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                for monitor in &self.monitors {
+                for monitor in offered {
                     ui.selectable_value(
                         selected,
                         Some(monitor.device_path.clone()),
@@ -489,7 +502,11 @@ impl SettingsWindow {
             return;
         };
         ui.add_space(6.0);
-        let tone = look::Tone::of(&self.status.mirror);
+        // A slow mirror still runs, but the box warns.
+        let tone = match look::Tone::of(&self.status.mirror) {
+            look::Tone::Live if self.status.slow_mirror.is_some() => look::Tone::Busy,
+            tone => tone,
+        };
         egui::Frame::new()
             .fill(look::BACKGROUND)
             .stroke(egui::Stroke::new(1.0, tone.colour().gamma_multiply(0.35)))
@@ -543,9 +560,13 @@ impl eframe::App for SettingsWindow {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let before = self.settings.clone();
         if let (Status::Running, Some(presents)) = (&self.status.mirror, self.mirror.presents()) {
-            self.frame_rate.sample(presents, Instant::now());
+            let refresh_hz = self.card_display().map_or(0, |monitor| monitor.refresh_hz);
+            let now = Instant::now();
+            self.frame_rate.sample(presents, refresh_hz, now);
+            self.status.slow_mirror = self.frame_rate.slow_warning(now);
         } else if self.status.mirror != Status::Running {
             self.frame_rate = FrameRate::default();
+            self.status.slow_mirror = None;
         }
         let (visible, focused, time) = ui.input(|input| {
             let viewport = input.viewport();
@@ -571,7 +592,7 @@ impl eframe::App for SettingsWindow {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(look::BACKGROUND).inner_margin(16))
             .show(ui, |ui| {
-                let hint = match settings::role_problem(&self.settings) {
+                let hint = match settings::role_problem(&self.settings, &self.monitors) {
                     Some(problem) => RichText::new(problem).small().color(look::PROBLEM),
                     None => RichText::new("Click a monitor to choose its role")
                         .small()
@@ -754,6 +775,16 @@ mod tests {
     }
 
     #[test]
+    fn a_choice_cleared_at_load_is_still_said_after_the_start_at_launch() {
+        let mut window = window("card");
+        let cleared =
+            "\"Send windows to\" was the card display, so it is the primary monitor again.";
+        window.status.other = Some(cleared.into());
+        launched_minimised(&mut window);
+        assert_eq!(window.status.text(), format!("Running | {cleared}"));
+    }
+
+    #[test]
     fn launch_without_the_card_display_waits_with_the_window_shown() {
         let mut window = window("gone");
         assert!(!launched_minimised(&mut window));
@@ -891,6 +922,62 @@ mod tests {
             "the mirror ended after the replug"
         );
         assert_eq!(window.status.text(), "Running");
+    }
+
+    /// The mirror presents once per refresh (`Present(1, 0)`), with no 60 Hz cap. A virtual monitor
+    /// has no vertical blank, so its presents run unpaced: this proves only that nothing caps them
+    /// at 60, not that they follow the refresh rate. That stays an owner check on a real card.
+    #[cfg(windows)]
+    #[test]
+    fn second_monitor_mirror_on_a_120_hz_card_display_is_not_capped_at_60() {
+        use guard::second_monitor::{RefreshRate, wait_for};
+        use std::io::Write as _;
+        let Some(monitors) = guard::second_monitor::monitors(3) else {
+            return;
+        };
+        let (source_monitor, card_display) = (monitors[1].clone(), monitors[2].clone());
+        let _rate = RefreshRate::set(&card_display, 120);
+        let mut monitors = Vec::new();
+        wait_for(
+            "the card display at 120 Hz",
+            Duration::from_secs(10),
+            || {
+                monitors = guard::monitors().unwrap();
+                monitors.iter().any(|monitor| {
+                    monitor.device_path == card_display.device_path && monitor.refresh_hz == 120
+                })
+            },
+        );
+        let card_display = monitors
+            .iter()
+            .find(|monitor| monitor.device_path == card_display.device_path)
+            .unwrap()
+            .clone();
+        let (mut window, _guard) = on_second_monitors(monitors, &source_monitor, &card_display);
+        let context = egui::Context::default();
+        start_and_wait(&mut window, &context);
+        // Measured as the header does, after the mirror settled.
+        std::thread::sleep(Duration::from_millis(500));
+        for _ in 0..=8 {
+            let now = Instant::now();
+            window
+                .frame_rate
+                .sample(window.mirror.presents().unwrap(), 120, now);
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let shown = window.frame_rate.shown.unwrap();
+        // Written to stderr directly: libtest captures only the print macros.
+        let _ = writeln!(
+            std::io::stderr(),
+            "{shown:.1} presents a second on a {} Hz card display; slow warning: {:?}",
+            card_display.refresh_hz,
+            window.frame_rate.slow_warning(Instant::now())
+        );
+        assert!(
+            shown > 66.0,
+            "{shown:.1} presents a second on a 120 Hz card display: capped at 60"
+        );
+        assert!(window.mirror.is_running(), "the mirror ended on its own");
     }
 
     #[cfg(windows)]

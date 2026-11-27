@@ -39,6 +39,8 @@ impl Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusLine {
     pub mirror: Status,
+    /// The running mirror keeps up with too few of the card display's refreshes (`look::FrameRate`).
+    pub slow_mirror: Option<String>,
     /// The audio relay's problem; cleared when it relays again, or on Start and Stop.
     pub audio: Option<String>,
     /// Automatic found no sound output: the status line offers "Choose sound output".
@@ -57,6 +59,7 @@ impl StatusLine {
     pub fn new(mirror: Status) -> Self {
         Self {
             mirror,
+            slow_mirror: None,
             audio: None,
             choose_sound_output: false,
             guard: None,
@@ -66,9 +69,10 @@ impl StatusLine {
         }
     }
 
-    /// Start and Stop: the new mirror status clears audio and other problems, not the lasting ones.
+    /// Start and Stop: the new mirror status clears its speed, audio and other problems, not the lasting ones.
     pub fn set_mirror(&mut self, mirror: Status) {
         self.mirror = mirror;
+        self.slow_mirror = None;
         self.audio = None;
         self.choose_sound_output = false;
         self.other = None;
@@ -117,6 +121,7 @@ impl StatusLine {
         };
         let parts: Vec<&str> = [
             reason,
+            self.slow_mirror.as_deref(),
             self.audio.as_deref(),
             self.guard.as_deref(),
             self.displays.as_deref(),
@@ -153,12 +158,18 @@ pub fn restart_delay(attempts: u32) -> Duration {
     }
 }
 
-/// Choices that can't work together, in plain words. The dropdowns and the live layout allow
-/// any choice, so a swap can go through a clash; the window warns about it instead.
-pub fn role_problem(settings: &Settings) -> Option<&'static str> {
+/// Choices that can't work together, in plain words; the one source of the refusal text. The
+/// dropdowns and the live layout never offer them (`look::Role::offers`), and Start refuses them.
+/// One can still happen: Windows can make the card display the primary monitor.
+pub fn role_problem(settings: &Settings, monitors: &[Monitor]) -> Option<&'static str> {
     let card_display = settings.card_display.as_ref()?;
+    let primary = monitors
+        .iter()
+        .any(|monitor| monitor.primary && &monitor.device_path == card_display);
     if settings.source_monitor.as_ref() == Some(card_display) {
         Some("The source monitor and the card display must be different monitors.")
+    } else if primary {
+        Some("The card display can't be the primary monitor.")
     } else if settings.send_windows_to.as_ref() == Some(card_display) {
         Some("\"Send windows to\" can't be the card display.")
     } else {
@@ -172,18 +183,13 @@ pub fn start(settings: &Settings, monitors: &[Monitor], mirror: &mut dyn Mirror)
     else {
         return Status::Error("Choose a source monitor and a card display.".into());
     };
-    if source_path == card_path {
-        return Status::Error(
-            "The source monitor and the card display must be different monitors.".into(),
-        );
+    if let Some(problem) = role_problem(settings, monitors) {
+        return Status::Error(problem.into());
     }
     let find = |path: &str| monitors.iter().find(|monitor| monitor.device_path == path);
     let Some(card_display) = find(card_path) else {
         return Status::WaitingForCardDisplay;
     };
-    if card_display.primary {
-        return Status::Error("The card display can't be the primary monitor.".into());
-    }
     let Some(source_monitor) = find(source_path) else {
         return Status::WaitingForSourceMonitor;
     };
@@ -387,6 +393,27 @@ impl Settings {
                 .map(|monitor| monitor.device_path.clone());
         }
         self
+    }
+
+    /// Clears a role an older cardcast saved on the card display: the source monitor, so the card
+    /// display and its guard stay, and "send windows to", which [`Self::with_defaults`] then sets
+    /// to the primary monitor. Returns what was cleared, in plain words. A card display that is
+    /// the primary monitor is kept: that is Windows' live state, and Start refuses it.
+    pub fn clear_role_clashes(&mut self) -> Option<String> {
+        let mut cleared = Vec::new();
+        if self.card_display.is_some() && self.source_monitor == self.card_display {
+            self.source_monitor = None;
+            cleared.push(
+                "The source monitor was the card display, so it was cleared. Choose a source monitor.",
+            );
+        }
+        if self.card_display.is_some() && self.send_windows_to == self.card_display {
+            self.send_windows_to = None;
+            cleared.push(
+                "\"Send windows to\" was the card display, so it is the primary monitor again.",
+            );
+        }
+        (!cleared.is_empty()).then(|| cleared.join(" "))
     }
 
     /// Loads the saved settings; a missing or unreadable file gives defaults.
@@ -905,9 +932,10 @@ mod tests {
     }
 
     #[test]
-    fn the_card_display_cannot_share_a_monitor_with_another_role() {
+    fn the_card_display_cannot_share_a_monitor_with_another_role_or_be_the_primary() {
+        let problem = |settings: &Settings| role_problem(settings, &sender_monitors());
         assert_eq!(
-            role_problem(&chosen("card", "card")),
+            problem(&chosen("card", "card")),
             Some("The source monitor and the card display must be different monitors.")
         );
         let send_to_card = Settings {
@@ -915,21 +943,125 @@ mod tests {
             ..chosen("source", "card")
         };
         assert_eq!(
-            role_problem(&send_to_card),
+            problem(&send_to_card),
             Some("\"Send windows to\" can't be the card display.")
+        );
+        assert_eq!(
+            problem(&chosen("source", "primary")),
+            Some("The card display can't be the primary monitor.")
+        );
+        // Sent to by default, the primary monitor still reads as the primary monitor.
+        let primary_by_default = Settings::default().with_defaults(&sender_monitors());
+        assert_eq!(
+            problem(&Settings {
+                card_display: Some("primary".into()),
+                ..primary_by_default
+            }),
+            Some("The card display can't be the primary monitor.")
         );
         let fine = Settings {
             send_windows_to: Some("primary".into()),
             ..chosen("source", "card")
         };
-        assert_eq!(role_problem(&fine), None);
+        assert_eq!(problem(&fine), None);
         // Sending windows to the source monitor is fine, and nothing chosen is not a clash.
         let send_to_source = Settings {
             send_windows_to: Some("source".into()),
             ..chosen("source", "card")
         };
-        assert_eq!(role_problem(&send_to_source), None);
-        assert_eq!(role_problem(&Settings::default()), None);
+        assert_eq!(problem(&send_to_source), None);
+        assert_eq!(problem(&Settings::default()), None);
+        // A card display that is not connected is not known to be the primary monitor.
+        assert_eq!(problem(&chosen("source", "gone")), None);
+    }
+
+    #[test]
+    fn start_refuses_every_role_problem_with_its_text() {
+        let send_to_card = Settings {
+            send_windows_to: Some("card".into()),
+            ..chosen("source", "card")
+        };
+        for settings in [
+            chosen("card", "card"),
+            chosen("source", "primary"),
+            send_to_card,
+        ] {
+            let problem = role_problem(&settings, &sender_monitors()).unwrap();
+            assert_eq!(
+                start(&settings, &sender_monitors(), &mut StandInMirror::default()),
+                Status::Error(problem.into())
+            );
+        }
+    }
+
+    /// Settings an older cardcast saved, as launch loads them.
+    fn launched(saved: &Settings) -> (Settings, Option<String>) {
+        let mut settings = Settings::from_text(&saved.to_text());
+        let cleared = settings.clear_role_clashes();
+        (settings.with_defaults(&sender_monitors()), cleared)
+    }
+
+    #[test]
+    fn saved_send_windows_to_on_the_card_display_is_reset_to_the_primary_monitor() {
+        let (settings, cleared) = launched(&Settings {
+            send_windows_to: Some("card".into()),
+            ..chosen("source", "card")
+        });
+        assert_eq!(
+            settings,
+            Settings {
+                send_windows_to: Some("primary".into()),
+                ..chosen("source", "card")
+            }
+        );
+        assert_eq!(
+            cleared.as_deref(),
+            Some("\"Send windows to\" was the card display, so it is the primary monitor again.")
+        );
+    }
+
+    #[test]
+    fn saved_source_monitor_on_the_card_display_is_cleared_and_the_card_display_kept() {
+        let (settings, cleared) = launched(&chosen("card", "card"));
+        assert_eq!(settings.source_monitor, None);
+        assert_eq!(settings.card_display.as_deref(), Some("card"));
+        assert_eq!(
+            cleared.as_deref(),
+            Some(
+                "The source monitor was the card display, so it was cleared. Choose a source monitor."
+            )
+        );
+        assert!(!starts_on_launch(&settings));
+        // Both at once: both are cleared, and both are said.
+        let (settings, cleared) = launched(&Settings {
+            send_windows_to: Some("card".into()),
+            ..chosen("card", "card")
+        });
+        assert_eq!(settings.source_monitor, None);
+        assert_eq!(settings.send_windows_to.as_deref(), Some("primary"));
+        assert_eq!(cleared.unwrap().matches(" was the card display").count(), 2);
+    }
+
+    #[test]
+    fn a_saved_card_display_that_is_the_primary_monitor_is_kept_and_start_refuses_it() {
+        // Primary is Windows' live state: with the other monitors asleep, the card display can be it for a while.
+        let saved = chosen("source", "primary");
+        let (settings, cleared) = launched(&saved);
+        assert_eq!(cleared, None);
+        assert_eq!(settings.card_display.as_deref(), Some("primary"));
+        assert_eq!(
+            start(&settings, &sender_monitors(), &mut StandInMirror::default()),
+            Status::Error("The card display can't be the primary monitor.".into())
+        );
+    }
+
+    #[test]
+    fn settings_without_a_clash_load_unchanged() {
+        let saved = Settings {
+            send_windows_to: Some("source".into()),
+            ..chosen("source", "card")
+        };
+        assert_eq!(launched(&saved), (saved, None));
     }
 
     #[test]
@@ -957,6 +1089,18 @@ mod tests {
             ..StatusLine::new(Status::Error("failed".into()))
         };
         assert_eq!(line.details(), Some("failed | audio | guard".into()));
+    }
+
+    #[test]
+    fn a_slow_mirror_is_said_while_it_runs_and_cleared_by_start_and_stop() {
+        let mut line = StatusLine {
+            slow_mirror: Some("slow".into()),
+            guard: Some("guard".into()),
+            ..StatusLine::new(Status::Running)
+        };
+        assert_eq!(line.details(), Some("slow | guard".into()));
+        line.set_mirror(Status::Stopped);
+        assert_eq!(line.details(), Some("guard".into()));
     }
 
     #[test]

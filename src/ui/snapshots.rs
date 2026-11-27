@@ -159,11 +159,45 @@ fn snapshot_error() {
     snapshot("error", window);
 }
 
+/// The one clash left to warn about: Windows made the card display the primary monitor.
 #[test]
-fn snapshot_invalid_roles() {
+fn snapshot_card_display_is_primary() {
     let mut window = sender(Status::Stopped);
-    window.settings.send_windows_to = Some("card".into());
-    snapshot("invalid_roles", window);
+    for monitor in &mut window.monitors {
+        monitor.primary = monitor.device_path == "card";
+    }
+    snapshot("card_display_is_primary", window);
+}
+
+/// The card display dropdown leaves out the source monitor and the primary monitor.
+#[test]
+fn snapshot_card_display_dropdown() {
+    let mut harness = harness(sender(Status::Stopped));
+    harness
+        .get_by_role_and_label(egui::accesskit::Role::ComboBox, "Card display")
+        .click();
+    harness.run();
+    harness.snapshot("card_display_dropdown");
+}
+
+/// A 120 Hz card display that gets about 71 frames a second.
+#[test]
+fn snapshot_slow_mirror() {
+    let mut window = sender(Status::Running);
+    window.monitors[3].refresh_hz = 120;
+    let start = Instant::now();
+    for second in 0..=4 {
+        window.frame_rate.sample(
+            71 * second,
+            120,
+            start + std::time::Duration::from_secs(second),
+        );
+    }
+    window.status.slow_mirror = window
+        .frame_rate
+        .slow_warning(start + std::time::Duration::from_secs(4));
+    assert!(window.status.slow_mirror.is_some());
+    snapshot("slow_mirror", window);
 }
 
 #[test]
