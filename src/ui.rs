@@ -8,6 +8,7 @@ mod snapshots;
 
 use crate::audio::{self, AudioDevice, Relay, RelayReport, SoundOutput};
 use crate::guard::{self, Guard, Monitor};
+use crate::input::{self, InputThread, Probe};
 use crate::mirror::{self, Ended, Mirror};
 use eframe::egui::{self, RichText};
 use look::{FrameRate, Role};
@@ -58,6 +59,13 @@ struct SettingsWindow {
     frame_rate: FrameRate,
     /// Height the live layout takes beyond `look::LAYOUT_HEIGHT`, so the window has no empty band.
     layout_extra: f32,
+    /// Runs while input switching is on; `None` while off, so nothing is sent over DDC/CI.
+    input_thread: Option<InputThread>,
+    start_input_thread: Box<dyn Fn() -> Result<InputThread, String>>,
+    /// The input lists last read, in the monitor list's order.
+    input_lists: Vec<Probe>,
+    /// The current input of the monitor whose input menu opened last: its device path and the value.
+    current_input: Option<(String, u8)>,
 }
 
 impl SettingsWindow {
@@ -85,6 +93,7 @@ impl SettingsWindow {
         let relay_context = context.clone();
         let mirror_context = context.clone();
         let guard_context = context.clone();
+        let input_context = context.clone();
         let mut guard = guard::new_guard(move || guard_context.request_repaint());
         update_guard(&mut *guard, &settings);
         let displays_changed = Arc::new(AtomicBool::new(false));
@@ -115,11 +124,19 @@ impl SettingsWindow {
             _display_watcher: display_watcher,
             frame_rate: FrameRate::default(),
             layout_extra: 0.0,
+            input_thread: None,
+            start_input_thread: Box::new(move || {
+                let context = input_context.clone();
+                input::new_input_thread(move || context.request_repaint())
+            }),
+            input_lists: Vec::new(),
+            current_input: None,
         }
     }
 
     /// Starts the mirror from saved settings; the window minimises once it runs.
     fn launch(&mut self, context: &egui::Context) {
+        self.follow_input_switching(None, false);
         if settings::starts_on_launch(&self.settings) {
             // A problem found while loading outlives the start, which clears the status line's.
             let loaded = self.status.other.take();
@@ -266,6 +283,63 @@ impl SettingsWindow {
             }
             None => {}
         }
+        while let Some(report) = self
+            .input_thread
+            .as_ref()
+            .and_then(InputThread::take_report)
+        {
+            match report {
+                input::Report::Probed(lists) => {
+                    self.status.input = input::probed_notice(&lists).map(str::to_owned);
+                    self.input_lists = lists;
+                }
+                input::Report::Current { device_path, input } => {
+                    self.current_input = input.map(|input| (device_path, input));
+                }
+                input::Report::Switched(Ok(current)) => {
+                    self.status.input = None;
+                    self.current_input = Some(current);
+                }
+                input::Report::Switched(Err(problem)) => self.status.input = Some(problem),
+            }
+        }
+    }
+
+    /// Starts and stops the input thread with the toggle, and has it read the input lists when
+    /// [`input::reads_input_lists`] says so. `was_on` is `None` at launch.
+    fn follow_input_switching(&mut self, was_on: Option<bool>, displays_changed: bool) {
+        let on = self.settings.input_switching;
+        if !on {
+            // Dropping the thread stops it after the monitor it is reading.
+            self.input_thread = None;
+            self.input_lists.clear();
+            self.current_input = None;
+            self.status.input = None;
+            return;
+        }
+        if !input::reads_input_lists(was_on, on, displays_changed) {
+            return;
+        }
+        if self.input_thread.is_none() {
+            match (self.start_input_thread)() {
+                Ok(thread) => self.input_thread = Some(thread),
+                Err(problem) => {
+                    self.status.input = Some(problem);
+                    return;
+                }
+            }
+        }
+        self.send_input_job(input::Job::Probe(self.monitors.clone()));
+    }
+
+    /// Hands a job to the input thread; there is none while input switching is off.
+    fn send_input_job(&mut self, job: input::Job) {
+        if let Some(thread) = &self.input_thread {
+            if matches!(job, input::Job::Read(_)) {
+                self.current_input = None;
+            }
+            thread.send(job);
+        }
     }
 
     /// What every pass does, even while minimised: follow display changes, the mirror and reports.
@@ -318,6 +392,7 @@ impl SettingsWindow {
             Follow::Stop(status) => self.stop(status),
             Follow::Nothing => {}
         }
+        self.follow_input_switching(Some(self.settings.input_switching), true);
     }
 
     /// Applies changed choices at once: the guard takes them, and a mirror that runs or will
@@ -328,6 +403,9 @@ impl SettingsWindow {
             self.start_by_user();
         } else if before.sound_output != self.settings.sound_output {
             self.restart_audio();
+        }
+        if before.input_switching != self.settings.input_switching {
+            self.follow_input_switching(Some(before.input_switching), false);
         }
     }
 
@@ -596,11 +674,19 @@ impl eframe::App for SettingsWindow {
             .exact_size(60.0)
             .show_separator_line(false)
             .show(ui, |ui| {
-                live::header(ui, &self.status.mirror, self.frame_rate.shown, time);
+                live::header(
+                    ui,
+                    &self.status.mirror,
+                    self.frame_rate.shown,
+                    time,
+                    &mut self.settings.input_switching,
+                    self.status.input.as_deref(),
+                );
             });
         egui::Panel::bottom("controls")
             .frame(egui::Frame::new().fill(look::PANEL).inner_margin(16))
             .show(ui, |ui| self.controls(ui));
+        let mut asked = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(look::BACKGROUND).inner_margin(16))
             .show(ui, |ui| {
@@ -613,13 +699,17 @@ impl eframe::App for SettingsWindow {
                 // A small window scrolls instead of hiding the choices under the controls.
                 let shown = egui::ScrollArea::vertical().show(ui, |ui| {
                     live::section(ui, "LIVE LAYOUT", hint, |ui| {
-                        live::layout_map(
+                        asked = live::layout_map(
                             ui,
                             &self.monitors,
                             &mut self.settings,
                             &self.status.mirror,
                             time,
                             look::LAYOUT_HEIGHT + self.layout_extra,
+                            &live::Inputs {
+                                lists: &self.input_lists,
+                                current: self.current_input.as_ref(),
+                            },
                         );
                     });
                     ui.add_space(8.0);
@@ -647,6 +737,9 @@ impl eframe::App for SettingsWindow {
                         .request_discard("the live layout takes the spare height");
                 }
             });
+        if let Some(job) = asked {
+            self.send_input_job(job);
+        }
         self.sound_output_dialog(ui.ctx());
         // A newly chosen card display's connector is saved with it.
         settings::follow_card_display(&mut self.settings, &self.monitors);
@@ -763,6 +856,10 @@ mod tests {
             _display_watcher: None,
             frame_rate: FrameRate::default(),
             layout_extra: 0.0,
+            input_thread: None,
+            start_input_thread: Box::new(|| input::new_input_thread(|| {})),
+            input_lists: Vec::new(),
+            current_input: None,
         }
     }
 
@@ -909,6 +1006,10 @@ mod tests {
             _display_watcher: display_watcher,
             frame_rate: FrameRate::default(),
             layout_extra: 0.0,
+            input_thread: None,
+            start_input_thread: Box::new(|| input::new_input_thread(|| {})),
+            input_lists: Vec::new(),
+            current_input: None,
         };
         (window, guard)
     }
@@ -1556,6 +1657,137 @@ mod tests {
         assert_eq!(window.status.text(), "Stopped | given up");
         guard.0.borrow_mut().push(GuardReport::Clear);
         window.follow_reports();
+        assert_eq!(window.status.text(), "Stopped");
+    }
+
+    /// The monitors an input thread read over DDC/CI, and how many input threads started.
+    #[derive(Default, Clone)]
+    struct InputRecord(
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::atomic::AtomicU32>,
+    );
+
+    /// `window` with an input thread on monitors that don't answer DDC/CI, recording what it reads.
+    fn with_input_thread(mut window: SettingsWindow) -> (SettingsWindow, InputRecord) {
+        let record = InputRecord::default();
+        let recording = record.clone();
+        window.start_input_thread = Box::new(move || {
+            recording.1.fetch_add(1, Ordering::Relaxed);
+            let read = recording.0.clone();
+            input::InputThread::spawn(
+                |_: &Monitor| None,
+                move |monitor: &Monitor| {
+                    read.lock().unwrap().push(monitor.device_path.clone());
+                    None
+                },
+                || {},
+            )
+        });
+        (window, record)
+    }
+
+    /// Follows the input thread's reports until `done`.
+    fn follow_input_thread(window: &mut SettingsWindow, done: impl Fn(&SettingsWindow) -> bool) {
+        let start = Instant::now();
+        while !done(window) {
+            assert!(start.elapsed() < Duration::from_secs(10), "no input report");
+            std::thread::sleep(Duration::from_millis(5));
+            window.follow_reports();
+        }
+    }
+
+    fn switch_input_switching(window: &mut SettingsWindow, on: bool) {
+        let before = window.settings.clone();
+        window.settings.input_switching = on;
+        window.follow_settings(&before);
+    }
+
+    #[test]
+    fn nothing_is_read_over_ddc_ci_while_input_switching_is_off() {
+        let (mut window, record) = with_input_thread(window("card"));
+        let context = egui::Context::default();
+        window.launch(&context);
+        let monitors = window.monitors.clone();
+        window.follow_monitors(monitors.clone());
+        window.start();
+        window.follow(&context);
+        assert!(window.input_thread.is_none());
+        assert_eq!(
+            record.1.load(Ordering::Relaxed),
+            0,
+            "an input thread started"
+        );
+
+        switch_input_switching(&mut window, true);
+        follow_input_thread(&mut window, |window| !window.input_lists.is_empty());
+        assert_eq!(*record.0.lock().unwrap(), ["source", "card"]);
+        assert_eq!(
+            window.status.text(),
+            "Running | No monitor offers input switching over DDC/CI."
+        );
+
+        switch_input_switching(&mut window, false);
+        assert!(window.input_thread.is_none());
+        assert!(window.input_lists.is_empty());
+        assert_eq!(window.status.text(), "Running");
+        window.follow_monitors(monitors);
+        window.follow(&context);
+        assert_eq!(
+            record.1.load(Ordering::Relaxed),
+            1,
+            "an input thread started"
+        );
+        assert_eq!(
+            record.0.lock().unwrap().len(),
+            2,
+            "read a monitor while off"
+        );
+    }
+
+    #[test]
+    fn input_lists_are_read_at_launch_and_after_a_display_change_while_on() {
+        let (mut window, record) = with_input_thread(window("card"));
+        window.settings.input_switching = true;
+        window.launch(&egui::Context::default());
+        follow_input_thread(&mut window, |window| !window.input_lists.is_empty());
+        window.input_lists.clear();
+        let mut monitors = window.monitors.clone();
+        monitors.push(monitor("new", false));
+        window.follow_monitors(monitors);
+        follow_input_thread(&mut window, |window| !window.input_lists.is_empty());
+        assert_eq!(
+            *record.0.lock().unwrap(),
+            ["source", "card", "source", "card", "new"]
+        );
+        assert_eq!(record.1.load(Ordering::Relaxed), 1, "one input thread");
+    }
+
+    #[test]
+    fn a_switch_the_monitor_does_not_answer_is_said_in_the_status_line() {
+        let (mut window, _record) = with_input_thread(window("card"));
+        switch_input_switching(&mut window, true);
+        let card = window.monitors[1].clone();
+        window.send_input_job(input::Job::Switch(card, 0x11));
+        follow_input_thread(&mut window, |window| {
+            window.status.text().contains("Could not switch")
+        });
+        assert_eq!(
+            window.status.text(),
+            "Stopped | Could not switch card to HDMI 1: the monitor did not answer over DDC/CI."
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn on_linux_input_switching_says_it_does_not_work_yet() {
+        let mut window = window("card");
+        switch_input_switching(&mut window, true);
+        assert!(window.input_thread.is_none());
+        assert_eq!(
+            window.status.text(),
+            "Stopped | Input switching does not work on Linux yet."
+        );
+        switch_input_switching(&mut window, false);
         assert_eq!(window.status.text(), "Stopped");
     }
 }

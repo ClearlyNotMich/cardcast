@@ -7,7 +7,7 @@
 )]
 
 use super::{Ddc, MonitorId, edid_serial};
-use crate::guard;
+use crate::guard::{self, Monitor};
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Open_DevNode_Key, CM_REGISTRY_HARDWARE, CR_SUCCESS, RegDisposition_OpenExisting,
 };
@@ -41,7 +41,7 @@ pub fn monitors() -> Result<Vec<(MonitorId, Place)>, String> {
         .into_iter()
         .map(|monitor| {
             let id = MonitorId {
-                serial: edid(&monitor.device_path).and_then(|edid| edid_serial(&edid)),
+                serial: serial(&monitor),
                 name: monitor.name,
             };
             let place = Place {
@@ -52,6 +52,20 @@ pub fn monitors() -> Result<Vec<(MonitorId, Place)>, String> {
             (id, place)
         })
         .collect())
+}
+
+/// The monitor's EDID serial, see [`edid_serial`].
+pub fn serial(monitor: &Monitor) -> Option<String> {
+    edid(&monitor.device_path).and_then(|edid| edid_serial(&edid))
+}
+
+/// Opens a monitor from the settings window's list over DDC/CI, as [`open`] does.
+pub fn open_monitor(monitor: &Monitor) -> Option<Box<dyn Ddc>> {
+    open(Place {
+        gdi_name: monitor.gdi_name.clone(),
+        left: monitor.left,
+        top: monitor.top,
+    })
 }
 
 /// The monitor's EDID from its device registry key (`Device Parameters\EDID`), or `None`.

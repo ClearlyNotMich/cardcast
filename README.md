@@ -5,7 +5,7 @@ cardcast is a small Windows program for streaming with two PCs and a capture car
 - It shows a mirror of the source monitor on the card display, so the receiver can capture it.
 - It keeps windows and the mouse pointer off the card display.
 - It plays the chosen audio source into the capture card, so the capture card carries sound.
-- It can switch a monitor's input from a command, for example on a Stream Deck key (see [Switching a monitor's input](#switching-a-monitors-input)).
+- It can switch a monitor's input from the live layout or a command, for example on a Stream Deck key (see [Switching a monitor's input](#switching-a-monitors-input)).
 
 The receiver needs no cardcast software. OBS on the receiver adds the capture card as a video source.
 
@@ -82,7 +82,11 @@ To choose which programs go to the capture card, use Windows' own per-app sound 
 
 ## Switching a monitor's input
 
-cardcast can switch a monitor's input over DDC/CI, as the monitor's own buttons do, for example to show the receiver on the AW2523HF and switch back. Run with arguments, `cardcast.exe` does one switch and exits. It opens no window and doesn't touch the settings, and works whether or not the settings window is open.
+cardcast can switch a monitor's input over DDC/CI, as the monitor's own buttons do, for example to show the receiver on the AW2523HF and switch back.
+
+In the settings window, click the cog at the top right and switch on **Input switching** (it is off by default, and then cardcast sends nothing over DDC/CI). cardcast then reads each monitor's inputs, which can take a few seconds. A monitor that lists two or more gets a small button at the bottom right of its tile in the live layout: it lists the inputs with the current one ticked, and clicking one switches the monitor. **Copy command** copies the command below for that monitor and input, ready for a shortcut. DDC/CI can't tell which inputs have a cable plugged in.
+
+Run with arguments, `cardcast.exe` does one switch and exits. It opens no window and doesn't touch the settings, and works whether or not the settings window is open.
 
 ```
 cardcast.exe input <monitor> <input>

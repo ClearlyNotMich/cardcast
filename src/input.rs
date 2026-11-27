@@ -3,7 +3,11 @@
 #[cfg(windows)]
 mod ddc;
 
+use crate::guard::Monitor;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 /// A monitor's DDC/CI connection. Every call blocks, the capabilities string for up to seconds (docs/win32-ddc.md).
 pub trait Ddc {
@@ -313,6 +317,200 @@ pub fn decide_switch(
     } else {
         Switch::SwitchTo(wanted)
     })
+}
+
+/// What the status line says while input switching is on and not built for this platform (#46).
+#[cfg(not(windows))]
+pub const NOT_BUILT: &str = "Input switching does not work on Linux yet.";
+
+/// The input thread for the settings window; `wake` asks it to repaint when a report is waiting.
+pub fn new_input_thread(wake: impl Fn() + Send + 'static) -> Result<InputThread, String> {
+    #[cfg(windows)]
+    return InputThread::spawn(ddc::serial, ddc::open_monitor, wake);
+    #[cfg(not(windows))]
+    {
+        let _ = wake;
+        Err(NOT_BUILT.to_owned())
+    }
+}
+
+/// The settings window's DDC/CI calls, one at a time on their own thread, never the settings window's, guard's or mirror's. Dropping it stops the thread after the monitor it is reading.
+pub struct InputThread {
+    jobs: mpsc::Sender<Job>,
+    reports: mpsc::Receiver<Report>,
+    stop: Arc<AtomicBool>,
+}
+
+impl InputThread {
+    /// Starts the thread with the platform's calls, as [`run_job`] takes them.
+    pub fn spawn(
+        serial: impl Fn(&Monitor) -> Option<String> + Send + 'static,
+        open: impl Fn(&Monitor) -> Option<Box<dyn Ddc>> + Send + 'static,
+        wake: impl Fn() + Send + 'static,
+    ) -> Result<Self, String> {
+        let (jobs, waiting) = mpsc::channel::<Job>();
+        let (reports_to, reports) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        std::thread::Builder::new()
+            .name("input".into())
+            .spawn(move || {
+                for job in waiting {
+                    if stopped.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let switches = matches!(job, Job::Switch(..));
+                    if let Some(report) = run_job(job, &serial, &open, &stopped) {
+                        if reports_to.send(report).is_err() {
+                            break;
+                        }
+                        wake();
+                    }
+                    // DDC/CI 1.1: 50 ms after a Set before the next call (docs/win32-ddc.md).
+                    if switches {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            })
+            .map_err(|error| format!("Could not start input switching: {error}"))?;
+        Ok(Self {
+            jobs,
+            reports,
+            stop,
+        })
+    }
+
+    pub fn send(&self, job: Job) {
+        // Fails only once the thread ended, which it does only when dropped.
+        let _ = self.jobs.send(job);
+    }
+
+    pub fn take_report(&self) -> Option<Report> {
+        self.reports.try_recv().ok()
+    }
+}
+
+impl Drop for InputThread {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// What the settings window asks of the input thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Job {
+    /// Read every monitor's serial and input list, one monitor at a time.
+    Probe(Vec<Monitor>),
+    /// Read the monitor's current input, as its input menu opens.
+    Read(Monitor),
+    /// Switch the monitor to this input.
+    Switch(Monitor, u8),
+}
+
+/// A monitor's serial and input list, as the input thread read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    pub device_path: String,
+    pub id: MonitorId,
+    /// `None`: the monitor has no input switch.
+    pub inputs: Option<Vec<u8>>,
+}
+
+/// What the input thread tells the settings window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Report {
+    Probed(Vec<Probe>),
+    /// The monitor's current input; `None` when it didn't answer.
+    Current {
+        device_path: String,
+        input: Option<u8>,
+    },
+    /// The monitor (its device path) took the input, or the status line's text when it didn't answer.
+    Switched(Result<(String, u8), String>),
+}
+
+/// Does `job` with the platform's calls passed in: `serial` reads a monitor's EDID serial and `open` reaches it over DDC/CI. A probe that `stop` ends before its last monitor reports nothing.
+pub fn run_job(
+    job: Job,
+    serial: &dyn Fn(&Monitor) -> Option<String>,
+    open: &dyn Fn(&Monitor) -> Option<Box<dyn Ddc>>,
+    stop: &AtomicBool,
+) -> Option<Report> {
+    Some(match job {
+        Job::Probe(monitors) => {
+            let mut probes = Vec::new();
+            for monitor in monitors {
+                if stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let inputs = open(&monitor)
+                    .and_then(|mut ddc| ddc.capabilities())
+                    .and_then(|capabilities| input_list(&capabilities));
+                probes.push(Probe {
+                    id: MonitorId {
+                        serial: serial(&monitor),
+                        name: monitor.name,
+                    },
+                    device_path: monitor.device_path,
+                    inputs,
+                });
+            }
+            Report::Probed(probes)
+        }
+        Job::Read(monitor) => Report::Current {
+            input: open(&monitor).and_then(|mut ddc| ddc.current_input()),
+            device_path: monitor.device_path,
+        },
+        Job::Switch(monitor, value) => Report::Switched(
+            if open(&monitor).is_some_and(|mut ddc| ddc.set_input(value)) {
+                Ok((monitor.device_path, value))
+            } else {
+                Err(format!(
+                    "Could not switch {} to {}: the monitor did not answer over DDC/CI.",
+                    monitor.name,
+                    input_name(value)
+                ))
+            },
+        ),
+    })
+}
+
+/// The status line's text after reading the input lists, when no monitor has one.
+pub fn probed_notice(probes: &[Probe]) -> Option<&'static str> {
+    (!probes.iter().any(|probe| probe.inputs.is_some()))
+        .then_some("No monitor offers input switching over DDC/CI.")
+}
+
+/// The command switching `monitor` (from [`command_monitor`]) to input `value`, run by `exe`.
+// shortcut: a name with a `"` in it breaks the quoting; quote it as Windows does if a monitor ever has one.
+pub fn command_line(exe: &str, monitor: &str, value: u8) -> String {
+    let monitor = if monitor.contains(' ') {
+        format!("\"{monitor}\"")
+    } else {
+        monitor.to_owned()
+    };
+    let input = match value {
+        0x0F => "dp".to_owned(),
+        0x10 => "dp2".to_owned(),
+        0x11 => "hdmi1".to_owned(),
+        0x12 => "hdmi2".to_owned(),
+        _ => format!("0x{value:02X}"),
+    };
+    format!("\"{exe}\" input {monitor} {input}")
+}
+
+/// [`command_line`] for this cardcast, as the Copy command button copies it.
+pub fn copy_command(monitor: &str, value: u8) -> String {
+    let exe = std::env::current_exe().map_or_else(
+        |_| "cardcast.exe".to_owned(),
+        |exe| exe.display().to_string(),
+    );
+    command_line(&exe, monitor, value)
+}
+
+/// Whether the settings window reads every monitor's input list now: only while the toggle is `on`, when it was just switched on, at launch (`was_on` is `None`) or after a display change.
+pub fn reads_input_lists(was_on: Option<bool>, on: bool, displays_changed: bool) -> bool {
+    on && (was_on != Some(true) || displays_changed)
 }
 
 /// Hex pairs, spaced or not (`0F 11` or `0F11`); `None` for anything else.
@@ -889,6 +1087,204 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn input_lists_are_read_only_while_the_toggle_is_on() {
+        // (was on: None at launch, on, displays changed) -> read.
+        for (was_on, on, displays_changed, read) in [
+            (None, false, false, false),
+            (None, false, true, false),
+            (Some(false), false, true, false),
+            (Some(true), false, false, false),
+            (Some(true), false, true, false),
+            (None, true, false, true),
+            (Some(false), true, false, true),
+            (Some(true), true, true, true),
+            (Some(true), true, false, false),
+        ] {
+            assert_eq!(
+                reads_input_lists(was_on, on, displays_changed),
+                read,
+                "{was_on:?} {on} {displays_changed}"
+            );
+        }
+    }
+
+    fn screen(device_path: &str, name: &str) -> Monitor {
+        Monitor {
+            device_path: device_path.into(),
+            gdi_name: String::new(),
+            name: name.into(),
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+            primary: false,
+            left: 0,
+            top: 0,
+            graphics_card: String::new(),
+            container_id: String::new(),
+            connector: String::new(),
+        }
+    }
+
+    /// The AW2523HF answers DDC/CI, the card display doesn't, and the other monitor lists one input.
+    fn sender_ddc(monitor: &Monitor) -> Option<Box<dyn Ddc>> {
+        let capabilities = match monitor.device_path.as_str() {
+            "aw" => AW2523HF_CAPS,
+            "one" => "(vcp(60(0F)))",
+            _ => return None,
+        };
+        Some(Box::new(FakeDdc {
+            capabilities: Some(capabilities),
+            ..aw2523hf(0x0F)
+        }))
+    }
+
+    #[test]
+    fn probe_reads_each_monitors_serial_and_input_list() {
+        let monitors = [
+            screen("aw", "AW2523HF"),
+            screen("card", "Elgato 1080p"),
+            screen("one", "DELL P2210"),
+        ];
+        let serial = |monitor: &Monitor| (monitor.device_path == "aw").then(|| "4GZY5P3".into());
+        let probes = run_job(
+            Job::Probe(monitors.to_vec()),
+            &serial,
+            &sender_ddc,
+            &AtomicBool::new(false),
+        );
+        let probe = |device_path: &str, serial: Option<&str>, name: &str, inputs| Probe {
+            device_path: device_path.into(),
+            id: monitor(serial, name),
+            inputs,
+        };
+        assert_eq!(
+            probes,
+            Some(Report::Probed(vec![
+                probe(
+                    "aw",
+                    Some("4GZY5P3"),
+                    "AW2523HF",
+                    Some(vec![0x0F, 0x11, 0x12])
+                ),
+                probe("card", None, "Elgato 1080p", None),
+                probe("one", None, "DELL P2210", None),
+            ]))
+        );
+    }
+
+    #[test]
+    fn read_and_switch_say_when_the_monitor_does_not_answer() {
+        let no_serial = |_: &Monitor| None;
+        let run = |job| run_job(job, &no_serial, &sender_ddc, &AtomicBool::new(false));
+        let (aw, card) = (screen("aw", "AW2523HF"), screen("card", "Elgato 1080p"));
+        assert_eq!(
+            run(Job::Read(aw.clone())),
+            Some(Report::Current {
+                device_path: "aw".into(),
+                input: Some(0x0F)
+            })
+        );
+        assert_eq!(
+            run(Job::Read(card.clone())),
+            Some(Report::Current {
+                device_path: "card".into(),
+                input: None
+            })
+        );
+        assert_eq!(
+            run(Job::Switch(aw, 0x11)),
+            Some(Report::Switched(Ok(("aw".into(), 0x11))))
+        );
+        assert_eq!(
+            run(Job::Switch(card, 0x11)),
+            Some(Report::Switched(Err(
+                "Could not switch Elgato 1080p to HDMI 1: the monitor did not answer over DDC/CI."
+                    .into()
+            )))
+        );
+    }
+
+    #[test]
+    fn the_status_line_says_when_no_monitor_offers_input_switching() {
+        let probe = |inputs| Probe {
+            device_path: "aw".into(),
+            id: monitor(None, "AW2523HF"),
+            inputs,
+        };
+        let none = "No monitor offers input switching over DDC/CI.";
+        assert_eq!(probed_notice(&[]), Some(none));
+        assert_eq!(probed_notice(&[probe(None)]), Some(none));
+        assert_eq!(
+            probed_notice(&[probe(None), probe(Some(vec![0x0F, 0x11]))]),
+            None
+        );
+    }
+
+    #[test]
+    fn copy_command_switches_this_monitor_to_this_input() {
+        let exe = r"C:\Program Files\cardcast\cardcast.exe";
+        assert_eq!(
+            command_line(exe, "4GZY5P3", 0x11),
+            r#""C:\Program Files\cardcast\cardcast.exe" input 4GZY5P3 hdmi1"#
+        );
+        assert_eq!(
+            command_line("cardcast.exe", "DELL P2210", 0x1B),
+            r#""cardcast.exe" input "DELL P2210" 0x1B"#
+        );
+        // Each input word reads back as its value.
+        for value in [0x0F, 0x10, 0x11, 0x12, 0x01, 0x1B, 0xFF] {
+            let line = command_line("cardcast.exe", "4GZY5P3", value);
+            let word = line.rsplit(' ').next().unwrap();
+            assert_eq!(input_value(word), Some(value), "{line}");
+        }
+        assert!(command_line("cardcast.exe", "4GZY5P3", 0x0F).ends_with(" dp"));
+    }
+
+    #[test]
+    fn the_input_thread_does_the_jobs_and_wakes_the_settings_window() {
+        let woken = std::sync::Arc::new(AtomicBool::new(false));
+        let wake = {
+            let woken = std::sync::Arc::clone(&woken);
+            move || woken.store(true, Ordering::Relaxed)
+        };
+        let thread = InputThread::spawn(|_: &Monitor| None, sender_ddc, wake).unwrap();
+        thread.send(Job::Read(screen("aw", "AW2523HF")));
+        let start = std::time::Instant::now();
+        let report = loop {
+            if let Some(report) = thread.take_report() {
+                break report;
+            }
+            assert!(start.elapsed().as_secs() < 10, "no report");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(
+            report,
+            Report::Current {
+                device_path: "aw".into(),
+                input: Some(0x0F)
+            }
+        );
+        assert!(woken.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn probe_stops_when_the_toggle_is_switched_off() {
+        let opened = std::sync::Mutex::new(Vec::new());
+        let stop = AtomicBool::new(false);
+        let open = |monitor: &Monitor| {
+            opened.lock().unwrap().push(monitor.device_path.clone());
+            stop.store(true, Ordering::Relaxed);
+            None
+        };
+        let monitors = vec![screen("aw", "AW2523HF"), screen("one", "DELL P2210")];
+        assert_eq!(
+            run_job(Job::Probe(monitors), &|_: &Monitor| None, &open, &stop),
+            None
+        );
+        assert_eq!(*opened.lock().unwrap(), ["aw"], "read the next monitor");
     }
 
     #[test]
