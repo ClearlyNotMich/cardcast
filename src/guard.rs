@@ -299,7 +299,11 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             path.targetInfo.rotation,
             DISPLAYCONFIG_ROTATION_ROTATE90 | DISPLAYCONFIG_ROTATION_ROTATE270
         );
-        let (width, height) = desktop_size(source_mode.width, source_mode.height, sideways);
+        let (width, height) = desktop_size(
+            source_mode.width,
+            source_mode.height,
+            sideways && path.targetInfo.rotation.0 > 4,
+        );
         let gdi_name = wide_to_string(&source.viewGdiDeviceName);
         let graphics_card = cards
             .iter()
