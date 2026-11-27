@@ -60,12 +60,22 @@ jobs:
           sudo apt-get install -y pipewire pipewire-bin wireplumber
           export XDG_RUNTIME_DIR=$(mktemp -d)
           dbus-run-session -- sh -ec '
-            pipewire & wireplumber &
+            pipewire & pipewire=$!
+            wireplumber & wireplumber=$!
             for _ in $(seq 50); do wpctl status >/dev/null 2>&1 && break; sleep 0.2; done
             for sink in source card; do
               pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=cardcast-$sink node.nick=\"cardcast $sink\" media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"
             done
-            CARDCAST_NULL_SINKS=1 cargo test audio::linux::tests::null_sinks -- --nocapture
+            failed=0
+            CARDCAST_NULL_SINKS=1 cargo test audio::linux::tests::null_sinks -- --nocapture || failed=1
+            # Without WirePlumber nothing links the loopback (#50).
+            kill $wireplumber
+            CARDCAST_NO_WIREPLUMBER=1 cargo test audio::linux::tests::without_wireplumber -- --nocapture || failed=1
+            # A stopped PipeWire never answers pw-dump (#50).
+            kill -STOP $pipewire
+            CARDCAST_PIPEWIRE_STOPPED=1 cargo test audio::linux::tests::a_stopped_pipewire -- --nocapture || failed=1
+            kill -CONT $pipewire
+            exit $failed
           '
       - run: cargo build --release
       - if: runner.os == 'Windows'

@@ -1,9 +1,9 @@
 use super::*;
 use crate::audio::{RelayReport, SoundOutput, card_output};
 
-/// `pw-dump` on the sender (CachyOS, PipeWire 1.6.12), recorded 2026-11-28 and cut to the audio
-/// devices, the sinks and one source: the HD60 X's sink on the AMD integrated graphics'
-/// HDMI audio (`0000:0c:00.1`), and a USB headset.
+/// `pw-dump` on the sender (CachyOS, PipeWire 1.6.12), recorded 2026-11-28 and cut to the core's
+/// version, the audio devices, the sinks and one source: the HD60 X's sink on the AMD integrated
+/// graphics' HDMI audio (`0000:0c:00.1`), and a USB headset.
 const SENDER_DUMP: &str = include_str!("../../../tests/fixtures/sender-pw-dump.json");
 
 const HEADSET: &str =
@@ -289,5 +289,172 @@ fn the_loopback_records_the_audio_sources_monitor_and_stays_on_its_sinks() {
             "--playback-props",
             r#"target.object="odd \"name\"\\" node.dont-reconnect=true node.dont-fallback=true"#,
         ]
+    );
+}
+
+#[test]
+fn pipewire_or_wireplumber_below_the_minimum_refuses_the_relay() {
+    let wireplumber = |version: &str| {
+        format!(
+            "wireplumber\nCompiled with libwireplumber {version}\nLinked with libwireplumber {version}\n"
+        )
+    };
+    // Ubuntu 24.04 (CI) and the sender.
+    assert_eq!(supported("1.0.5", &wireplumber("0.4.17")), Ok(()));
+    assert_eq!(supported("1.6.12", &wireplumber("0.5.19")), Ok(()));
+    assert_eq!(supported("0.3.44", &wireplumber("0.4.12")), Ok(()));
+    assert_eq!(
+        supported("0.3.43", &wireplumber("0.5.19")),
+        Err("The audio relay needs PipeWire 0.3.44 or newer; this is PipeWire 0.3.43.".into())
+    );
+    // Ubuntu 22.04.
+    assert_eq!(
+        supported("0.3.48", &wireplumber("0.4.8")),
+        Err("The audio relay needs WirePlumber 0.4.12 or newer; this is WirePlumber 0.4.8.".into())
+    );
+    // WirePlumber before 0.4.12 does not print the version it runs.
+    for unknown in ["wireplumber\n", ""] {
+        assert_eq!(
+            supported("1.0.5", unknown),
+            Err(
+                "The audio relay needs WirePlumber 0.4.12 or newer; is WirePlumber installed?"
+                    .into()
+            )
+        );
+    }
+}
+
+#[test]
+fn the_pipewire_version_comes_from_the_dump() {
+    assert_eq!(pipewire_version(SENDER_DUMP), "1.6.12");
+    assert_eq!(pipewire_version("[]"), "");
+}
+
+/// A `pw-dump` with the audio source and output sinks, the loopback (process 4242) and `links`
+/// as (output node, input node): 10 the audio source, 20 the output, 31 and 32 the loopback's
+/// capture and playback streams, 40 another program's stream.
+fn loopback_dump(links: &[(u32, u32)]) -> String {
+    let node = |id: u32, client: u32, class: &str, name: &str| {
+        format!(
+            r#"{{"id": {id}, "type": "PipeWire:Interface:Node", "info": {{"props": {{"client.id": {client}, "media.class": "{class}", "node.name": "{name}"}}}}}}"#
+        )
+    };
+    let client = |id: u32, pid: u32| {
+        format!(
+            r#"{{"id": {id}, "type": "PipeWire:Interface:Client", "info": {{"props": {{"application.process.id": {pid}}}}}}}"#
+        )
+    };
+    let mut objects = vec![
+        client(5, 1000),
+        client(30, 4242),
+        client(41, 7000),
+        node(10, 5, "Audio/Sink", "speakers"),
+        node(20, 5, "Audio/Sink", "capture-card"),
+        node(31, 30, "Stream/Input/Audio", "input.cardcast"),
+        node(32, 30, "Stream/Output/Audio", "output.cardcast"),
+        node(40, 41, "Stream/Input/Audio", "recorder"),
+    ];
+    objects.extend(links.iter().map(|(output, input)| {
+        format!(
+            r#"{{"id": {}, "type": "PipeWire:Interface:Link", "info": {{"output-node-id": {output}, "input-node-id": {input}, "state": "active"}}}}"#,
+            1000 + output * 100 + input
+        )
+    }));
+    format!("[{}]", objects.join(","))
+}
+
+#[test]
+fn the_loopback_is_linked_only_from_the_audio_source_and_to_the_sound_output() {
+    let linked = |links: &[(u32, u32)]| {
+        loopback_linked(&loopback_dump(links), 4242, "speakers", "capture-card")
+    };
+    // Each of the two channels has its own link.
+    assert!(linked(&[(10, 31), (10, 31), (32, 20), (32, 20)]));
+    assert!(!linked(&[]), "no WirePlumber links nothing");
+    assert!(!linked(&[(10, 31)]), "nothing plays on the sound output");
+    assert!(!linked(&[(32, 20)]), "nothing records the audio source");
+    assert!(!linked(&[(10, 40), (32, 20)]), "another program records it");
+    assert!(!linked(&[(20, 31), (32, 10)]), "the sinks swapped");
+    assert!(
+        !linked(&[(10, 31), (32, 10)]),
+        "played back into the audio source"
+    );
+    assert!(
+        !loopback_linked(
+            &loopback_dump(&[(10, 31), (32, 20)]),
+            9999,
+            "speakers",
+            "capture-card"
+        ),
+        "another process's loopback"
+    );
+}
+
+#[test]
+fn a_loopback_whose_cardcast_is_gone_does_not_start() {
+    let spawn = |parent: u32| {
+        let mut command = Command::new("true");
+        die_with(&mut command, parent);
+        command.spawn().and_then(|mut child| child.wait())
+    };
+    assert!(spawn(std::process::id()).unwrap().success());
+    assert!(
+        spawn(u32::MAX).is_err(),
+        "reparented: cardcast died before prctl"
+    );
+}
+
+#[test]
+fn a_loopback_that_cannot_start_is_reported_in_plain_words() {
+    assert_eq!(
+        spawn_failed(&std::io::Error::from(std::io::ErrorKind::NotFound)),
+        "Could not start the audio relay: pw-loopback is not installed. Install PipeWire's tools (see README, Sound)."
+    );
+    assert_eq!(
+        spawn_failed(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        "Could not start the audio relay: pw-loopback did not run."
+    );
+}
+
+/// CI (`CARDCAST_NO_WIREPLUMBER`): PipeWire runs with the null sinks but no WirePlumber, so
+/// nothing links the loopback. Skips when unset.
+#[test]
+fn without_wireplumber_the_unlinked_relay_is_reported() {
+    if std::env::var_os("CARDCAST_NO_WIREPLUMBER").is_none() {
+        return;
+    }
+    let mut relay = crate::audio::new_relay(|| {});
+    relay.start(
+        "cardcast-source",
+        &SoundOutput::Automatic,
+        "",
+        "cardcast card",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let report = loop {
+        if let Some(report) = relay.take_report() {
+            break report;
+        }
+        assert!(std::time::Instant::now() < deadline, "no report");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(report, RelayReport::Failing(NOT_LINKED.into()));
+    relay.stop();
+}
+
+/// CI (`CARDCAST_PIPEWIRE_STOPPED`): the PipeWire daemon is stopped with SIGSTOP, so `pw-dump`
+/// never gets an answer. Skips when unset.
+#[test]
+fn a_stopped_pipewire_is_reported_after_the_timeout() {
+    if std::env::var_os("CARDCAST_PIPEWIRE_STOPPED").is_none() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    assert_eq!(crate::audio::playback_devices(), Err(NO_ANSWER.to_owned()));
+    let waited = started.elapsed();
+    eprintln!("waited {waited:?}");
+    assert!(
+        waited < DUMP_TIMEOUT + std::time::Duration::from_secs(2),
+        "waited {waited:?}"
     );
 }

@@ -1,6 +1,7 @@
 //! The Linux audio relay (docs/research/linux-support.md, section 3): PipeWire's `pw-loopback`
 //! records the audio source's monitor and plays it on the sound output, and `pw-dump` lists the
-//! sinks. Both come with PipeWire (Arch: `pipewire-audio`; Debian and Ubuntu: `pipewire-bin`).
+//! sinks. Both come with PipeWire (Arch: `pipewire-audio`; Debian and Ubuntu: `pipewire-bin`;
+//! Fedora: `pipewire-utils`), and WirePlumber links the loopback.
 
 use super::{AudioDevice, RelayReport, SoundOutput};
 use serde_json::Value;
@@ -21,6 +22,22 @@ const REPORT_AFTER: u32 = 3;
 /// How long `pw-loopback` must run before the relay counts as started: WirePlumber ends it within
 /// a second when a target is missing (WirePlumber 0.4.17 and 0.5.19, checked).
 const SETTLE: Duration = Duration::from_secs(2);
+/// How long `pw-dump` may take before PipeWire counts as not answering; it answers in well under
+/// a second.
+const DUMP_TIMEOUT: Duration = Duration::from_secs(3);
+const NO_ANSWER: &str = "PipeWire is not answering. Is it still running?";
+const NOT_LINKED: &str =
+    "PipeWire did not connect the audio relay. Is WirePlumber installed and running?";
+/// The first PipeWire with `target.object` (`PW_KEY_TARGET_OBJECT` in `src/pipewire/keys.h`, new
+/// at tag 0.3.44): <https://gitlab.freedesktop.org/pipewire/pipewire/-/blob/0.3.44/src/pipewire/keys.h>.
+const MIN_PIPEWIRE: (u32, u32, u32) = (0, 3, 44);
+/// WirePlumber links a stream to its `target.object` by node name from 0.4.9 (NEWS.rst: "policy-node
+/// now supports the 'target.object' key"), and a `node.dont-reconnect` stream with a target never
+/// falls back to the default sink (`src/scripts/policy-node.lua`); 0.5.0 documents
+/// `node.dont-fallback` (`docs/rst/policies/linking.rst`). 0.4.12 is the first whose `wireplumber
+/// --version` says which version runs (`src/main.c`), so older ones are refused as unknown:
+/// <https://gitlab.freedesktop.org/pipewire/wireplumber/-/blob/master/NEWS.rst>.
+const MIN_WIREPLUMBER: (u32, u32, u32) = (0, 4, 12);
 
 struct Running {
     stop: Arc<AtomicBool>,
@@ -136,7 +153,9 @@ fn relay(
     stop: &AtomicBool,
     opened: &mut dyn FnMut(),
 ) -> Result<(), RelayReport> {
-    let devices = playback_devices()?;
+    let dump = pw_dump()?;
+    supported(&pipewire_version(&dump), &wireplumber_version())?;
+    let devices = sinks(&dump).map_err(unreadable)?;
     let Some(output) = super::card_output(
         &devices,
         audio_source,
@@ -148,6 +167,7 @@ fn relay(
         return Ok(());
     };
     let mut loopback = Loopback::start(audio_source, &output.id)?;
+    let output = output.id.clone();
     let started = Instant::now();
     let mut settled = false;
     while !stop.load(Ordering::Relaxed) {
@@ -158,6 +178,9 @@ fn relay(
         }
         if !settled && started.elapsed() >= SETTLE {
             settled = true;
+            if !loopback_linked(&pw_dump()?, loopback.0.id(), audio_source, &output) {
+                return Err(NOT_LINKED.to_owned().into());
+            }
             opened();
         }
         std::thread::sleep(RETRY / 10);
@@ -171,28 +194,17 @@ struct Loopback(Child);
 
 impl Loopback {
     fn start(audio_source: &str, output: &str) -> Result<Self, String> {
-        use std::os::unix::process::CommandExt;
         let mut command = Command::new("pw-loopback");
         command
             .args(loopback_args(audio_source, output))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // SAFETY: prctl is async-signal-safe and touches no memory of the parent. It ends the
-        // loopback when the relay thread ends, so one never outlives a crashed cardcast.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command.spawn().map(Self).map_err(|error| {
-            format!(
-                "Could not start the audio relay; is PipeWire installed? (pw-loopback: {error})"
-            )
-        })
+        die_with(&mut command, std::process::id());
+        command
+            .spawn()
+            .map(Self)
+            .map_err(|error| spawn_failed(&error))
     }
 
     fn end(&mut self) {
@@ -205,6 +217,79 @@ impl Drop for Loopback {
     fn drop(&mut self) {
         self.end();
     }
+}
+
+/// Ends `command`'s process when the thread that spawns it ends, so a loopback never outlives a
+/// crashed cardcast; and does not start it when `parent` already died before that took hold.
+fn die_with(command: &mut std::process::Command, parent: u32) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: prctl and getppid are async-signal-safe, and the closure touches no memory of the
+    // parent and allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Reparented: the parent died between fork and prctl, so no signal will come.
+            if u32::try_from(libc::getppid()) != Ok(parent) {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Why `pw-loopback` did not start, in plain words.
+fn spawn_failed(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        "Could not start the audio relay: pw-loopback is not installed. Install PipeWire's tools (see README, Sound).".to_owned()
+    } else {
+        "Could not start the audio relay: pw-loopback did not run.".to_owned()
+    }
+}
+
+/// Whether `dump` shows the loopback of process `pid` recording the `audio_source` sink and
+/// playing on the `output` sink; without WirePlumber it runs but nothing links it.
+fn loopback_linked(dump: &str, pid: u32, audio_source: &str, output: &str) -> bool {
+    let Ok(objects) = serde_json::from_str::<Vec<Value>>(dump) else {
+        return false;
+    };
+    let of_type = |kind: &'static str| {
+        objects
+            .iter()
+            .filter(move |object| object["type"] == format!("PipeWire:Interface:{kind}"))
+    };
+    let props = |object: &Value| object.pointer("/info/props").cloned().unwrap_or_default();
+    let clients: Vec<&Value> = of_type("Client")
+        .filter(|client| props(client)["application.process.id"] == pid)
+        .map(|client| &client["id"])
+        .collect();
+    let nodes: Vec<(Value, Value, bool)> = of_type("Node")
+        .map(|node| {
+            let props = props(node);
+            let ours = clients.contains(&&props["client.id"]);
+            (node["id"].clone(), props["node.name"].clone(), ours)
+        })
+        .collect();
+    let sink = |name: &str| nodes.iter().find(|node| node.1 == name && !node.2);
+    let (Some(audio_source), Some(output)) = (sink(audio_source), sink(output)) else {
+        return false;
+    };
+    let ours = |id: &Value| nodes.iter().any(|node| &node.0 == id && node.2);
+    let links: Vec<(&Value, &Value)> = of_type("Link")
+        .map(|link| {
+            (
+                &link["info"]["output-node-id"],
+                &link["info"]["input-node-id"],
+            )
+        })
+        .collect();
+    links
+        .iter()
+        .any(|(from, to)| *from == &audio_source.0 && ours(to))
+        && links
+            .iter()
+            .any(|(from, to)| ours(from) && *to == &output.0)
 }
 
 /// `pw-loopback`'s arguments: record the monitor of the `audio_source` sink and play it on the
@@ -233,19 +318,95 @@ fn quoted(text: &str) -> String {
 
 /// The sinks PipeWire lists now.
 pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
-    let failed = |error: String| {
-        format!("Could not list playback devices; is PipeWire installed and running? ({error})")
-    };
-    let dump = Command::new("pw-dump")
+    sinks(&pw_dump()?).map_err(unreadable)
+}
+
+fn unreadable(_error: String) -> String {
+    "Could not read PipeWire's list of playback devices.".to_owned()
+}
+
+/// What `pw-dump` prints, ended after [`DUMP_TIMEOUT`] so a hung PipeWire can't hang cardcast.
+fn pw_dump() -> Result<String, String> {
+    let dump = Command::new("timeout")
+        .args([
+            "--kill-after=1",
+            &format!("{}", DUMP_TIMEOUT.as_secs()),
+            "pw-dump",
+        ])
         .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match dump.map(|dump| (dump.status.code(), dump.stdout)) {
+        Ok((Some(0), dump)) => Ok(String::from_utf8_lossy(&dump).into_owned()),
+        // timeout's codes: 124 timed out, 137 killed after it, 127 no pw-dump.
+        Ok((Some(124 | 137), _)) => Err(NO_ANSWER.to_owned()),
+        Ok((Some(127), _)) => Err("Could not list playback devices: pw-dump is not installed. Install PipeWire's tools (see README, Sound).".to_owned()),
+        _ => Err("Could not list playback devices. Is PipeWire running?".to_owned()),
+    }
+}
+
+/// The version of the PipeWire daemon in `dump`, empty if it is not there.
+fn pipewire_version(dump: &str) -> String {
+    serde_json::from_str::<Vec<Value>>(dump)
+        .unwrap_or_default()
+        .iter()
+        .find(|object| object["type"] == "PipeWire:Interface:Core")
+        .and_then(|core| core.pointer("/info/version")?.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// What `wireplumber --version` prints, empty if it does not run.
+fn wireplumber_version() -> String {
+    Command::new("wireplumber")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
         .output()
-        .map_err(|error| failed(format!("pw-dump: {error}")))?;
-    if !dump.status.success() {
-        return Err(failed(
-            String::from_utf8_lossy(&dump.stderr).trim().to_owned(),
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// Whether this PipeWire (its version) and WirePlumber (what `wireplumber --version` prints)
+/// keep each loopback stream on its own sink. Below [`MIN_PIPEWIRE`] and [`MIN_WIREPLUMBER`] a
+/// stream may fall back to the default sink and play the audio source back into itself.
+fn supported(pipewire: &str, wireplumber: &str) -> Result<(), String> {
+    let at_least = |version: &str, (major, minor, micro): (u32, u32, u32)| {
+        let mut parts = version.split('.').map(|part| {
+            part.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u32>()
+                .ok()
+        });
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(Some(a)), Some(Some(b)), Some(Some(c))) => (a, b, c) >= (major, minor, micro),
+            _ => false,
+        }
+    };
+    let wanted = |(major, minor, micro): (u32, u32, u32)| format!("{major}.{minor}.{micro}");
+    if !at_least(pipewire, MIN_PIPEWIRE) {
+        return Err(format!(
+            "The audio relay needs PipeWire {} or newer; this is PipeWire {pipewire}.",
+            wanted(MIN_PIPEWIRE)
         ));
     }
-    sinks(&String::from_utf8_lossy(&dump.stdout)).map_err(failed)
+    let Some(wireplumber) = wireplumber
+        .lines()
+        .find_map(|line| line.strip_prefix("Linked with libwireplumber "))
+        .map(str::trim)
+    else {
+        return Err(format!(
+            "The audio relay needs WirePlumber {} or newer; is WirePlumber installed?",
+            wanted(MIN_WIREPLUMBER)
+        ));
+    };
+    if !at_least(wireplumber, MIN_WIREPLUMBER) {
+        return Err(format!(
+            "The audio relay needs WirePlumber {} or newer; this is WirePlumber {wireplumber}.",
+            wanted(MIN_WIREPLUMBER)
+        ));
+    }
+    Ok(())
 }
 
 /// The playback devices (PipeWire's sinks) in `dump`, the JSON `pw-dump` prints: the id is the
