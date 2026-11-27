@@ -1,11 +1,13 @@
-//! audio module. Windows calls live here.
+//! audio module. Windows and Linux calls live here.
 
 // unsafe is opt-in per module; see Cargo.toml [lints].
 #![allow(
     unsafe_code,
-    reason = "SPEC allows unsafe only in mirror, guard and audio, for Windows API calls"
+    reason = "SPEC allows unsafe only in mirror, guard and audio, for platform calls"
 )]
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg_attr(
     not(windows),
     allow(
@@ -14,6 +16,8 @@
     )
 )]
 mod pacing;
+#[cfg(target_os = "linux")]
+pub use linux::container_id;
 #[cfg(windows)]
 mod relay;
 #[cfg_attr(
@@ -45,10 +49,6 @@ pub trait Relay {
 
 /// What the relay tells the status line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(windows),
-    allow(dead_code, reason = "only the Windows relay and the tests send them")
-)]
 pub enum RelayReport {
     /// It keeps failing, for this reason in plain words.
     Failing(String),
@@ -101,35 +101,15 @@ pub fn new_relay(wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
     Box::new(relay::WasapiRelay::new(wake))
 }
 
-/// What the status line keeps saying while the relay is not built for this platform (#36).
-#[cfg(windows)]
+/// The audio relay; `wake` asks the settings window to repaint when a report is waiting.
+#[cfg(target_os = "linux")]
+pub fn new_relay(wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
+    Box::new(linux::PipeWireRelay::new(wake))
+}
+
+/// What the status line keeps saying while the relay is not built for this platform (#36): it is
+/// built for both.
 pub const NOT_BUILT: Option<&str> = None;
-#[cfg(not(windows))]
-pub const NOT_BUILT: Option<&str> = Some("The audio relay does not work on Linux yet.");
-
-/// The Linux relay is not built yet (#36), so every start reports that.
-#[cfg(not(windows))]
-pub fn new_relay(_wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
-    Box::new(NotOnLinuxYet { started: false })
-}
-
-/// `started` until the start's report is taken.
-#[cfg(not(windows))]
-struct NotOnLinuxYet {
-    started: bool,
-}
-
-#[cfg(not(windows))]
-impl Relay for NotOnLinuxYet {
-    fn start(&mut self, _source: &str, _output: &SoundOutput, _container: &str, _name: &str) {
-        self.started = true;
-    }
-    fn stop(&mut self) {}
-    fn take_report(&mut self) -> Option<RelayReport> {
-        std::mem::take(&mut self.started)
-            .then(|| RelayReport::Failing(NOT_BUILT.unwrap_or_default().into()))
-    }
-}
 
 /// A playback device on the sender, as shown in the audio source dropdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,11 +225,8 @@ fn without_number(name: &str) -> &str {
     }
 }
 
-/// Linux lists no playback devices yet (#36); [`NOT_BUILT`] tells the user.
-#[cfg(not(windows))]
-pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
-    Ok(Vec::new())
-}
+#[cfg(target_os = "linux")]
+pub use linux::playback_devices;
 
 /// Active playback devices from WASAPI.
 #[cfg(windows)]
@@ -313,22 +290,6 @@ pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(not(windows))]
-    #[test]
-    fn on_linux_the_audio_relay_says_it_does_not_run_yet() {
-        let not_yet = "The audio relay does not work on Linux yet.";
-        assert_eq!(playback_devices(), Ok(Vec::new()));
-        assert_eq!(NOT_BUILT, Some(not_yet));
-        let mut relay = new_relay(|| {});
-        assert_eq!(relay.take_report(), None);
-        relay.start("speakers", &SoundOutput::Automatic, "card", "Elgato");
-        assert_eq!(
-            relay.take_report(),
-            Some(RelayReport::Failing(not_yet.into()))
-        );
-        assert_eq!(relay.take_report(), None);
-    }
 
     const CARD: &str = "card container";
 

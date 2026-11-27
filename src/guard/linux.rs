@@ -157,9 +157,14 @@ pub fn match_monitors(
                     text
                 }
             };
+            let edid_name = edid_name(edid);
             Monitor {
                 device_path: identity.unwrap_or_else(|| or_output_name(connector_id.clone())),
-                name: edid_name(edid).unwrap_or_else(|| or_output_name(output.description.clone())),
+                container_id: connector
+                    .zip(edid_name.as_deref())
+                    .map(|(connector, name)| crate::audio::container_id(&connector.card, name))
+                    .unwrap_or_default(),
+                name: edid_name.unwrap_or_else(|| or_output_name(output.description.clone())),
                 width: output.width,
                 height: output.height,
                 layout_size: output.layout_size,
@@ -172,7 +177,6 @@ pub fn match_monitors(
                 graphics_card: connector
                     .map(|connector| connector.graphics_card.clone())
                     .unwrap_or_default(),
-                container_id: String::new(),
                 connector: connector_id,
                 gdi_name: output.name,
             }

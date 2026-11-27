@@ -945,8 +945,7 @@ mod tests {
         assert_eq!(
             window.status.text(),
             "Choose a source monitor and a card display. \
-             | The mirror does not work on Linux yet. \
-             | The audio relay does not work on Linux yet."
+             | The mirror does not work on Linux yet."
         );
     }
 
