@@ -40,6 +40,10 @@ _Avoid_: Cursor lock, mouse fence
 The one playback device on the sender whose sound is carried to the receiver.
 _Avoid_: Channel, audio track
 
+**Sound output**:
+The playback device on the sender that the audio source is played to, so the capture card carries it: Automatic (the card display's own sound output), a chosen playback device, or No audio for a capture card without sound.
+_Avoid_: Audio sink, target device, card audio
+
 **Sender load**:
 The resources the sender spends on sending its screen instead of on the game. Keeping it near zero is the reason the project exists.
 _Avoid_: Overhead, CPU usage

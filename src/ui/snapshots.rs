@@ -10,6 +10,8 @@ use egui_kittest::kittest::Queryable;
 /// The sender's graphics card, and the processor's integrated graphics the card display is on.
 const RTX_4080: &str = "NVIDIA GeForce RTX 4080";
 const INTEGRATED: &str = "Integrated graphics";
+/// The card display and its playback device share this container ID.
+const CARD_CONTAINER: &str = "5D9736D1-BB58-4944-B8BA-CE1857311DC7";
 
 fn monitor(
     device_path: &str,
@@ -64,7 +66,17 @@ fn sender(status: Status) -> SettingsWindow {
             (2560, 180),
             RTX_4080,
         ),
-        monitor("card", "HD60 X", (1920, 1080), 60, (4480, 180), INTEGRATED),
+        Monitor {
+            container_id: CARD_CONTAINER.into(),
+            ..monitor(
+                "card",
+                "Elgato 1080p",
+                (1920, 1080),
+                60,
+                (4480, 180),
+                INTEGRATED,
+            )
+        },
     ];
     window.playback_devices = vec![
         AudioDevice {
@@ -78,6 +90,13 @@ fn sender(status: Status) -> SettingsWindow {
             name: "Headset".into(),
             description: "Headphones".into(),
             container_id: String::new(),
+        },
+        // In Display EDID mode the card display reads "Elgato 1080p", its playback device "HD60 X".
+        AudioDevice {
+            id: "hdmi".into(),
+            name: "HD60 X (Intel Display Audio)".into(),
+            description: "HD60 X".into(),
+            container_id: CARD_CONTAINER.into(),
         },
     ];
     window.settings.send_windows_to = Some("primary".into());
@@ -155,6 +174,44 @@ fn snapshot_guard_notice() {
         "\"Discord\" keeps going back to the card display; the guard stopped moving it.".into(),
     );
     snapshot("guard_notice", window);
+}
+
+#[test]
+fn snapshot_sound_output_automatic_found() {
+    let mut window = sender(Status::Running);
+    window.frame_rate.shown = Some(60.0);
+    snapshot("sound_output_automatic_found", window);
+}
+
+#[test]
+fn snapshot_sound_output_automatic_not_found() {
+    let mut window = sender(Status::Running);
+    window.frame_rate.shown = Some(60.0);
+    // No container ID, and the playback device is not named after the card display.
+    window.monitors[3].container_id = String::new();
+    let relay = super::tests::RecordingRelay::default();
+    relay.1.borrow_mut().push(RelayReport::NoSoundOutput(
+        "Sound output not found: Windows gave the card display no container ID, and no other playback device is named Elgato 1080p. Choose one, or No audio if the capture card has none.".into(),
+    ));
+    window.relay = Box::new(relay);
+    window.follow_reports();
+    snapshot("sound_output_automatic_not_found", window);
+}
+
+#[test]
+fn snapshot_sound_output_dialog() {
+    let mut window = sender(Status::Running);
+    window.frame_rate.shown = Some(60.0);
+    window.choosing_sound_output = Some(SoundOutput::Automatic);
+    snapshot("sound_output_dialog", window);
+}
+
+#[test]
+fn snapshot_sound_output_no_audio() {
+    let mut window = sender(Status::Running);
+    window.frame_rate.shown = Some(60.0);
+    window.settings.sound_output = SoundOutput::NoAudio;
+    snapshot("sound_output_no_audio", window);
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Settings model: saved choices, start-up refusal rules and the status line. No Windows calls.
 
+use crate::audio::{self, AudioDevice, SoundOutput};
 use crate::guard::{GuardReport, Monitor};
 use crate::mirror::{Ended, Mirror};
 use std::time::Duration;
@@ -40,6 +41,8 @@ pub struct StatusLine {
     pub mirror: Status,
     /// The audio relay's problem; cleared when it relays again, or on Start and Stop.
     pub audio: Option<String>,
+    /// Automatic found no sound output: the status line offers "Choose sound output".
+    pub choose_sound_output: bool,
     /// The guard's notice; kept until the guard clears it or the user dismisses it.
     pub guard: Option<String>,
     /// The notice the user dismissed; the guard re-sends it after every display change.
@@ -55,6 +58,7 @@ impl StatusLine {
         Self {
             mirror,
             audio: None,
+            choose_sound_output: false,
             guard: None,
             dismissed_guard: None,
             displays: None,
@@ -66,6 +70,7 @@ impl StatusLine {
     pub fn set_mirror(&mut self, mirror: Status) {
         self.mirror = mirror;
         self.audio = None;
+        self.choose_sound_output = false;
         self.other = None;
     }
 
@@ -266,6 +271,57 @@ pub fn follow_card_display(settings: &mut Settings, monitors: &[Monitor]) -> boo
         )
 }
 
+/// The "Sound output" line's value: No audio, the chosen playback device while it is connected,
+/// else "Automatic" with what it finds for the card display now.
+pub fn sound_output_label(
+    settings: &Settings,
+    devices: &[AudioDevice],
+    card_display: Option<&Monitor>,
+) -> String {
+    let source = settings.audio_source.as_deref();
+    match &settings.sound_output {
+        SoundOutput::NoAudio => return "No audio".into(),
+        SoundOutput::Device(id) => {
+            if let Some(device) = devices
+                .iter()
+                .find(|device| &device.id == id && Some(id.as_str()) != source)
+            {
+                return device.name.clone();
+            }
+        }
+        SoundOutput::Automatic => {}
+    }
+    let (Some(source), Some(card_display)) = (source, card_display) else {
+        return "Automatic".into();
+    };
+    match audio::card_output(
+        devices,
+        source,
+        &SoundOutput::Automatic,
+        &card_display.container_id,
+        &card_display.name,
+    ) {
+        Ok(Some(device)) => format!("Automatic · {}", device.name),
+        _ => "Automatic · not found".into(),
+    }
+}
+
+/// The sound output dialog's choices: Automatic, every playback device but the audio source, No audio.
+pub fn sound_output_choices(
+    devices: &[AudioDevice],
+    audio_source: Option<&str>,
+) -> Vec<(SoundOutput, String)> {
+    let mut choices = vec![(SoundOutput::Automatic, "Automatic".to_owned())];
+    choices.extend(
+        devices
+            .iter()
+            .filter(|device| Some(device.id.as_str()) != audio_source)
+            .map(|device| (SoundOutput::Device(device.id.clone()), device.name.clone())),
+    );
+    choices.push((SoundOutput::NoAudio, "No audio".to_owned()));
+    choices
+}
+
 /// The user's choices. Monitors are stored by their display-configuration device path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -273,6 +329,7 @@ pub struct Settings {
     pub card_display: Option<String>,
     pub send_windows_to: Option<String>,
     pub audio_source: Option<String>,
+    pub sound_output: SoundOutput,
     /// The card display's connector ([`Monitor::connector`]), to find it when its device path changes.
     pub card_display_connector: Option<String>,
     pub guard_enabled: bool,
@@ -286,6 +343,7 @@ impl Default for Settings {
             card_display: None,
             send_windows_to: None,
             audio_source: None,
+            sound_output: SoundOutput::Automatic,
             card_display_connector: None,
             guard_enabled: true,
         }
@@ -336,6 +394,7 @@ impl Settings {
                 text.push_str(&format!("{key}={value}\n"));
             }
         }
+        text.push_str(&format!("sound_output={}\n", self.sound_output.to_text()));
         text.push_str(&format!("guard_enabled={}\n", self.guard_enabled));
         text
     }
@@ -351,6 +410,9 @@ impl Settings {
                 "send_windows_to" => settings.send_windows_to = value,
                 "audio_source" => settings.audio_source = value,
                 "card_display_connector" => settings.card_display_connector = value,
+                "sound_output" => {
+                    settings.sound_output = SoundOutput::from_text(value.as_deref().unwrap_or(""));
+                }
                 "guard_enabled" => settings.guard_enabled = value.as_deref() == Some("true"),
                 _ => {}
             }
@@ -390,10 +452,82 @@ mod tests {
             card_display: Some(r"\\?\DISPLAY#ELG1#5&2&UID2".into()),
             send_windows_to: Some(r"\\?\DISPLAY#DEL1#5&3&UID3".into()),
             audio_source: Some("{0.0.0.00000000}.{abc}".into()),
+            sound_output: SoundOutput::Device("{0.0.0.00000000}.{hdmi}".into()),
             card_display_connector: Some(r"\\?\PCI#VEN_8086#3&1&0#{guid} target 4353".into()),
             guard_enabled: true,
         };
         assert_eq!(Settings::from_text(&saved.to_text()), saved);
+    }
+
+    fn playback(id: &str, name: &str, container_id: &str) -> AudioDevice {
+        AudioDevice {
+            id: id.into(),
+            name: name.into(),
+            description: name.into(),
+            container_id: container_id.into(),
+        }
+    }
+
+    /// The sender in Display EDID mode: the card display reads "Elgato 1080p", its playback device "HD60 X".
+    fn sound_devices() -> (Vec<AudioDevice>, Monitor) {
+        let devices = vec![
+            playback("speakers", "Speakers", "computer"),
+            playback("hdmi", "HD60 X", "card container"),
+        ];
+        let card = Monitor {
+            name: "Elgato 1080p".into(),
+            container_id: "card container".into(),
+            ..monitor("card", false)
+        };
+        (devices, card)
+    }
+
+    fn with_output(output: SoundOutput) -> Settings {
+        Settings {
+            audio_source: Some("speakers".into()),
+            sound_output: output,
+            ..chosen("source", "card")
+        }
+    }
+
+    #[test]
+    fn sound_output_line_names_the_choice_and_what_automatic_finds() {
+        let (devices, card) = sound_devices();
+        let label = |output, card: Option<&Monitor>| {
+            sound_output_label(&with_output(output), &devices, card)
+        };
+        assert_eq!(
+            label(SoundOutput::Automatic, Some(&card)),
+            "Automatic · HD60 X"
+        );
+        let unknown = Monitor {
+            container_id: String::new(),
+            ..card.clone()
+        };
+        assert_eq!(
+            label(SoundOutput::Automatic, Some(&unknown)),
+            "Automatic · not found"
+        );
+        assert_eq!(label(SoundOutput::Automatic, None), "Automatic");
+        assert_eq!(label(SoundOutput::NoAudio, Some(&card)), "No audio");
+        assert_eq!(label(SoundOutput::Device("hdmi".into()), None), "HD60 X");
+        assert_eq!(
+            label(SoundOutput::Device("gone".into()), Some(&card)),
+            "Automatic · HD60 X"
+        );
+    }
+
+    #[test]
+    fn sound_output_choices_leave_out_the_audio_source() {
+        let (devices, _) = sound_devices();
+        assert_eq!(
+            sound_output_choices(&devices, Some("speakers")),
+            [
+                (SoundOutput::Automatic, "Automatic".to_owned()),
+                (SoundOutput::Device("hdmi".into()), "HD60 X".to_owned()),
+                (SoundOutput::NoAudio, "No audio".to_owned()),
+            ]
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ Terms in bold in `GLOSSARY.md` are used with exactly that meaning here. `docs/ad
 ## 2. Setup it assumes
 
 - Two Windows PCs. The sender runs the game; the receiver runs OBS.
-- A capture card connected to the receiver over USB, with its HDMI input plugged into the sender's graphics card. Tested cards: Elgato HD60 X and AVerMedia Live Gamer Mini.
+- A capture card connected to the receiver over USB, with its HDMI input plugged into the sender's graphics card. Any capture card works that shows up in Windows as a monitor; its sound, if it has any, as a playback device. Tested reference cards: Elgato HD60 X and AVerMedia Live Gamer Mini.
 - The card display is set to **Extend** in Windows, never Duplicate.
 - The card display may be plugged into the same graphics card as the source monitor, or into another one (a second GPU or the integrated GPU); then the mirror converts the picture on the source monitor's card and Windows copies it across (ADR 0003).
 - The source monitor may run with Windows HDR on or off. The card display is always SDR.
@@ -28,8 +28,8 @@ Terms in bold in `GLOSSARY.md` are used with exactly that meaning here. `docs/ad
 - The source monitor keeps its refresh rate and the game is not measurably slower. See the pass line in section 9.
 - When the source monitor is in HDR, the mirror is converted to SDR and its colours look the same on the receiver as the OBS fullscreen projector's do today.
 - No window ever stays on the card display, and the mouse pointer cannot stay there either.
-- The chosen audio source is played to the card display's sound output, so the capture card carries sound.
-- A settings window with: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, Start/Stop button, guard checkbox.
+- The chosen audio source is played to the sound output, so the capture card carries sound. A capture card without sound works with No audio.
+- A settings window with: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, sound output line, Start/Stop button, guard checkbox.
 - Choices are remembered. On launch the mirror starts by itself. If the capture card is unplugged and plugged back in, the mirror resumes by itself.
 
 **Non-goals**
@@ -86,16 +86,19 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 ## 6. Settings window
 
 - Built with `egui` (`eframe`). It must use no CPU while minimised.
-- Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, Start/Stop button, guard checkbox, and the status: the header names the state (starting, running, waiting for card display, waiting for source monitor, restarting, stopped by an error), and a line under the controls gives the error, restart reason or notice in plain words when there is one.
+- Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, a "Sound output: <choice> · Change" line under it, Start/Stop button, guard checkbox, and the status: the header names the state (starting, running, waiting for card display, waiting for source monitor, restarting, stopped by an error), and a line under the controls gives the error, restart reason or notice in plain words when there is one.
 - Dropdowns show each monitor's name, resolution and refresh rate.
-- Settings are saved when changed and loaded at launch.
+- Settings are saved when changed and loaded at launch. Few settings, safe defaults: an invalid choice is refused, not warned about.
+- "Change" opens a dialog with one dropdown (Automatic, the playback devices except the audio source, No audio) and Save / Cancel. When Automatic finds no sound output, the status line says why and shows a "Choose sound output" button that opens the same dialog.
 - The window repaints on user input or when the mirror or window guard reports a status change. While the mirror starts, runs or restarts, its status indicator and the dots travelling along the live layout's arc animate at most about 30 times a second while the window has focus. Without focus nothing animates, and only a running mirror's frame rate refreshes, once a second; never while minimised.
 - Closing the window quits cardcast. When launched with saved settings that start the mirror successfully, the window starts minimised.
 - On Linux the window runs with the mirror and window guard replaced by stand-ins, so the layout can be checked during development.
 
 ## 7. Audio
 
-- The audio source is one playback device on the sender, chosen in the dropdown. cardcast records what that device plays and plays it again on the card display's sound output.
+- The audio source is one playback device on the sender, chosen in the dropdown. cardcast records what that device plays and plays it again on the sound output.
+- The sound output setting is Automatic (default), a chosen playback device, or No audio. Automatic picks the one playback device with the card display's container ID (Windows gives a monitor and its HDMI or DisplayPort sound output the same one), else the one playback device other than the audio source named after the card display; a name that fits several devices counts as not found. A chosen device that is not connected falls back to Automatic. The audio source can't be the sound output. No audio runs the mirror without the relay.
+- Audio problems never stop or hold up the mirror; they show in the status line.
 - The sender keeps hearing the audio source normally.
 - Which programs play into the audio source is decided in Windows' own per-app sound settings, not in cardcast.
 - Audio starts and stops with the mirror, and resumes with it after the card is re-plugged.
@@ -121,7 +124,7 @@ v1 contains every part below. Each part is handed over as a test build when it i
 | --- | --- |
 | Guard | A window moved to the card display with Win+Shift+Arrow goes to the "send windows to" monitor at once, without taking focus. A window already there at launch does the same. The pointer cannot be parked on the card display. |
 | Mirror | OBS on the receiver shows the source monitor through the capture card at 1080p60, pointer included. With HDR on, colours match the OBS fullscreen projector's. The source monitor still reports 500 Hz. Unplugging and re-plugging the card restores the mirror with no clicks. Restarting cardcast restores the mirror with no clicks. |
-| Audio | The receiver hears the chosen audio source through the capture card, and the sender still hears it normally. |
+| Audio | The receiver hears the chosen audio source through the capture card, and the sender still hears it normally, with the sound output on Automatic. With No audio the mirror runs without sound. Checked on the reference cards. |
 
 **Capture check, before the mirror is written.** In OBS on the sender, switch Display Capture's method from Automatic to Windows Graphics Capture with Force SDR on, keep the fullscreen projector running, and play. If the game feels the same, the colours look right on the receiver and no yellow border shows, the mirror uses Windows Graphics Capture. Otherwise it uses Desktop Duplication.
 
