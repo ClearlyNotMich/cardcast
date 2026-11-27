@@ -27,12 +27,18 @@ jobs:
         with:
           name: cardcast-exe
           path: target/release/cardcast.exe
-      # The artifact zip drops the executable bit: chmod +x cardcast after unzipping.
+      # A tarball keeps cardcast's executable bit, which the artifact zip would drop.
+      - if: runner.os == 'Linux'
+        run: |
+          mkdir cardcast-linux-x86_64
+          cp target/release/cardcast LICENSE README.md cardcast-linux-x86_64/
+          tar -czf cardcast-linux-x86_64.tar.gz cardcast-linux-x86_64
+          tar -tvzf cardcast-linux-x86_64.tar.gz | grep -q -- '-rwx.* cardcast-linux-x86_64/cardcast$'
       - if: runner.os == 'Linux'
         uses: actions/upload-artifact@v7
         with:
-          name: cardcast-linux
-          path: target/release/cardcast
+          name: cardcast-linux-x86_64.tar.gz
+          path: cardcast-linux-x86_64.tar.gz
       - if: runner.os == 'Windows'
         name: Check embedded DPI manifest
         shell: pwsh

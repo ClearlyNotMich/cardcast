@@ -63,12 +63,13 @@ struct SettingsWindow {
 impl SettingsWindow {
     fn new(context: &egui::Context) -> Self {
         let mut status = StatusLine::new(Status::Stopped);
+        status.displays = not_built_yet();
         let monitors = guard::monitors().unwrap_or_else(|error| {
             status.other = Some(error);
             Vec::new()
         });
         let playback_devices = audio::playback_devices().unwrap_or_else(|error| {
-            status.other = settings::notices(status.other.take(), Some(error));
+            status.other = Some(error);
             Vec::new()
         });
         let mut settings = Settings::load();
@@ -93,7 +94,9 @@ impl SettingsWindow {
                 displays_changed.store(true, Ordering::Relaxed);
                 context.request_repaint();
             })
-            .map_err(|error| status.displays = Some(error))
+            .map_err(|error| {
+                status.displays = settings::notices(status.displays.take(), Some(error))
+            })
             .ok()
         };
         Self {
@@ -535,6 +538,15 @@ impl SettingsWindow {
     }
 }
 
+/// The parts not built for this platform yet (#36): a lasting notice that Start and Stop don't clear.
+fn not_built_yet() -> Option<String> {
+    let parts: Vec<&str> = [guard::NOT_BUILT, mirror::NOT_BUILT, audio::NOT_BUILT]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(" | "))
+}
+
 fn update_guard(guard: &mut dyn Guard, settings: &Settings) {
     guard.update(
         settings.guard_enabled,
@@ -815,6 +827,23 @@ mod tests {
         window.relay = Box::new(relay.clone());
         window.settings.audio_source = audio_source.map(str::to_owned);
         (window, relay)
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn on_linux_start_keeps_saying_what_does_not_work_yet() {
+        let mut window = window("card");
+        window.monitors = guard::monitors().unwrap();
+        window.settings = Settings::default();
+        window.status.displays = not_built_yet();
+        window.start();
+        assert_eq!(
+            window.status.text(),
+            "Choose a source monitor and a card display. \
+             | The monitor list does not work on Linux yet. \
+             | The mirror does not work on Linux yet. \
+             | The audio relay does not work on Linux yet."
+        );
     }
 
     #[test]

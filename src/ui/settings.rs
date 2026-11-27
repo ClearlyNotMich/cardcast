@@ -49,7 +49,8 @@ pub struct StatusLine {
     pub guard: Option<String>,
     /// The notice the user dismissed; the guard re-sends it after every display change.
     dismissed_guard: Option<String>,
-    /// The display watcher could not start; kept until cardcast restarts.
+    /// The display watcher could not start, or parts are not built for this platform yet; kept
+    /// until cardcast restarts.
     pub displays: Option<String>,
     /// A settings or monitor-list problem; cleared on Start and Stop.
     pub other: Option<String>,

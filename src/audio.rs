@@ -101,8 +101,11 @@ pub fn new_relay(wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
     Box::new(relay::WasapiRelay::new(wake))
 }
 
+/// What the status line keeps saying while the relay is not built for this platform (#36).
+#[cfg(windows)]
+pub const NOT_BUILT: Option<&str> = None;
 #[cfg(not(windows))]
-const NOT_ON_LINUX_YET: &str = "The audio relay does not work on Linux yet.";
+pub const NOT_BUILT: Option<&str> = Some("The audio relay does not work on Linux yet.");
 
 /// The Linux relay is not built yet (#36), so every start reports that.
 #[cfg(not(windows))]
@@ -123,7 +126,8 @@ impl Relay for NotOnLinuxYet {
     }
     fn stop(&mut self) {}
     fn take_report(&mut self) -> Option<RelayReport> {
-        std::mem::take(&mut self.started).then(|| RelayReport::Failing(NOT_ON_LINUX_YET.into()))
+        std::mem::take(&mut self.started)
+            .then(|| RelayReport::Failing(NOT_BUILT.unwrap_or_default().into()))
     }
 }
 
@@ -241,10 +245,10 @@ fn without_number(name: &str) -> &str {
     }
 }
 
-/// Linux lists no playback devices yet (#36).
+/// Linux lists no playback devices yet (#36); [`NOT_BUILT`] tells the user.
 #[cfg(not(windows))]
 pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
-    Err(NOT_ON_LINUX_YET.into())
+    Ok(Vec::new())
 }
 
 /// Active playback devices from WASAPI.
@@ -314,7 +318,8 @@ mod tests {
     #[test]
     fn on_linux_the_audio_relay_says_it_does_not_run_yet() {
         let not_yet = "The audio relay does not work on Linux yet.";
-        assert_eq!(playback_devices(), Err(not_yet.into()));
+        assert_eq!(playback_devices(), Ok(Vec::new()));
+        assert_eq!(NOT_BUILT, Some(not_yet));
         let mut relay = new_relay(|| {});
         assert_eq!(relay.take_report(), None);
         relay.start("speakers", &SoundOutput::Automatic, "card", "Elgato");

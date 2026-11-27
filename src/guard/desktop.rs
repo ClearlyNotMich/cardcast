@@ -17,16 +17,18 @@ pub enum Desktop {
 /// `None` outside a graphical session.
 pub fn detect(var: impl Fn(&str) -> Option<String>) -> Option<Desktop> {
     let set = |name| var(name).is_some_and(|value| !value.is_empty());
-    // XDG_SESSION_TYPE may be missing outside a login manager; Xwayland sets DISPLAY on Wayland too.
-    let wayland = match var("XDG_SESSION_TYPE").as_deref() {
-        Some("wayland") => true,
-        Some("x11") => false,
-        _ if set("WAYLAND_DISPLAY") => true,
-        _ if set("DISPLAY") => false,
-        _ => return None,
-    };
-    if !wayland {
-        return Some(Desktop::X11);
+    // A compositor's own socket and WAYLAND_DISPLAY name the compositor cardcast runs in, even nested
+    // in another session whose XDG_SESSION_TYPE and XDG_CURRENT_DESKTOP it inherited.
+    if set("SWAYSOCK") {
+        return Some(Desktop::Sway);
+    }
+    if set("HYPRLAND_INSTANCE_SIGNATURE") {
+        return Some(Desktop::Hyprland);
+    }
+    let session = var("XDG_SESSION_TYPE");
+    // Xwayland sets DISPLAY on Wayland too, so DISPLAY counts only without a Wayland session.
+    if !set("WAYLAND_DISPLAY") && session.as_deref() != Some("wayland") {
+        return (session.as_deref() == Some("x11") || set("DISPLAY")).then_some(Desktop::X11);
     }
     // XDG_CURRENT_DESKTOP is a colon-separated list, for example "ubuntu:GNOME".
     let current = var("XDG_CURRENT_DESKTOP").unwrap_or_default();
@@ -39,9 +41,9 @@ pub fn detect(var: impl Fn(&str) -> Option<String>) -> Option<Desktop> {
         Desktop::PlasmaWayland
     } else if named("GNOME") {
         Desktop::GnomeWayland
-    } else if named("sway") || set("SWAYSOCK") {
+    } else if named("sway") {
         Desktop::Sway
-    } else if named("Hyprland") || set("HYPRLAND_INSTANCE_SIGNATURE") {
+    } else if named("Hyprland") {
         Desktop::Hyprland
     } else {
         Desktop::OtherWayland
@@ -121,6 +123,32 @@ mod tests {
     fn an_x11_session_is_x11_whatever_the_desktop() {
         let plasma = [("XDG_SESSION_TYPE", "x11"), ("XDG_CURRENT_DESKTOP", "KDE")];
         assert_eq!(on(&plasma), Some(Desktop::X11));
+    }
+
+    #[test]
+    fn a_nested_compositor_wins_over_the_session_it_runs_in() {
+        // sway or Hyprland started inside Plasma inherit Plasma's desktop name.
+        let sway_in_plasma = [
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("XDG_CURRENT_DESKTOP", "KDE"),
+            ("WAYLAND_DISPLAY", "wayland-1"),
+            ("SWAYSOCK", "/run/user/1000/sway-ipc.sock"),
+        ];
+        assert_eq!(on(&sway_in_plasma), Some(Desktop::Sway));
+        let hyprland_in_gnome = [
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("XDG_CURRENT_DESKTOP", "GNOME"),
+            ("HYPRLAND_INSTANCE_SIGNATURE", "abc_123"),
+        ];
+        assert_eq!(on(&hyprland_in_gnome), Some(Desktop::Hyprland));
+        // A Wayland compositor nested in an X11 session.
+        let river_in_x11 = [
+            ("XDG_SESSION_TYPE", "x11"),
+            ("XDG_CURRENT_DESKTOP", "river"),
+            ("DISPLAY", ":0"),
+            ("WAYLAND_DISPLAY", "wayland-1"),
+        ];
+        assert_eq!(on(&river_in_x11), Some(Desktop::OtherWayland));
     }
 
     #[test]

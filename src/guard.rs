@@ -136,10 +136,16 @@ impl Guard for NotOnLinuxYet {
     }
 }
 
-/// Linux lists no monitors yet (#36).
+/// What the status line keeps saying while the monitor list is not built for this platform (#36).
+#[cfg(windows)]
+pub const NOT_BUILT: Option<&str> = None;
+#[cfg(not(windows))]
+pub const NOT_BUILT: Option<&str> = Some("The monitor list does not work on Linux yet.");
+
+/// Linux lists no monitors yet (#36); [`NOT_BUILT`] tells the user.
 #[cfg(not(windows))]
 pub fn monitors() -> Result<Vec<Monitor>, String> {
-    Err("The monitor list does not work on Linux yet.".into())
+    Ok(Vec::new())
 }
 
 /// Active display paths and modes from `QueryDisplayConfig`.
@@ -731,10 +737,11 @@ mod linux_tests {
     use super::*;
 
     #[test]
-    fn on_linux_the_monitor_list_says_it_does_not_work_yet() {
+    fn on_linux_the_monitor_list_is_empty_and_says_it_does_not_work_yet() {
+        assert_eq!(monitors(), Ok(Vec::new()));
         assert_eq!(
-            monitors(),
-            Err("The monitor list does not work on Linux yet.".into())
+            NOT_BUILT,
+            Some("The monitor list does not work on Linux yet.")
         );
     }
 
@@ -748,7 +755,7 @@ mod linux_tests {
         guard.update(true, Some("card"), None);
         assert_eq!(guard.take_report(), Some(not_yet.clone()));
         assert_eq!(guard.take_report(), None);
-        // A dismissed notice comes back after a display change, as on Windows.
+        // A display change re-sends the notice while the guard is on, as the Windows guard does.
         guard.follow_displays();
         assert_eq!(guard.take_report(), Some(not_yet));
         guard.update(false, Some("card"), None);

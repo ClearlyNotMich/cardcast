@@ -123,6 +123,12 @@ pub fn shown_at() -> Option<(i32, i32)> {
     window::shown_at()
 }
 
+/// What the status line keeps saying while the mirror is not built for this platform (#36).
+#[cfg(windows)]
+pub const NOT_BUILT: Option<&str> = None;
+#[cfg(not(windows))]
+pub const NOT_BUILT: Option<&str> = Some("The mirror does not work on Linux yet.");
+
 /// The Linux mirror is not built yet (#36), so every start fails and says so.
 #[cfg(not(windows))]
 pub fn new_mirror(_wake: impl Fn() + Send + Sync + 'static) -> Box<dyn Mirror> {
@@ -135,7 +141,7 @@ struct NotOnLinuxYet;
 #[cfg(not(windows))]
 impl Mirror for NotOnLinuxYet {
     fn start(&mut self, _source_monitor: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
-        Err(Ended::Stop("The mirror does not work on Linux yet.".into()))
+        Err(Ended::Stop(NOT_BUILT.unwrap_or_default().into()))
     }
     fn stop(&mut self) {}
     fn is_running(&self) -> bool {
@@ -372,6 +378,7 @@ mod tests {
             container_id: String::new(),
             connector: String::new(),
         };
+        assert_eq!(NOT_BUILT, Some("The mirror does not work on Linux yet."));
         let mut mirror = new_mirror(|| {});
         assert_eq!(
             mirror.start(&monitor, &monitor),

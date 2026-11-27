@@ -4,7 +4,7 @@ Nov 23, 2026 · @Mich
 
 ## 1. Summary
 
-cardcast is a small Windows program for dual-PC streaming with a capture card. It runs on the sender and does three things: it shows a mirror of the source monitor on the card display, it keeps windows and the mouse pointer off the card display, and it plays the chosen audio source into the capture card.
+cardcast is a small Windows and Linux program for dual-PC streaming with a capture card (Linux: ADR 0004). It runs on the sender and does three things: it shows a mirror of the source monitor on the card display, it keeps windows and the mouse pointer off the card display, and it plays the chosen audio source into the capture card.
 
 The receiver needs no cardcast software. OBS on the receiver adds the capture card as a video source.
 
@@ -14,11 +14,11 @@ Terms in bold in `GLOSSARY.md` are used with exactly that meaning here. `docs/ad
 
 ## 2. Setup it assumes
 
-- Two Windows PCs. The sender runs the game; the receiver runs OBS.
-- A capture card connected to the receiver over USB, with its HDMI input plugged into the sender's graphics card. Any capture card works that shows up in Windows as a monitor; its sound, if it has any, as a playback device. Tested reference cards: Elgato HD60 X and AVerMedia Live Gamer Mini.
-- The card display is set to **Extend** in Windows, never Duplicate.
-- The card display may be plugged into the same graphics card as the source monitor, or into another one (a second GPU or the integrated GPU); then the mirror converts the picture on the source monitor's card and Windows copies it across (ADR 0003).
-- The source monitor may run with Windows HDR on or off. The card display is always SDR.
+- Two PCs. The sender runs the game, on Windows or on Linux (X11 or Wayland: Plasma, GNOME, sway, Hyprland or another compositor); the receiver runs OBS. The reference Linux sender runs CachyOS with KDE Plasma on Wayland.
+- A capture card connected to the receiver over USB, with its HDMI input plugged into the sender's graphics card. Any capture card works that shows up on the sender as a monitor; its sound, if it has any, as a playback device (on Linux, a PipeWire sink). Tested reference cards: Elgato HD60 X and AVerMedia Live Gamer Mini.
+- The card display is set to **Extend** in Windows, never Duplicate; on Linux it is a separate output in the desktop's display settings, never mirrored.
+- The card display may be plugged into the same graphics card as the source monitor, or into another one (a second GPU or the integrated GPU); then the mirror converts the picture on the source monitor's card and Windows copies it across (ADR 0003). On Linux the compositor shows the mirror on the other graphics card's output (`docs/research/linux-support.md`, section 2).
+- The source monitor may run with HDR on or off (Windows HDR, or the desktop's HDR on Linux). The card display is always SDR.
 
 ## 3. Goals and non-goals
 
@@ -118,7 +118,7 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 
 ## 9. Build, test and acceptance
 
-Code is written on Linux. GitHub Actions builds the Windows `.exe` (`cardcast-exe`) and the Linux binary (`cardcast-linux`) on every push and attaches both to the run. The project owner downloads them and tests them on the sender, in Windows and on CachyOS with KDE Plasma on Wayland. The Windows mirror and guards cannot be run on Linux.
+Code is written on Linux. GitHub Actions builds the Windows `.exe` (`cardcast-exe`) and the Linux tarball (`cardcast-linux-x86_64.tar.gz`) on every push and attaches both to the run. The project owner downloads them and tests them on the sender, in Windows and on CachyOS with KDE Plasma on Wayland. The Windows mirror and guards cannot be run on Linux.
 
 CI must pass `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` and `cargo build --release` on Windows and Linux. The Linux CI desktops come with the Linux parts (research section 9): Xvfb with openbox, headless sway with xdg-desktop-portal-wlr and PipeWire, and `kwin_wayland --virtual`. GNOME, NVIDIA, HDR colours and game load stay owner checks.
 
