@@ -43,10 +43,10 @@ jobs:
           export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
           export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-? | head -n 1)")
           swaymsg -t get_outputs
-          CARDCAST_EXPECT_MONITORS='HEADLESS-1 1920x1080+0+0 primary; HEADLESS-2 1920x1080+1920+0' \
+          CARDCAST_EXPECT_MONITORS='HEADLESS-1 1280x720+1280+0; HEADLESS-2 1280x720+0+0 primary' \
             cargo test guard::linux::tests::desktop_lists -- --nocapture
           CARDCAST_PLUG_COMMAND='swaymsg create_output' \
-          CARDCAST_EXPECT_PLUGGED='HEADLESS-1 1920x1080+0+0 primary; HEADLESS-2 1920x1080+1920+0; HEADLESS-3 1920x1080+3840+0' \
+          CARDCAST_EXPECT_PLUGGED='HEADLESS-1 1280x720+1280+0; HEADLESS-2 1280x720+0+0 primary; HEADLESS-3 1280x720+2560+0' \
             cargo test guard::linux::tests::desktop_hotplug -- --nocapture
       - run: cargo build --release
       - if: runner.os == 'Windows'

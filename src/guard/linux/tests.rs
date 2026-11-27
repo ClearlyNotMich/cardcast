@@ -313,13 +313,13 @@ fn two_monitors_with_the_same_serial_keep_apart_by_their_connector() {
 }
 
 /// `CARDCAST_EXPECT_MONITORS` (set by CI's Xvfb and headless sway steps): the monitor list,
-/// `<output> <width>x<height>+<left>+<top>[ primary]` joined by `; `. Skips when unset.
+/// `<output> <width>x<height>+<left>+<top>[ primary]` by output name, joined by `; `. Skips when unset.
 fn expected_monitors() -> Option<String> {
     std::env::var("CARDCAST_EXPECT_MONITORS").ok()
 }
 
 fn listed(monitors: &[Monitor]) -> String {
-    let each: Vec<String> = monitors
+    let mut each: Vec<String> = monitors
         .iter()
         .map(|m| {
             format!(
@@ -333,6 +333,8 @@ fn listed(monitors: &[Monitor]) -> String {
             )
         })
         .collect();
+    // The compositor's order is its own; sway announces its outputs last to first.
+    each.sort();
     each.join("; ")
 }
 
