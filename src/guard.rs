@@ -55,8 +55,13 @@ pub struct Monitor {
     /// name (`HDMI-A-2`). Changes between boots, so never saved.
     pub gdi_name: String,
     pub name: String,
+    /// The resolution in real pixels, after the monitor's rotation; the dropdowns show it and the mirror uses it.
     pub width: u32,
     pub height: u32,
+    /// The size in the desktop's coordinates, which `left` and `top` are in; the live layout draws
+    /// it. On Wayland these are logical pixels, so a scaled monitor's is smaller than its resolution;
+    /// on Windows it is the resolution, and on X11 too unless `xrandr --scale` stretches it.
+    pub layout_size: (u32, u32),
     pub refresh_hz: u32,
     pub primary: bool,
     /// Top-left corner on the desktop.
@@ -283,6 +288,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             },
             width,
             height,
+            layout_size: (width, height),
             refresh_hz: (rate.Numerator + rate.Denominator / 2)
                 .checked_div(rate.Denominator)
                 .unwrap_or(0),

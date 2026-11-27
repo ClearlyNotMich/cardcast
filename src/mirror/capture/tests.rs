@@ -336,6 +336,7 @@ fn duplicate_and_check_colour(
     let quarter = crate::guard::Monitor {
         width: monitor.width / 2,
         height: monitor.height / 2,
+        layout_size: (monitor.width / 2, monitor.height / 2),
         ..monitor.clone()
     };
     // RGB(200, 40, 120); COLORREF is 0x00BBGGRR.

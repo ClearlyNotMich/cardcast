@@ -6,7 +6,7 @@ use super::Output;
 use std::error::Error;
 use std::sync::mpsc;
 use x11rb::connection::Connection as _;
-use x11rb::protocol::randr::{ConnectionExt as _, ModeInfo, NotifyMask};
+use x11rb::protocol::randr::{ConnectionExt as _, ModeInfo, NotifyMask, Rotation};
 use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, Window};
 use x11rb::rust_connection::RustConnection;
 
@@ -50,19 +50,27 @@ pub fn outputs() -> Result<Vec<Output>, Box<dyn Error>> {
                 .reply()?
                 .data
         };
+        let mode = resources.modes.iter().find(|mode| mode.id == crtc.mode);
+        let layout_size = (crtc.width.into(), crtc.height.into());
+        // The CRTC's size is the mode's after rotation, unless `xrandr --scale` stretches it.
+        let (width, height) = mode.map_or(layout_size, |mode| {
+            super::super::desktop_size(
+                mode.width.into(),
+                mode.height.into(),
+                crtc.rotation
+                    .intersects(Rotation::ROTATE90 | Rotation::ROTATE270),
+            )
+        });
         outputs.push(Output {
             name: String::from_utf8_lossy(&info.name).into_owned(),
             description: String::new(),
             edid: (!edid.is_empty()).then_some(edid),
             left: crtc.x.into(),
             top: crtc.y.into(),
-            width: crtc.width.into(),
-            height: crtc.height.into(),
-            refresh_hz: resources
-                .modes
-                .iter()
-                .find(|mode| mode.id == crtc.mode)
-                .map_or(0, refresh_hz),
+            width,
+            height,
+            layout_size,
+            refresh_hz: mode.map_or(0, refresh_hz),
         });
     }
     Ok(outputs)
@@ -76,8 +84,7 @@ fn refresh_hz(mode: &ModeInfo) -> u32 {
         .unwrap_or(0)
 }
 
-/// RandR's primary output; on Wayland Xwayland's, which Plasma and GNOME set to their own primary
-/// monitor. `None` without an X server or a primary output.
+/// RandR's primary output; `None` without one.
 pub fn primary() -> Option<String> {
     let (connection, root) = connect().ok()?;
     let output = connection

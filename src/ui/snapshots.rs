@@ -37,6 +37,7 @@ fn monitor(
         name: name.into(),
         width: size.0,
         height: size.1,
+        layout_size: (size.0, size.1),
         refresh_hz: hz,
         primary: at == (0, 0),
         left: at.0,

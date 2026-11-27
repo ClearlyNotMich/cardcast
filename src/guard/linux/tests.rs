@@ -24,8 +24,10 @@ const PCI_IDS: &str = "\
 const RTX_4080: &str = "AD103 [GeForce RTX 4080]";
 const RADEON: &str = "Granite Ridge [Radeon 610M]";
 
+/// An unscaled output: its size on the desktop is its resolution.
 fn output(name: &str, description: &str, at: (i32, i32), size: (u32, u32), hz: u32) -> Output {
     Output {
+        layout_size: size,
         name: name.into(),
         description: description.into(),
         edid: None,
@@ -41,13 +43,16 @@ fn output(name: &str, description: &str, at: (i32, i32), size: (u32, u32), hz: u
 /// with the connectors: DP-1 is turned to portrait at scale 1.3.
 fn sender_outputs() -> Vec<Output> {
     vec![
-        output(
-            "DP-1",
-            "Dell Inc. Dell S2417DG",
-            (0, 373),
-            (1108, 1969),
-            144,
-        ),
+        Output {
+            layout_size: (1108, 1969),
+            ..output(
+                "DP-1",
+                "Dell Inc. Dell S2417DG",
+                (0, 373),
+                (1440, 2560),
+                144,
+            )
+        },
         output(
             "HDMI-A-2",
             "Elgato Systems LLC Elgato1080HDR",
@@ -167,6 +172,18 @@ fn the_senders_four_monitors_are_matched_to_their_connectors() {
                 false
             ),
         ]
+    );
+    let portrait = &monitors[0];
+    assert_eq!(
+        (
+            portrait.width,
+            portrait.height,
+            portrait.layout_size,
+            portrait.left,
+            portrait.top
+        ),
+        (1440, 2560, (1108, 1969), 0, 373),
+        "the resolution, and the logical rectangle on the desktop"
     );
     let card = &monitors[1];
     assert_eq!(
@@ -313,7 +330,8 @@ fn two_monitors_with_the_same_serial_keep_apart_by_their_connector() {
 }
 
 /// `CARDCAST_EXPECT_MONITORS` (set by CI's Xvfb and headless sway steps): the monitor list,
-/// `<output> <width>x<height>+<left>+<top>[ primary]` by output name, joined by `; `. Skips when unset.
+/// `<output> <width>x<height> <layout width>x<layout height>+<left>+<top>[ primary]` by output
+/// name, joined by `; `. Skips when unset.
 fn expected_monitors() -> Option<String> {
     std::env::var("CARDCAST_EXPECT_MONITORS").ok()
 }
@@ -323,10 +341,12 @@ fn listed(monitors: &[Monitor]) -> String {
         .iter()
         .map(|m| {
             format!(
-                "{} {}x{}+{}+{}{}",
+                "{} {}x{} {}x{}+{}+{}{}",
                 m.gdi_name,
                 m.width,
                 m.height,
+                m.layout_size.0,
+                m.layout_size.1,
                 m.left,
                 m.top,
                 if m.primary { " primary" } else { "" }
@@ -348,12 +368,14 @@ fn desktop_lists_its_outputs() {
     assert_eq!(listed(&monitors), expected);
 }
 
-/// `CARDCAST_PLUG_COMMAND` (CI's headless sway): a shell command that adds an output, after which
-/// `CARDCAST_EXPECT_PLUGGED` is the monitor list. Skips when unset.
+/// `CARDCAST_PLUG_COMMAND` (CI's headless sway): a shell command that plugs in the output named
+/// `CARDCAST_PLUGGED`; once a wake lists it, `CARDCAST_EXPECT_PLUGGED` is the monitor list. Skips
+/// when unset.
 #[test]
 fn desktop_hotplug_wakes_the_display_watcher() {
-    let (Ok(plug), Ok(expected)) = (
+    let (Ok(plug), Ok(plugged), Ok(expected)) = (
         std::env::var("CARDCAST_PLUG_COMMAND"),
+        std::env::var("CARDCAST_PLUGGED"),
         std::env::var("CARDCAST_EXPECT_PLUGGED"),
     ) else {
         return;
@@ -368,11 +390,17 @@ fn desktop_hotplug_wakes_the_display_watcher() {
         .status()
         .unwrap();
     assert!(status.success(), "{plug} failed");
-    assert!(
-        wakes
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .is_ok(),
-        "the display watcher did not wake"
-    );
-    assert_eq!(listed(&monitors().unwrap()), expected);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let monitors = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            wakes.recv_timeout(left).is_ok(),
+            "the display watcher did not wake for {plugged}"
+        );
+        let monitors = monitors().unwrap();
+        if monitors.iter().any(|m| m.gdi_name == plugged) {
+            break monitors;
+        }
+    };
+    assert_eq!(listed(&monitors), expected);
 }

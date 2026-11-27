@@ -732,6 +732,7 @@ mod tests {
             name: device_path.into(),
             width: 1920,
             height: 1080,
+            layout_size: (1920, 1080),
             refresh_hz: 60,
             primary,
             left: 0,

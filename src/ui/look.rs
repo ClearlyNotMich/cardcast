@@ -273,7 +273,7 @@ pub fn fit_layout(monitors: &[Monitor], area: Rect, gap: f32) -> Vec<Rect> {
     let desktop = |monitor: &Monitor| {
         Rect::from_min_size(
             pos2(monitor.left as f32, monitor.top as f32),
-            vec2(monitor.width as f32, monitor.height as f32),
+            vec2(monitor.layout_size.0 as f32, monitor.layout_size.1 as f32),
         )
     };
     let Some(bounds) = monitors.iter().map(desktop).reduce(|a, b| a.union(b)) else {
@@ -308,12 +308,12 @@ pub fn layout_extra(extra: f32, shown: f32, content: f32) -> f32 {
 pub fn card_display_placeholder(monitors: &[Monitor]) -> Monitor {
     let rightmost = monitors
         .iter()
-        .max_by_key(|monitor| monitor.left.saturating_add_unsigned(monitor.width));
+        .max_by_key(|monitor| monitor.left.saturating_add_unsigned(monitor.layout_size.0));
     let (left, top) = rightmost.map_or((0, 0), |monitor| {
         (
             monitor
                 .left
-                .saturating_add_unsigned(monitor.width)
+                .saturating_add_unsigned(monitor.layout_size.0)
                 .saturating_add(240),
             monitor.top,
         )
@@ -324,6 +324,7 @@ pub fn card_display_placeholder(monitors: &[Monitor]) -> Monitor {
         name: "Card display: not connected".into(),
         width: 1920,
         height: 1080,
+        layout_size: (1920, 1080),
         refresh_hz: 0,
         primary: false,
         left,
@@ -405,6 +406,7 @@ mod tests {
             name: device_path.into(),
             width,
             height,
+            layout_size: (width, height),
             refresh_hz: 60,
             primary: left == 0 && top == 0,
             left,
@@ -437,6 +439,22 @@ mod tests {
             .fold(Rect::NOTHING, |all, rect| all.union(*rect));
         assert!((drawn.center() - area.center()).length() < 1e-3);
         assert!(area.expand(1e-3).contains_rect(drawn));
+    }
+
+    #[test]
+    fn a_scaled_monitor_is_drawn_at_its_size_on_the_desktop() {
+        // The sender's DP-1 on Plasma: 1440×2560 at scale 1.3 takes 1108×1969 of the desktop.
+        let scaled = Monitor {
+            layout_size: (1108, 1969),
+            ..monitor("scaled", 0, 0, 1440, 2560)
+        };
+        let monitors = [scaled, monitor("right", 1108, 0, 1920, 1080)];
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(3028.0, 1969.0));
+        let rects = fit_layout(&monitors, area, 0.0);
+        assert!((rects[0].width() - 1108.0).abs() < 1e-3);
+        assert!((rects[0].right() - rects[1].left()).abs() < 1e-3);
+        let placeholder = card_display_placeholder(&monitors[..1]);
+        assert_eq!(placeholder.left, 1108 + 240);
     }
 
     #[test]

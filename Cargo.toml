@@ -12,7 +12,9 @@ eframe = "0.37"
 [target.'cfg(target_os = "linux")'.dependencies]
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-plasma = { version = "0.3", features = ["client"] }
 x11rb = { version = "0.13", features = ["randr"] }
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 
 # PNG snapshots of the settings window, rendered on Linux (AGENTS.md, Build and test).
 [target.'cfg(target_os = "linux")'.dev-dependencies]

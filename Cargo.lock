@@ -573,8 +573,10 @@ dependencies = [
  "egui_kittest",
  "wayland-client",
  "wayland-protocols",
+ "wayland-protocols-plasma",
  "windows",
  "x11rb",
+ "zbus",
 ]
 
 [[package]]

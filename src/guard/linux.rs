@@ -2,6 +2,7 @@
 //! give each monitor's EDID and graphics card; the desktop (Wayland outputs, or RandR on X11) gives
 //! its name, position, size and refresh rate. The display watcher follows the desktop's outputs.
 
+mod mutter;
 mod wayland;
 mod x11;
 
@@ -35,18 +36,26 @@ pub struct Output {
     pub description: String,
     /// The EDID, if the desktop gives it (RandR does).
     pub edid: Option<Vec<u8>>,
-    /// The rectangle on the desktop, in the desktop's coordinates (logical pixels on Wayland).
+    /// The top-left corner on the desktop, in the desktop's coordinates (logical pixels on Wayland).
     pub left: i32,
     pub top: i32,
+    /// The resolution in real pixels, after the output's rotation.
     pub width: u32,
     pub height: u32,
+    /// The size in the desktop's coordinates; see [`Monitor::layout_size`].
+    pub layout_size: (u32, u32),
     pub refresh_hz: u32,
 }
 
 /// Active monitors: the desktop's outputs, matched to their DRM connectors.
 pub fn monitors() -> Result<Vec<Monitor>, String> {
-    let outputs = match desktop::detect(|name| std::env::var(name).ok()) {
-        Some(Desktop::X11) => x11::outputs(),
+    // The primary output from the desktop's own source: RandR on X11, Mutter on GNOME, the output
+    // order on Plasma; other desktops have none, so the monitor at the origin is primary.
+    let (outputs, primary) = match desktop::detect(|name| std::env::var(name).ok()) {
+        Some(Desktop::X11) => x11::outputs().map(|outputs| (outputs, x11::primary())),
+        Some(Desktop::GnomeWayland) => {
+            wayland::outputs().map(|(outputs, _)| (outputs, mutter::primary()))
+        }
         Some(_) => wayland::outputs(),
         None => Err("no desktop session".into()),
     }
@@ -56,11 +65,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         .find_map(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
     let connectors = connectors(Path::new("/sys/class/drm"), &pci_ids);
-    Ok(match_monitors(
-        outputs,
-        &connectors,
-        x11::primary().as_deref(),
-    ))
+    Ok(match_monitors(outputs, &connectors, primary.as_deref()))
 }
 
 /// The connected connectors under `drm` (`/sys/class/drm`), named with `pci_ids` (pci.ids' text).
@@ -122,9 +127,9 @@ fn pci_name<'a>(pci_ids: &'a str, vendor: &str, device: &str) -> Option<&'a str>
 }
 
 /// Each output as a monitor, with the EDID and graphics card of its connector. The saved identity
-/// (`device_path`) is the EDID's product and serial, as in a Windows device path, else the connector.
-/// The primary monitor is the output named `primary` (RandR's, which Plasma and GNOME also set in
-/// Xwayland), else the one at the desktop's origin, where Windows puts it.
+/// (`device_path`) is the EDID's product and serial, else the connector; Linux keeps its own
+/// settings file, so it need not match Windows' device path. The primary monitor is the output
+/// named `primary` (the desktop's), else the one at the desktop's origin, where Windows puts it.
 pub fn match_monitors(
     outputs: Vec<Output>,
     connectors: &[Connector],
@@ -157,6 +162,7 @@ pub fn match_monitors(
                 name: edid_name(edid).unwrap_or_else(|| or_output_name(output.description.clone())),
                 width: output.width,
                 height: output.height,
+                layout_size: output.layout_size,
                 refresh_hz: output.refresh_hz,
                 primary: primary.map_or((output.left, output.top) == (0, 0), |name| {
                     name == output.name
