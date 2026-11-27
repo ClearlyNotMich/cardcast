@@ -1,11 +1,16 @@
 //! ui module. No unsafe and no Windows calls here.
 
+mod live;
+mod look;
 mod settings;
+#[cfg(all(test, target_os = "linux"))]
+mod snapshots;
 
 use crate::audio::{self, AudioDevice, Relay, RelayReport};
 use crate::guard::{self, Guard, Monitor};
 use crate::mirror::{self, Ended, Mirror};
-use eframe::egui;
+use eframe::egui::{self, RichText};
+use look::{FrameRate, Role};
 use settings::{Follow, Settings, Status, StatusLine};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,13 +19,16 @@ use std::time::Instant;
 /// Opens the settings window; returns when it is closed, which quits cardcast.
 pub fn run() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([460.0, 220.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([780.0, 720.0])
+            .with_min_inner_size([560.0, 560.0]),
         ..Default::default()
     };
     eframe::run_native(
         "cardcast",
         options,
         Box::new(|creation| {
+            look::apply(&creation.egui_ctx);
             let mut window = SettingsWindow::new(&creation.egui_ctx);
             window.launch(&creation.egui_ctx);
             Ok(Box::new(window))
@@ -45,6 +53,7 @@ struct SettingsWindow {
     displays_changed: Arc<AtomicBool>,
     /// `None` if it could not start; the status line says so.
     _display_watcher: Option<guard::DisplayWatcher>,
+    frame_rate: FrameRate,
 }
 
 impl SettingsWindow {
@@ -87,6 +96,7 @@ impl SettingsWindow {
             guard,
             displays_changed,
             _display_watcher: display_watcher,
+            frame_rate: FrameRate::default(),
         }
     }
 
@@ -252,21 +262,17 @@ impl SettingsWindow {
         }
     }
 
-    fn monitor_dropdown(&mut self, ui: &mut egui::Ui, label: &str, choice: Choice) {
-        let selected = match choice {
-            Choice::SourceMonitor => &mut self.settings.source_monitor,
-            Choice::CardDisplay => &mut self.settings.card_display,
-            Choice::SendWindowsTo => &mut self.settings.send_windows_to,
-        };
+    fn monitor_dropdown(&mut self, ui: &mut egui::Ui, role: Role) {
+        let selected = role.choice(&mut self.settings);
         let shown = self
             .monitors
             .iter()
             .find(|monitor| selected.as_deref() == Some(&monitor.device_path))
             .map_or_else(|| "(choose)".to_owned(), monitor_label);
-        ui.label(label);
-        egui::ComboBox::from_id_salt(label)
+        let label = live::labelled_dot(ui, role.label(), role.colour());
+        egui::ComboBox::from_id_salt(role.label())
             .selected_text(shown)
-            .width(300.0)
+            .width(ui.available_width())
             .show_ui(ui, |ui| {
                 for monitor in &self.monitors {
                     ui.selectable_value(
@@ -275,8 +281,9 @@ impl SettingsWindow {
                         monitor_label(monitor),
                     );
                 }
-            });
-        ui.end_row();
+            })
+            .response
+            .labelled_by(label.id);
     }
 
     fn audio_dropdown(&mut self, ui: &mut egui::Ui) {
@@ -286,16 +293,67 @@ impl SettingsWindow {
             .iter()
             .find(|device| selected.as_deref() == Some(&device.id))
             .map_or("(choose)", |device| &device.name);
-        ui.label("Audio source");
+        let label = live::labelled_dot(ui, "Audio source", look::LIVE);
         egui::ComboBox::from_id_salt("Audio source")
             .selected_text(shown)
-            .width(300.0)
+            .width(ui.available_width())
             .show_ui(ui, |ui| {
                 for device in &self.playback_devices {
                     ui.selectable_value(selected, Some(device.id.clone()), &device.name);
                 }
+            })
+            .response
+            .labelled_by(label.id);
+    }
+
+    /// Start or Stop, the guard switch, and the status line with the guard notice's dismiss button.
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let (text, fill) = if self.status.shows_stop() {
+                ("Stop", look::PROBLEM.gamma_multiply(0.75))
+            } else {
+                ("Start", look::ACCENT)
+            };
+            let button =
+                egui::Button::new(RichText::new(text).size(16.0).strong().color(look::TEXT))
+                    .fill(fill)
+                    .corner_radius(10)
+                    .min_size(egui::vec2(132.0, 40.0));
+            if ui.add(button).clicked() {
+                if self.status.shows_stop() {
+                    self.stop(Status::Stopped);
+                } else {
+                    self.start_by_user();
+                }
+            }
+            ui.add_space(12.0);
+            live::switch(ui, &mut self.settings.guard_enabled, "Guard");
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Guard").strong().color(look::TEXT));
+                ui.label(
+                    RichText::new("Keeps windows and the pointer off the card display")
+                        .small()
+                        .color(look::TEXT_DIM),
+                );
             });
-        ui.end_row();
+        });
+        ui.add_space(6.0);
+        let tone = look::Tone::of(&self.status.mirror);
+        egui::Frame::new()
+            .fill(look::BACKGROUND)
+            .stroke(egui::Stroke::new(1.0, tone.colour().gamma_multiply(0.35)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    live::dot(ui, tone.colour());
+                    ui.label(RichText::new(self.status.text()).color(look::TEXT));
+                    if self.status.guard.is_some() && ui.button("Dismiss guard notice").clicked() {
+                        self.status.dismiss_guard_notice();
+                    }
+                });
+            });
     }
 }
 
@@ -305,13 +363,6 @@ fn update_guard(guard: &mut dyn Guard, settings: &Settings) {
         settings.card_display.as_deref(),
         settings.send_windows_to.as_deref(),
     );
-}
-
-#[derive(Clone, Copy)]
-enum Choice {
-    SourceMonitor,
-    CardDisplay,
-    SendWindowsTo,
 }
 
 fn monitor_label(monitor: &Monitor) -> String {
@@ -327,30 +378,68 @@ impl eframe::App for SettingsWindow {
         self.follow(context);
     }
 
+    // eframe calls it only while the window is shown; minimised, only `logic` runs.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let before = self.settings.clone();
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
-                self.monitor_dropdown(ui, "Source monitor", Choice::SourceMonitor);
-                self.monitor_dropdown(ui, "Card display", Choice::CardDisplay);
-                self.monitor_dropdown(ui, "Send windows to", Choice::SendWindowsTo);
-                self.audio_dropdown(ui);
-            });
-            ui.horizontal(|ui| {
-                if self.status.shows_stop() {
-                    if ui.button("Stop").clicked() {
-                        self.stop(Status::Stopped);
-                    }
-                } else if ui.button("Start").clicked() {
-                    self.start_by_user();
-                }
-                ui.checkbox(&mut self.settings.guard_enabled, "Guard");
-            });
-            ui.label(self.status.text());
-            if self.status.guard.is_some() && ui.button("Dismiss guard notice").clicked() {
-                self.status.dismiss_guard_notice();
-            }
+        if let (Status::Running, Some(presents)) = (&self.status.mirror, self.mirror.presents()) {
+            self.frame_rate.sample(presents, Instant::now());
+        } else if self.status.mirror != Status::Running {
+            self.frame_rate = FrameRate::default();
+        }
+        let (visible, focused, time) = ui.input(|input| {
+            let viewport = input.viewport();
+            let hidden = viewport.minimized == Some(true) || viewport.occluded == Some(true);
+            (!hidden, input.focused, input.time)
         });
+        // Without focus (the game has it) the animation holds still instead of stepping once a second.
+        let time = focused.then_some(time);
+        egui::Panel::top("header")
+            .frame(
+                egui::Frame::new()
+                    .fill(look::PANEL)
+                    .inner_margin(egui::Margin::symmetric(18, 0)),
+            )
+            .exact_size(60.0)
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                live::header(ui, &self.status.mirror, self.frame_rate.shown, time);
+            });
+        egui::Panel::bottom("controls")
+            .frame(egui::Frame::new().fill(look::PANEL).inner_margin(16))
+            .show(ui, |ui| self.controls(ui));
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(look::BACKGROUND).inner_margin(16))
+            .show(ui, |ui| {
+                // A small window scrolls instead of hiding the choices under the controls.
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    live::section(
+                        ui,
+                        "LIVE LAYOUT",
+                        "Click a monitor to choose its role",
+                        |ui| {
+                            live::layout_map(
+                                ui,
+                                &self.monitors,
+                                &mut self.settings,
+                                &self.status.mirror,
+                                time,
+                            );
+                        },
+                    );
+                    ui.add_space(8.0);
+                    live::section(ui, "CHOICES", "", |ui| {
+                        ui.columns(2, |columns| {
+                            self.monitor_dropdown(&mut columns[0], Role::SourceMonitor);
+                            self.monitor_dropdown(&mut columns[1], Role::CardDisplay);
+                        });
+                        ui.add_space(6.0);
+                        ui.columns(2, |columns| {
+                            self.monitor_dropdown(&mut columns[0], Role::SendWindowsTo);
+                            self.audio_dropdown(&mut columns[1]);
+                        });
+                    });
+                });
+            });
         if self.settings != before {
             self.follow_settings(&before);
             if let Err(error) = self.settings.save() {
@@ -361,6 +450,9 @@ impl eframe::App for SettingsWindow {
         if matches!(self.status.mirror, Status::Restarting(_)) && !self.mirror.is_running() {
             ui.ctx()
                 .request_repaint_after(self.restart_at.saturating_duration_since(Instant::now()));
+        }
+        if let Some(after) = look::next_repaint(&self.status.mirror, visible, focused) {
+            ui.ctx().request_repaint_after(after);
         }
     }
 }
@@ -427,7 +519,7 @@ mod tests {
         }
     }
 
-    fn window(card_display: &str) -> SettingsWindow {
+    pub(super) fn window(card_display: &str) -> SettingsWindow {
         SettingsWindow {
             settings: Settings {
                 source_monitor: Some("source".into()),
@@ -445,6 +537,7 @@ mod tests {
             guard: Box::new(ReportingGuard::default()),
             displays_changed: Arc::default(),
             _display_watcher: None,
+            frame_rate: FrameRate::default(),
         }
     }
 
@@ -547,6 +640,7 @@ mod tests {
             guard: Box::new(guard.clone()),
             displays_changed,
             _display_watcher: display_watcher,
+            frame_rate: FrameRate::default(),
         };
         (window, guard)
     }

@@ -35,6 +35,11 @@ pub trait Mirror {
     fn shows_picture(&self) -> bool;
     /// What to do about the mirror ending on its own or failing to start; given once, after it ended.
     fn take_end(&mut self) -> Option<Ended>;
+    /// Frames presented on the card display since this start, for the frame rate readout; `None`
+    /// where nothing is counted (the stand-ins). Reading it costs the mirror nothing.
+    fn presents(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// What the settings window does after the mirror failed to start or ended on its own, with the status text.

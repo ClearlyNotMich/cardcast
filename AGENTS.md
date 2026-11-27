@@ -18,6 +18,7 @@ Cardcast mirrors a screen from the sender onto the card display, so a second PC 
 - Before every push: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
 - Check the Windows-only code on Linux before pushing: `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings` (one-time: `rustup target add x86_64-pc-windows-msvc`).
 - GitHub Actions builds the Windows `.exe` on every push. The owner tests it on the sender.
+- See the settings window: `cargo test snapshot` renders it to `tests/snapshots/*.png` (Linux, lavapipe: `mesa-vulkan-drivers`); `UPDATE_SNAPSHOTS=1 cargo test snapshot` rewrites them after a UI change.
 - Keep decisions in plain functions with no Windows calls (for example "where does this window go"), so they can be unit-tested on Linux.
 
 ## Agent skills

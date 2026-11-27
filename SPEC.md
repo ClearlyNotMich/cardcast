@@ -89,7 +89,7 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 - Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, Start/Stop button, guard checkbox, and a one-line status (starting, running, waiting for card display, waiting for source monitor, restarting, or the last error in plain words).
 - Dropdowns show each monitor's name, resolution and refresh rate.
 - Settings are saved when changed and loaded at launch.
-- The window repaints only on user input or when the mirror or window guard reports a status change.
+- The window repaints on user input or when the mirror or window guard reports a status change. While the mirror starts, runs or restarts, its status indicator animates at most about 30 times a second while the window has focus, and the frame rate refreshes once a second while it does not; never while minimised.
 - Closing the window quits cardcast. When launched with saved settings that start the mirror successfully, the window starts minimised.
 - On Linux the window runs with the mirror and window guard replaced by stand-ins, so the layout can be checked during development.
 

@@ -58,7 +58,6 @@ struct Running {
     thread: JoinHandle<Option<Ended>>,
     /// The mirror window once it shows the picture; 0 while the mirror starts.
     shown: Arc<AtomicIsize>,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the Windows tests"))]
     presents: Arc<AtomicU64>,
 }
 
@@ -120,6 +119,10 @@ impl Mirror for MirrorWindow {
         self.running.as_ref().is_some_and(|running| {
             !running.thread.is_finished() && running.shown.load(Ordering::Acquire) != 0
         })
+    }
+
+    fn presents(&self) -> Option<u64> {
+        Some(self.running.as_ref()?.presents.load(Ordering::Relaxed))
     }
 
     fn take_end(&mut self) -> Option<Ended> {

@@ -1,2 +1,6 @@
 /target/
 .codebase-index/
+# Written by a failing snapshot test; only the snapshot itself is committed.
+tests/snapshots/*.diff.png
+tests/snapshots/*.new.png
+tests/snapshots/*.old.png
