@@ -249,7 +249,13 @@ impl Screen {
             find_output(&card_display.device_path, &monitors, &outputs).ok_or_else(|| {
                 Ended::Restart("The card display is not connected to any graphics card.".into())
             })?;
-        let source = source_output(&source_monitor.device_path, output, &monitors, &outputs)?;
+        // SPIKE (research-cross-gpu, not for merge): the device goes on the source monitor's graphics
+        // card and DXGI copies each present across to the card display's (cross-adapter presentation).
+        let _ = (source_output, output);
+        let source =
+            find_output(&source_monitor.device_path, &monitors, &outputs).ok_or_else(|| {
+                Ended::Restart("The source monitor is not connected to any graphics card.".into())
+            })?;
         let card_display = monitors
             .iter()
             .find(|monitor| monitor.device_path == card_display.device_path)
@@ -265,7 +271,7 @@ impl Screen {
         };
         // SAFETY: the index came from EnumAdapters1 on this factory just above.
         let adapter =
-            unsafe { factory.EnumAdapters1(output.adapter) }.map_err(failed("graphics card"))?;
+            unsafe { factory.EnumAdapters1(source.adapter) }.map_err(failed("graphics card"))?;
         // SAFETY: the index came from EnumOutputs on this adapter in `outputs`.
         let source = unsafe { adapter.EnumOutputs(source.output) }
             .map_err(|_| Ended::Restart("The source monitor is not connected.".into()))?;
