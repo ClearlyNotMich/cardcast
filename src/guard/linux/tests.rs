@@ -258,6 +258,28 @@ fn an_x11_output_with_another_name_is_matched_by_its_edid() {
 }
 
 #[test]
+fn each_monitor_shares_a_container_with_its_graphics_cards_sound_output() {
+    // audio::container_id of the PCI slot and EDID name; the sound output's sink gets the same.
+    let connectors = connectors(&sender_drm(), PCI_IDS);
+    let monitors = match_monitors(sender_outputs(), &connectors, None);
+    let found: Vec<_> = monitors.iter().map(|m| m.container_id.as_str()).collect();
+    assert_eq!(
+        found,
+        [
+            "0000:01:00 Dell S2417DG",
+            "0000:0c:00 Elgato1080HDR",
+            "0000:01:00 MAG 272Q X50",
+            "0000:01:00 DELL AW2523HF"
+        ]
+    );
+    let headless = output("HEADLESS-1", "Headless output 1", (0, 0), (1920, 1080), 60);
+    assert_eq!(
+        match_monitors(vec![headless], &connectors, None)[0].container_id,
+        ""
+    );
+}
+
+#[test]
 fn an_output_with_no_connector_is_listed_by_its_own_name() {
     // A headless or nested desktop's outputs have no DRM connector.
     let outputs = vec![

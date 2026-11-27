@@ -71,7 +71,7 @@ pub struct Monitor {
     /// empty if unknown.
     pub graphics_card: String,
     /// The physical device the monitor is part of (`DEVPKEY_Device_ContainerId`), shared with its
-    /// HDMI or DisplayPort sound output; empty if unknown, and on Linux.
+    /// HDMI or DisplayPort sound output; on Linux `audio::container_id`. Empty if unknown.
     pub container_id: String,
     /// The graphics card's device path and the target id of the video output the monitor is on (on
     /// Linux its PCI address and DRM connector, `0000:0c:00.0 HDMI-A-2`); unlike `device_path` it

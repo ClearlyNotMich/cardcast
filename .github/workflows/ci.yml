@@ -70,6 +70,20 @@ jobs:
           openbox &
           for _ in $(seq 50); do xprop -root _NET_SUPPORTING_WM_CHECK | grep -q window && break; sleep 0.2; done
           cargo test guard_tests -- --nocapture --test-threads=1
+      # The audio relay (#44): PipeWire and WirePlumber with two null sinks, a tone played into one.
+      - if: runner.os == 'Linux'
+        name: Audio relay between two null sinks
+        run: |
+          sudo apt-get install -y pipewire pipewire-bin wireplumber
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          dbus-run-session -- sh -ec '
+            pipewire & wireplumber &
+            for _ in $(seq 50); do wpctl status >/dev/null 2>&1 && break; sleep 0.2; done
+            for sink in source card; do
+              pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=cardcast-$sink node.nick=\"cardcast $sink\" media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"
+            done
+            CARDCAST_NULL_SINKS=1 cargo test audio::linux::tests::null_sinks -- --nocapture
+          '
       - run: cargo build --release
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7
