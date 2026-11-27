@@ -571,6 +571,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui_kittest",
+ "libc",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-plasma",

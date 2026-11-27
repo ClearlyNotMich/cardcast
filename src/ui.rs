@@ -1791,15 +1791,17 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
+    /// The test monitors have no DRM connector, so the real Linux input thread reaches none.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn on_linux_input_switching_says_it_does_not_work_yet() {
+    fn on_linux_input_switching_reads_the_monitors_over_i2c_dev() {
         let mut window = window("card");
         switch_input_switching(&mut window, true);
-        assert!(window.input_thread.is_none());
+        assert!(window.input_thread.is_some());
+        follow_input_thread(&mut window, |window| window.status.text() != "Stopped");
         assert_eq!(
             window.status.text(),
-            "Stopped | Input switching does not work on Linux yet."
+            "Stopped | No monitor offers input switching over DDC/CI."
         );
         switch_input_switching(&mut window, false);
         assert_eq!(window.status.text(), "Stopped");

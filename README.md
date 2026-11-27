@@ -99,6 +99,8 @@ cardcast.exe input <monitor> toggle <input> <input>
 
 The exit code is 0 when the monitor took the switch or was already on that input, 1 when the switch failed (no such monitor, an input it doesn't list, or no answer over DDC/CI), and 2 when the command was not understood. One line saying what happened goes to standard error, which you only see when you capture it: in a `.cmd` script, `cardcast.exe input 4GZY5P3 hdmi1 2> result.txt` waits for cardcast, then `%ERRORLEVEL%` is the exit code and `result.txt` holds the line. Typed at a command prompt, cmd doesn't wait for cardcast, so `%ERRORLEVEL%` there is not its exit code.
 
+On Linux the command is `cardcast input <monitor> …`, and it works the same way. cardcast talks to the monitor through `/dev/i2c-*`, which needs the `i2c-dev` kernel module and access for your user, no root: the package installs `packaging/linux/modules-load.d/i2c-dev.conf` and `packaging/linux/udev/rules.d/60-cardcast-i2c.rules` for that. If you run cardcast from the tarball, copy them to `/etc/modules-load.d/` and `/etc/udev/rules.d/` and restart. With NVIDIA's own driver, some monitors only answer after setting `NVreg_RegistryDwords=RMUseSwI2c=0x01` ([ddcutil](https://www.ddcutil.com/nvidia/)).
+
 A monitor whose input switched away may drop out of Windows, as if unplugged. Then cardcast can't switch it back; use the monitor's own buttons. If it was the source monitor or the card display, the mirror waits for it and resumes when it is back.
 
 ### A Stream Deck key
