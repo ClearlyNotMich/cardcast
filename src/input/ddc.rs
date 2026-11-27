@@ -193,7 +193,7 @@ mod tests {
             let args = ["input", wanted, "hdmi1"].map(str::to_owned);
             let (code, line) = run_command(&args, monitors, open);
             second_monitor::log(&format!("{args:?}: {code} {line}"));
-            assert_eq!(code, 0, "{line}");
+            assert_eq!(code, 1, "{line}");
             assert!(
                 line.ends_with(": the monitor did not answer over DDC/CI."),
                 "{line}"
@@ -201,5 +201,11 @@ mod tests {
             tried += 1;
         }
         assert!(tried > 0, "no monitor has a serial or name of its own");
+        // The two virtual monitors share a name and a placeholder serial, so no command reaches them; open them directly.
+        for (id, place) in monitors().unwrap() {
+            let capabilities = open(place).map(|mut ddc| ddc.capabilities());
+            second_monitor::log(&format!("{id:?}: capabilities {capabilities:?}"));
+            assert!(matches!(capabilities, None | Some(None)), "{id:?}");
+        }
     }
 }
