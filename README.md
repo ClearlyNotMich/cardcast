@@ -96,3 +96,7 @@ Open an issue on GitHub at `ClearlyNotMich/cardcast`. Include:
 - the text of the status line,
 - the CI run or commit the `.exe` came from,
 - your monitors and capture card, and whether HDR was on.
+
+## Licence
+
+cardcast is free software under the GNU General Public License, version 3 or (at your option) any later version. See [LICENSE](LICENSE).
