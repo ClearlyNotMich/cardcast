@@ -1212,6 +1212,7 @@ mod tests {
             name: name.into(),
             width: 1920,
             height: 1080,
+            layout_size: (1920, 1080),
             refresh_hz: 60,
             primary: false,
             left: 0,
