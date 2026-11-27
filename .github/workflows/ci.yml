@@ -15,6 +15,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The pipewire crate's bindings are generated from PipeWire's headers with libclang (#42).
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpipewire-0.3-dev libclang-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       # The settings window snapshots render with wgpu on lavapipe, Mesa's software Vulkan.
@@ -53,6 +56,45 @@ jobs:
           CARDCAST_EXPECT_PLUGGED='HEADLESS-1 720x1280 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary; HEADLESS-3 1920x1080 1920x1080+1760+0' \
             cargo test guard::linux::tests::desktop_hotplug -- --nocapture || failed=1
           exit $failed
+      # The mirror capture (#42): a frame of a known colour through MIT-SHM on Xvfb, and through
+      # xdg-desktop-portal-wlr and PipeWire on headless sway. -noreset keeps xsetroot's colour.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y swaybg x11-xserver-utils xdg-desktop-portal xdg-desktop-portal-wlr pipewire wireplumber
+      - if: runner.os == 'Linux'
+        name: Mirror capture on Xvfb
+        env:
+          CARDCAST_CAPTURE: screen
+          CARDCAST_EXPECT_COLOUR: '#cc6633'
+        run: xvfb-run -s '-screen 0 1280x1024x24 -noreset' sh -c 'xsetroot -solid "#cc6633" && cargo test mirror::linux::tests::desktop_captures -- --nocapture'
+      - if: runner.os == 'Linux'
+        name: Mirror capture through the portal on headless sway
+        env:
+          WLR_BACKENDS: headless
+          WLR_HEADLESS_OUTPUTS: 2
+          WLR_LIBINPUT_NO_DEVICES: 1
+          WLR_RENDERER: pixman
+          XDG_CURRENT_DESKTOP: sway
+          CARDCAST_CAPTURE: HEADLESS-1
+          CARDCAST_EXPECT_COLOUR: '#3366cc'
+        run: |
+          export XDG_RUNTIME_DIR=$(mktemp -d) XDG_CONFIG_HOME=$(mktemp -d)
+          # xdg-desktop-portal-wlr shares HEADLESS-1 without asking.
+          mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr" "$XDG_CONFIG_HOME/xdg-desktop-portal"
+          printf '[screencast]\noutput_name=HEADLESS-1\nchooser_type=none\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr/config"
+          printf '[preferred]\ndefault=wlr\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
+          printf 'output * bg #3366cc solid_color\n' > "$XDG_CONFIG_HOME/sway.conf"
+          cat > "$RUNNER_TEMP/capture.sh" <<'EOF'
+          pipewire & wireplumber &
+          sway -c "$XDG_CONFIG_HOME/sway.conf" &
+          for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.2; done
+          export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
+          export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-? | head -n 1)")
+          # The portals start on the session bus, so they need the desktop's variables.
+          dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_CONFIG_HOME XDG_RUNTIME_DIR
+          for _ in $(seq 10); do swaymsg -t get_outputs >/dev/null && break; sleep 1; done
+          cargo test mirror::linux::tests::desktop_captures -- --nocapture
+          EOF
+          dbus-run-session -- bash "$RUNNER_TEMP/capture.sh"
       - run: cargo build --release
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7

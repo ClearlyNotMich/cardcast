@@ -3,9 +3,9 @@
 //! Facts relied on are in `docs/win32-mirror-audio.md`.
 
 use super::pointer::{pointer_image, pointer_viewport};
-use super::window::Picture;
 use super::{
-    Ended, Fit, corner_uvs, recreate_capture_in_place, start_failed, upright_size, white_scale,
+    Ended, Fit, Picture, corner_uvs, recreate_capture_in_place, start_failed, upright_size,
+    white_scale,
 };
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::E_POINTER;
