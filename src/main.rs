@@ -4,6 +4,14 @@
 
 mod audio;
 mod guard;
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "command mode (issue #38) calls it; its tests run everywhere"
+    )
+)]
+mod input;
 mod mirror;
 mod ui;
 
