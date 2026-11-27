@@ -106,10 +106,10 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 
 ## 8. Tech stack and layout
 
-- Stable Rust, one crate named `cardcast`, one binary. Split into modules: `ui`, `mirror`, `guard` and `audio`.
+- Stable Rust, one crate named `cardcast`, one binary. Split into modules: `ui`, `mirror`, `guard`, `audio` and `input` (monitor input switching, section 11).
 - Windows APIs through the `windows` crate: Direct3D 11, DXGI, and Win32 windowing and events.
 - The program declares per-monitor DPI awareness (version 2) in its manifest, so monitor rectangles and window sizes are real pixels on scaled displays.
-- `unsafe` only in the `mirror`, `guard` and `audio` modules, each block with a `// SAFETY:` comment.
+- `unsafe` only in the `mirror`, `guard`, `audio` and `input` modules, each block with a `// SAFETY:` comment.
 - Check each crate's current version and maintenance status before adding it.
 - Licence: MIT OR Apache-2.0.
 

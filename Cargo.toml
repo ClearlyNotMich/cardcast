@@ -32,6 +32,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_Accessibility",
@@ -40,7 +41,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [lints.rust]
-# unsafe is opt-in per module (mirror, guard, audio allow it) so it cannot spread to ui or logic.
+# unsafe is opt-in per module (mirror, guard, audio and input's ddc allow it) so it cannot spread to ui or logic.
 unsafe_code = "deny"
 # Every unsafe operation needs its own explicit block, even inside unsafe fns.
 unsafe_op_in_unsafe_fn = "deny"

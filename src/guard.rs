@@ -29,6 +29,8 @@ mod window_guard;
 
 #[cfg(windows)]
 pub use displays::DisplayWatcher;
+#[cfg(windows)]
+pub(crate) use displays::device_node;
 
 /// Linux has no display changes to hear; this stand-in never wakes.
 #[cfg(not(windows))]
