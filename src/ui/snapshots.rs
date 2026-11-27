@@ -6,6 +6,16 @@ use super::*;
 use crate::mirror::StandInMirror;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+/// Vulkan loader 1.4.341 (Ubuntu 26.04 CI) frees a device in `vkDestroyDevice` while another
+/// thread's device call walks the loader's device list, a SIGSEGV (fixed in
+/// KhronosGroup/Vulkan-Loader#1866), so a test holds this while its harness owns a device.
+fn one_device_at_a_time() -> MutexGuard<'static, ()> {
+    static DEVICE: Mutex<()> = Mutex::new(());
+    // A failed snapshot poisons it; the other snapshots should still run.
+    DEVICE.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// The sender's graphics card, and the processor's integrated graphics the card display is on.
 const RTX_4080: &str = "NVIDIA GeForce RTX 4080";
@@ -119,6 +129,7 @@ fn harness(window: SettingsWindow) -> Harness<'static, SettingsWindow> {
 }
 
 fn snapshot(name: &str, window: SettingsWindow) {
+    let _device = one_device_at_a_time();
     let mut harness = harness(window);
     harness.run();
     harness.snapshot(name);
@@ -241,6 +252,7 @@ fn snapshot_sound_output_no_audio() {
 
 #[test]
 fn snapshot_role_menu_opens_on_a_monitor_click() {
+    let _device = one_device_at_a_time();
     let mut harness = harness(sender(Status::Stopped));
     harness.get_by_label("Dell S2417DG").click();
     harness.run();
