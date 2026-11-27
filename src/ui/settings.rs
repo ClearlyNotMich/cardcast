@@ -20,6 +20,8 @@ pub enum Status {
 }
 
 impl Status {
+    /// The status in words, as the tests read it; the window shows `look::headline` and `StatusLine::details`.
+    #[cfg(test)]
     pub fn text(&self) -> String {
         match self {
             Self::Stopped => "Stopped".into(),
@@ -86,6 +88,8 @@ impl StatusLine {
         self.dismissed_guard = self.guard.take();
     }
 
+    /// The whole status line, as the tests read it.
+    #[cfg(test)]
     pub fn text(&self) -> String {
         let mut text = self.mirror.text();
         let problems = [&self.audio, &self.guard, &self.displays, &self.other];
@@ -94,6 +98,27 @@ impl StatusLine {
             text.push_str(problem);
         }
         text
+    }
+
+    /// What the status box under the controls says, or `None` to hide it: why the mirror stopped or
+    /// restarts, then any problem. The header already shows the mirror's state.
+    pub fn details(&self) -> Option<String> {
+        let reason = match &self.mirror {
+            Status::Restarting(message) | Status::Error(message) => Some(message),
+            _ => None,
+        };
+        let parts: Vec<&str> = [
+            reason,
+            self.audio.as_ref(),
+            self.guard.as_ref(),
+            self.displays.as_ref(),
+            self.other.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(String::as_str)
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" | "))
     }
 
     /// Stop while the mirror runs or will start by itself; Start once it is stopped.
@@ -118,6 +143,19 @@ pub fn restart_delay(attempts: u32) -> Duration {
     match attempts {
         0 => Duration::ZERO,
         attempts => Duration::from_secs(1 << (attempts - 1).min(5)).min(Duration::from_secs(30)),
+    }
+}
+
+/// Choices that can't work together, in plain words. The dropdowns and the live layout allow
+/// any choice, so a swap can go through a clash; the window warns about it instead.
+pub fn role_problem(settings: &Settings) -> Option<&'static str> {
+    let card_display = settings.card_display.as_ref()?;
+    if settings.source_monitor.as_ref() == Some(card_display) {
+        Some("The source monitor and the card display must be different monitors.")
+    } else if settings.send_windows_to.as_ref() == Some(card_display) {
+        Some("\"Send windows to\" can't be the card display.")
+    } else {
+        None
     }
 }
 
@@ -327,6 +365,7 @@ mod tests {
             primary,
             left: 0,
             top: 0,
+            graphics_card: String::new(),
         }
     }
 
@@ -534,6 +573,57 @@ mod tests {
             .collect();
         assert_eq!(waits, [0, 1, 2, 4, 8, 16, 30, 30, 30]);
         assert_eq!(restart_delay(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn the_card_display_cannot_share_a_monitor_with_another_role() {
+        assert_eq!(
+            role_problem(&chosen("card", "card")),
+            Some("The source monitor and the card display must be different monitors.")
+        );
+        let send_to_card = Settings {
+            send_windows_to: Some("card".into()),
+            ..chosen("source", "card")
+        };
+        assert_eq!(
+            role_problem(&send_to_card),
+            Some("\"Send windows to\" can't be the card display.")
+        );
+        let fine = Settings {
+            send_windows_to: Some("primary".into()),
+            ..chosen("source", "card")
+        };
+        assert_eq!(role_problem(&fine), None);
+        // Sending windows to the source monitor is fine, and nothing chosen is not a clash.
+        let send_to_source = Settings {
+            send_windows_to: Some("source".into()),
+            ..chosen("source", "card")
+        };
+        assert_eq!(role_problem(&send_to_source), None);
+        assert_eq!(role_problem(&Settings::default()), None);
+    }
+
+    #[test]
+    fn details_hold_only_what_the_header_does_not_say() {
+        assert_eq!(StatusLine::new(Status::Running).details(), None);
+        assert_eq!(
+            StatusLine::new(Status::WaitingForCardDisplay).details(),
+            None
+        );
+        assert_eq!(
+            StatusLine::new(Status::Error("driver too old".into())).details(),
+            Some("driver too old".into())
+        );
+        assert_eq!(
+            StatusLine::new(Status::Restarting("lost".into())).details(),
+            Some("lost".into())
+        );
+        let line = StatusLine {
+            audio: Some("audio".into()),
+            guard: Some("guard".into()),
+            ..StatusLine::new(Status::Error("failed".into()))
+        };
+        assert_eq!(line.details(), Some("failed | audio | guard".into()));
     }
 
     #[test]

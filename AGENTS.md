@@ -14,10 +14,11 @@ Cardcast mirrors a screen from the sender onto the card display, so a second PC 
 ## Build and test
 
 - Code is written on Linux. Mirror and window guard only run on Windows, so they can't be run here.
-- A pre-push hook in `.githooks/` runs these checks (one-time: `git config core.hooksPath .githooks`). Never skip it with `--no-verify`.
+- A pre-push hook in `.githooks/` runs these checks (one-time: `git config core.hooksPath .githooks`); its `cargo test` renders the snapshots, so it needs `mesa-vulkan-drivers` too. Never skip it with `--no-verify`.
 - Before every push: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
 - Check the Windows-only code on Linux before pushing: `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings` (one-time: `rustup target add x86_64-pc-windows-msvc`).
 - GitHub Actions builds the Windows `.exe` on every push. The owner tests it on the sender.
+- See the settings window: `cargo test snapshot` renders it to `tests/snapshots/*.png` (Linux, lavapipe: `mesa-vulkan-drivers`); `UPDATE_SNAPSHOTS=1 cargo test snapshot` rewrites them after a UI change.
 - Keep decisions in plain functions with no Windows calls (for example "where does this window go"), so they can be unit-tested on Linux.
 
 ## Agent skills

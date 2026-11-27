@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::mirror::capture::duplicating;
+use std::io::Write;
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -35,18 +36,6 @@ fn shows_picture(mirror: &mut MirrorWindow) {
             Instant::now() < deadline,
             "the mirror never showed the picture"
         );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// How a started mirror ended; fails if it is still running after 10 s.
-fn end(mirror: &mut MirrorWindow) -> Ended {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(end) = mirror.take_end() {
-            return end;
-        }
-        assert!(Instant::now() < deadline, "the mirror did not end");
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -267,8 +256,44 @@ fn second_monitor_mirror_starts_on_it_and_presents() {
     assert!(mirror.is_running(), "the mirror ended on its own");
 }
 
+/// Name of the graphics card DXGI puts each monitor's output on: the card the mirror's device would use.
+fn graphics_card(factory: &IDXGIFactory2, monitor: &Monitor, monitors: &[Monitor]) -> String {
+    let adapter = find_output(&monitor.device_path, monitors, &outputs(factory))
+        .unwrap()
+        .adapter;
+    // SAFETY: the index came from `outputs` on this factory.
+    let description = unsafe { factory.EnumAdapters1(adapter).unwrap().GetDesc1() }.unwrap();
+    crate::guard::wide_to_string(&description.Description)
+}
+
 #[test]
-fn second_monitor_card_display_on_another_graphics_card_is_refused() {
+fn second_monitor_each_monitor_names_its_graphics_card() {
+    // Also runs on the runner's one monitor outside the second-monitor job.
+    let monitors = crate::guard::monitors().unwrap();
+    // SAFETY: plain factory creation.
+    let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory1() }.unwrap();
+    for monitor in &monitors {
+        // Written to stderr directly: libtest captures only the print macros, and CI runs without --nocapture.
+        let _ = writeln!(
+            std::io::stderr(),
+            "{} is on graphics card {:?}",
+            monitor.name,
+            monitor.graphics_card
+        );
+        assert!(
+            !monitor.graphics_card.is_empty(),
+            "{} names no graphics card",
+            monitor.name
+        );
+        assert_eq!(
+            monitor.graphics_card,
+            graphics_card(&factory, monitor, &monitors)
+        );
+    }
+}
+
+#[test]
+fn second_monitor_card_display_on_another_graphics_card_is_mirrored() {
     let Some(monitors) = crate::guard::second_monitor::monitors(2) else {
         return;
     };
@@ -291,14 +316,39 @@ fn second_monitor_card_display_on_another_graphics_card_is_refused() {
     let _duplicating = duplicating();
     let mut mirror = MirrorWindow::new(|| {});
     mirror.start(source_monitor, card_display).unwrap();
-    let refused = end(&mut mirror);
+    shows_picture(&mut mirror);
+    let mut rect = RECT::default();
+    // SAFETY: rect is a valid RECT; the window lives until `mirror` drops.
+    unsafe { GetWindowRect(window(&mirror), &mut rect) }.unwrap();
     assert_eq!(
-        refused,
-        Ended::Stop(
-            "The source monitor and the card display are on different graphics cards. Plug both into the same one.".into()
-        )
+        (rect.left, rect.top),
+        (card_display.left, card_display.top),
+        "mirror window is not on the card display"
     );
-    assert!(!mirror.is_running());
+    let presents = &mirror.running.as_ref().unwrap().presents;
+    std::thread::sleep(Duration::from_millis(500));
+    let (start, at_start) = (Instant::now(), presents.load(Ordering::Relaxed));
+    std::thread::sleep(Duration::from_secs(5));
+    let counted = presents.load(Ordering::Relaxed) - at_start;
+    let per_second = counted as f64 / start.elapsed().as_secs_f64();
+    let refresh = f64::from(card_display.refresh_hz);
+    let _ = writeln!(
+        std::io::stderr(),
+        "source monitor {} Hz on adapter {}, card display {refresh} Hz on adapter {}: {per_second:.1} presents per second",
+        source_monitor.refresh_hz,
+        adapter(source_monitor),
+        adapter(card_display)
+    );
+    // Paced by the card display, within the cap of the same-card test: a virtual monitor has no vertical blank.
+    assert!(
+        (refresh * 0.5..refresh * 8.0).contains(&per_second),
+        "{per_second:.1} presents per second on a {refresh} Hz card display"
+    );
+    assert!(
+        mirror.is_running(),
+        "the mirror ended: {:?}",
+        mirror.take_end()
+    );
 }
 
 #[test]

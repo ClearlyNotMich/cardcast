@@ -17,7 +17,7 @@ Terms in bold in `GLOSSARY.md` are used with exactly that meaning here. `docs/ad
 - Two Windows PCs. The sender runs the game; the receiver runs OBS.
 - A capture card connected to the receiver over USB, with its HDMI input plugged into the sender's graphics card. Tested cards: Elgato HD60 X and AVerMedia Live Gamer Mini.
 - The card display is set to **Extend** in Windows, never Duplicate.
-- The card display is plugged into the same graphics card as the source monitor, so the picture is never copied between graphics cards.
+- The card display may be plugged into the same graphics card as the source monitor, or into another one (a second GPU or the integrated GPU); then the mirror converts the picture on the source monitor's card and Windows copies it across (ADR 0003).
 - The source monitor may run with Windows HDR on or off. The card display is always SDR.
 
 ## 3. Goals and non-goals
@@ -60,7 +60,7 @@ Behaviour:
 - The mouse pointer is visible in the mirror whenever it is on the source monitor.
 - When capture access is lost (resolution change, a game entering or leaving exclusive fullscreen, a permission prompt), capture is re-created without restarting the program.
 - When the card display disappears, the mirror stops and waits. When it returns, the mirror starts again.
-- Monitors are remembered by the display's device path from the Windows display configuration, not by `\\.\DISPLAYn` or list position. At run time that path is mapped to its DXGI output, and the Direct3D device is created on that output's graphics card, not the default one.
+- Monitors are remembered by the display's device path from the Windows display configuration, not by `\\.\DISPLAYn` or list position. At run time that path is mapped to its DXGI output, and the Direct3D device is created on the source monitor's graphics card, not the default one.
 - The mirror refuses to start when the source monitor and the card display are the same display, or when the card display is the primary monitor.
 - The mirror window runs on its own thread with its own message loop, separate from the settings window.
 
@@ -86,10 +86,10 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 ## 6. Settings window
 
 - Built with `egui` (`eframe`). It must use no CPU while minimised.
-- Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, Start/Stop button, guard checkbox, and a one-line status (starting, running, waiting for card display, waiting for source monitor, restarting, or the last error in plain words).
+- Controls: source monitor dropdown, card display dropdown, "send windows to" dropdown, audio source dropdown, Start/Stop button, guard checkbox, and the status: the header names the state (starting, running, waiting for card display, waiting for source monitor, restarting, stopped by an error), and a line under the controls gives the error, restart reason or notice in plain words when there is one.
 - Dropdowns show each monitor's name, resolution and refresh rate.
 - Settings are saved when changed and loaded at launch.
-- The window repaints only on user input or when the mirror or window guard reports a status change.
+- The window repaints on user input or when the mirror or window guard reports a status change. While the mirror starts, runs or restarts, its status indicator and the dots travelling along the live layout's arc animate at most about 30 times a second while the window has focus. Without focus nothing animates, and only a running mirror's frame rate refreshes, once a second; never while minimised.
 - Closing the window quits cardcast. When launched with saved settings that start the mirror successfully, the window starts minimised.
 - On Linux the window runs with the mirror and window guard replaced by stand-ins, so the layout can be checked during development.
 
@@ -133,7 +133,7 @@ v1 contains every part below. Each part is handed over as a test build when it i
 
 | Risk | Effect | What to do |
 | --- | --- | --- |
-| The sender's graphics card runs out of outputs with three monitors plus the card display. Not verified. | The card display does not light up | Test with the first mirror build; unplug one monitor to confirm |
+| The sender's graphics card runs out of outputs with three monitors plus the card display. Seen on the sender (issue #25). | The card display does not light up | Plug the card display into another graphics card (ADR 0003) |
 | Capturing the source monitor changes how Windows presents the game | Added input lag | The OBS projector is accepted as feeling right on the reference sender but has not been measured; the input lag check in section 9 compares cardcast against it |
 | HDR to SDR conversion looks different from OBS's | Washed-out or clipped colours on the receiver | Compare against the OBS projector; switch capture method or adjust the conversion |
 | A game in exclusive fullscreen cannot be captured | Black mirror | Recommend borderless mode in the README |

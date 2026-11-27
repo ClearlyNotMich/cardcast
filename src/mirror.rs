@@ -35,6 +35,11 @@ pub trait Mirror {
     fn shows_picture(&self) -> bool;
     /// What to do about the mirror ending on its own or failing to start; given once, after it ended.
     fn take_end(&mut self) -> Option<Ended>;
+    /// Frames presented on the card display since this start, for the frame rate readout; `None`
+    /// where nothing is counted (the stand-ins). Reading it costs the mirror nothing.
+    fn presents(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// What the settings window does after the mirror failed to start or ended on its own, with the status text.
@@ -61,7 +66,8 @@ fn transient(code: i32) -> bool {
     !PERMANENT.contains(&code.cast_unsigned())
 }
 
-/// Decides from the HRESULT that ended the mirror thread whether a fresh start can fix it.
+/// Decides from the HRESULT that ended the mirror thread whether a fresh start can fix it. A lost
+/// graphics card, the source monitor's or the card display's, restarts it on a fresh device.
 #[cfg_attr(
     not(windows),
     allow(dead_code, reason = "only the Windows mirror window calls it")
@@ -252,28 +258,20 @@ pub fn find_output<'a>(
 }
 
 /// The DXGI output to duplicate for the source monitor. Desktop Duplication needs a device on the
-/// source's graphics card, and SPEC section 1 puts the card display on that same card, so the
-/// card display's device is reused and the picture is never copied between graphics cards.
+/// source monitor's graphics card, so the mirror's device goes there; if the card display is on
+/// another card, DXGI copies each present across (ADR 0003).
 #[cfg_attr(
     not(windows),
     allow(dead_code, reason = "only the Windows mirror window calls it")
 )]
 pub fn source_output<'a>(
     device_path: &str,
-    card_display: &Output,
     monitors: &[Monitor],
     outputs: &'a [Output],
 ) -> Result<&'a Output, Ended> {
-    let output = find_output(device_path, monitors, outputs).ok_or_else(|| {
+    find_output(device_path, monitors, outputs).ok_or_else(|| {
         Ended::Restart("The source monitor is not connected to any graphics card.".into())
-    })?;
-    if output.adapter == card_display.adapter {
-        Ok(output)
-    } else {
-        Err(Ended::Stop(
-            "The source monitor and the card display are on different graphics cards. Plug both into the same one.".into(),
-        ))
-    }
+    })
 }
 
 /// What the HDR shader multiplies linear scRGB by so the monitor's SDR white becomes 1.0.
@@ -326,6 +324,25 @@ mod tests {
                 Ended::Restart(format!(
                     "The mirror was interrupted; restarting it. (error 0x{code:08X})"
                 ))
+            );
+        }
+    }
+
+    #[test]
+    fn a_lost_graphics_card_on_either_side_restarts_the_mirror() {
+        // What GetDeviceRemovedReason reports, whichever card was lost: the device's own (source
+        // monitor's) card, or the card display's card that each present is copied to (ADR 0003).
+        // DXGI_ERROR_DEVICE_HUNG, _DEVICE_REMOVED, _DEVICE_RESET, _DRIVER_INTERNAL_ERROR, _INVALID_CALL.
+        for code in [
+            0x887A_0006_u32,
+            0x887A_0005,
+            0x887A_0007,
+            0x887A_0020,
+            0x887A_0001,
+        ] {
+            assert!(
+                matches!(ended(code.cast_signed()), Ended::Restart(_)),
+                "0x{code:08X} stops the mirror"
             );
         }
     }
@@ -423,34 +440,24 @@ mod tests {
     }
 
     #[test]
-    fn source_monitor_on_the_card_displays_graphics_card_is_duplicated() {
+    fn source_monitor_is_duplicated_on_its_own_graphics_card() {
         let monitors = [
             monitor("source", r"\\.\DISPLAY1"),
             monitor("card", r"\\.\DISPLAY2"),
         ];
-        let outputs = [output(0, 0, r"\\.\DISPLAY1"), output(0, 1, r"\\.\DISPLAY2")];
-        assert_eq!(
-            source_output("source", &outputs[1], &monitors, &outputs),
-            Ok(&outputs[0])
-        );
-    }
-
-    #[test]
-    fn source_monitor_on_another_graphics_card_is_refused() {
-        let monitors = [
-            monitor("source", r"\\.\DISPLAY1"),
-            monitor("card", r"\\.\DISPLAY2"),
-        ];
-        let outputs = [output(0, 0, r"\\.\DISPLAY1"), output(1, 0, r"\\.\DISPLAY2")];
-        assert_eq!(
-            source_output("source", &outputs[1], &monitors, &outputs),
-            Err(Ended::Stop(
-                "The source monitor and the card display are on different graphics cards. Plug both into the same one.".into()
-            ))
-        );
+        // Same graphics card, then the card display on another one (ADR 0003).
+        for outputs in [
+            [output(0, 0, r"\\.\DISPLAY1"), output(0, 1, r"\\.\DISPLAY2")],
+            [output(0, 0, r"\\.\DISPLAY1"), output(1, 0, r"\\.\DISPLAY2")],
+        ] {
+            assert_eq!(
+                source_output("source", &monitors, &outputs),
+                Ok(&outputs[0])
+            );
+        }
         // Gone during a replug: it may come back, so the start is retried.
         assert_eq!(
-            source_output("gone", &outputs[1], &monitors, &outputs),
+            source_output("gone", &monitors, &[output(0, 0, r"\\.\DISPLAY1")]),
             Err(Ended::Restart(
                 "The source monitor is not connected to any graphics card.".into()
             ))
@@ -505,6 +512,7 @@ mod tests {
             primary: false,
             left: 0,
             top: 0,
+            graphics_card: String::new(),
         }
     }
 

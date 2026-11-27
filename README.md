@@ -21,7 +21,8 @@ There is no installer and no release page yet. Each push builds `cardcast.exe` i
 ## Setup
 
 1. Plug the capture card's HDMI input into the sender's graphics card, and its USB side into the receiver.
-2. Plug the card display into the **same graphics card** as the source monitor. If they are on different graphics cards, Start fails with a message in the status line.
+2. Plug the card display into the same graphics card as the source monitor if it has a free output, or else into another one (a second graphics card or the processor's integrated graphics). cardcast then copies the picture across, which costs the source monitor's graphics card a little work (ADR 0003).
+   - On an NVIDIA graphics card, a monitor using Display Stream Compression (DSC, common on high-refresh monitors) can take two of the card's four display heads, so with two such monitors the card display may get no signal. A lower refresh rate or resolution on one of them, or turning DSC off on it (some monitors do this when switched from DisplayPort 1.4 to 1.2), frees a head, but costs that monitor refresh rate. Plugging the card display into the other graphics card keeps it.
 3. In Windows Display settings, set the card display to **Extend these displays**, never Duplicate.
 4. Set the card display's resolution and refresh rate in Windows (for example 1920×1080 at 60 Hz). cardcast never changes display modes.
 5. The card display must not be the primary monitor.
@@ -37,6 +38,7 @@ The settings window has these controls. Each monitor dropdown shows the monitor'
 - **Audio source**: the playback device whose sound goes to the capture card.
 - **Start / Stop**: starts or stops the mirror. Audio starts and stops with it.
 - **Guard**: turns the window guard and the pointer guard on and off together. On by default; it does nothing until the card display is chosen. The guard works whether or not the mirror is running.
+- **Live layout**: your monitors as Windows arranges them, to scale, each marked with what it is chosen as. Click a monitor to make it the source monitor, the card display or the "send windows to" monitor. While the mirror runs, the header says LIVE with the frame rate the card display gets.
 - **Status line**: shows "Running", "Waiting for card display", "Waiting for source monitor", "Stopped", or the last error in plain words, followed by any audio or guard problem. While the button shows Stop, the mirror runs or starts again by itself; a mirror stopped by an error stays stopped until you press Start.
 
 Choices are saved when you change them. Changing the source monitor, card display or audio source while the mirror runs or waits restarts it on the new choice at once. On launch the mirror starts by itself, and the window starts minimised if it does. Closing the window quits cardcast.
@@ -67,7 +69,7 @@ To choose which programs go to the capture card, use Windows' own per-app sound 
 - Changing the SDR content brightness slider in Windows while the mirror runs has no effect until the mirror is restarted.
 - A rotated (portrait) source monitor shows un-rotated in the mirror.
 - Pointer pixels that normally invert the screen are drawn black, so such a pointer can vanish on dark scenes.
-- If the mirror can't start or is interrupted for a reason that can pass (a monitor or graphics card going away, a driver reset, a mode change, a permission prompt), it tries again every second and the status line says why. A failure that can't pass (Windows or the graphics driver too old, the source monitor and card display on different graphics cards, a fault in cardcast) stops it with the reason; press Start to try again.
+- If the mirror can't start or is interrupted for a reason that can pass (a monitor or graphics card going away, a driver reset, a mode change, a permission prompt), it tries again every second and the status line says why. A failure that can't pass (Windows or the graphics driver too old, a fault in cardcast) stops it with the reason; press Start to try again.
 - The primary monitor is taken to be the one at the top-left corner (0,0) of the Windows desktop. Not yet confirmed on the sender.
 - The card display's sound output is found by matching its name to the monitor's name. Not yet confirmed on the sender or on any capture card.
 
