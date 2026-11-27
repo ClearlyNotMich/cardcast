@@ -190,12 +190,19 @@ impl FrameRate {
     /// refresh rate for [`SLOW_FOR`]: the mirror presents once per refresh, so it misses refreshes.
     pub fn slow_warning(&self, now: Instant) -> Option<String> {
         let (rate, since) = (self.shown?, self.slow_since?);
+        let hz = self.refresh_hz;
         (now.saturating_duration_since(since) >= SLOW_FOR).then(|| {
-            format!(
-                "The mirror shows only {rate:.0} frames a second on a {} Hz card display. \
-                 Set a lower refresh rate for the card display in Windows.",
-                self.refresh_hz
-            )
+            if hz <= 60 {
+                format!(
+                    "The mirror shows only {rate:.0} frames a second on a {hz} Hz card display: \
+                     the sender can't keep up."
+                )
+            } else {
+                format!(
+                    "The mirror shows only {rate:.0} frames a second on a {hz} Hz card display. \
+                     Set a lower refresh rate for the card display in Windows."
+                )
+            }
         })
     }
 }
@@ -236,14 +243,17 @@ impl Role {
         }
     }
 
-    /// Whether the dropdown and the role menu offer `monitor` for this role: not when it makes a
-    /// [`settings::role_problem`]. A problem that is already there (Windows made the card display
-    /// the primary monitor) locks no other choice.
+    /// Whether the dropdown and the role menu offer `monitor` for this role: never when it puts
+    /// two roles on the card display, nor when it makes another [`settings::role_problem`]. A
+    /// card display Windows made the primary monitor locks no other choice.
     pub fn offers(self, settings: &Settings, monitors: &[Monitor], monitor: &Monitor) -> bool {
         let mut chosen = settings.clone();
         *self.choice(&mut chosen) = Some(monitor.device_path.clone());
+        let shared = chosen.card_display.is_some()
+            && (chosen.source_monitor == chosen.card_display
+                || chosen.send_windows_to == chosen.card_display);
         let problem = settings::role_problem(&chosen, monitors);
-        problem.is_none() || problem == settings::role_problem(settings, monitors)
+        !shared && (problem.is_none() || problem == settings::role_problem(settings, monitors))
     }
 
     /// Whether `monitor` is chosen for this role.
@@ -578,6 +588,11 @@ mod tests {
             ["card", "spare"],
             "the current choice stays, and a new one fixes it"
         );
+        assert_eq!(
+            offered(Role::SendWindowsTo, &monitors, &settings),
+            ["source", "primary", "spare"],
+            "never the card display"
+        );
     }
 
     #[test]
@@ -644,6 +659,23 @@ mod tests {
         // Keeping up again clears it at once.
         rate.sample(470, 120, at(4500));
         assert_eq!(rate.slow_warning(at(4500)), None);
+    }
+
+    #[test]
+    fn a_slow_mirror_at_60_hz_or_below_says_the_sender_cannot_keep_up() {
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut rate = FrameRate::default();
+        for second in 0..=4 {
+            rate.sample(40 * second, 60, at(second));
+        }
+        assert_eq!(
+            rate.slow_warning(at(4)).as_deref(),
+            Some(
+                "The mirror shows only 40 frames a second on a 60 Hz card display: \
+                 the sender can't keep up."
+            )
+        );
     }
 
     #[test]

@@ -80,7 +80,7 @@ impl SettingsWindow {
         {
             status.other = Some(error);
         }
-        status.other = cleared.or(status.other);
+        status.other = settings::notices(status.other, cleared);
         let relay_context = context.clone();
         let mirror_context = context.clone();
         let guard_context = context.clone();
@@ -123,7 +123,7 @@ impl SettingsWindow {
             self.minimise_when_running = true;
             self.start();
             self.follow_mirror(context);
-            self.status.other = self.status.other.take().or(loaded);
+            self.status.other = settings::notices(self.status.other.take(), loaded);
         }
     }
 
@@ -782,6 +782,20 @@ mod tests {
         window.status.other = Some(cleared.into());
         launched_minimised(&mut window);
         assert_eq!(window.status.text(), format!("Running | {cleared}"));
+    }
+
+    #[test]
+    fn a_load_notice_and_a_start_notice_are_both_said_at_launch() {
+        let mut window = window("card");
+        window.status.other = Some("loaded".into());
+        // Start says the card display can't be the primary monitor.
+        window.monitors[0].primary = false;
+        window.monitors[1].primary = true;
+        window.launch(&egui::Context::default());
+        assert_eq!(
+            window.status.text(),
+            "The card display can't be the primary monitor. | loaded"
+        );
     }
 
     #[test]

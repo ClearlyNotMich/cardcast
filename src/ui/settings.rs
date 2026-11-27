@@ -230,6 +230,14 @@ pub fn follow_displays(
     }
 }
 
+/// Two notices for the status line's one slot, so neither hides the other.
+pub fn notices(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first} | {second}")),
+        (first, second) => first.or(second),
+    }
+}
+
 /// A changed source monitor, card display or audio source restarts a mirror that runs or will
 /// start by itself, so it follows the choice at once, as the guard does.
 pub fn restarts_on_change(wanted: bool, before: &Settings, after: &Settings) -> bool {
@@ -384,13 +392,15 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Fills choices the user never made: "send windows to" defaults to the primary monitor.
+    /// Fills choices the user never made: "send windows to" defaults to the primary monitor,
+    /// unless that is the card display.
     pub fn with_defaults(mut self, monitors: &[Monitor]) -> Self {
         if self.send_windows_to.is_none() {
             self.send_windows_to = monitors
                 .iter()
                 .find(|monitor| monitor.primary)
-                .map(|monitor| monitor.device_path.clone());
+                .map(|monitor| monitor.device_path.clone())
+                .filter(|primary| self.card_display.as_ref() != Some(primary));
         }
         self
     }
@@ -740,6 +750,22 @@ mod tests {
     }
 
     #[test]
+    fn send_windows_to_has_no_default_while_the_card_display_is_the_primary_monitor() {
+        let settings = chosen("source", "primary").with_defaults(&sender_monitors());
+        assert_eq!(settings.send_windows_to, None);
+    }
+
+    #[test]
+    fn both_notices_are_kept_when_one_meets_another() {
+        let both =
+            |a: Option<&str>, b: Option<&str>| notices(a.map(str::to_owned), b.map(str::to_owned));
+        assert_eq!(both(Some("a"), Some("b")).as_deref(), Some("a | b"));
+        assert_eq!(both(None, Some("b")).as_deref(), Some("b"));
+        assert_eq!(both(Some("a"), None).as_deref(), Some("a"));
+        assert_eq!(both(None, None), None);
+    }
+
+    #[test]
     fn saved_send_windows_to_is_kept() {
         let settings = Settings {
             send_windows_to: Some("source".into()),
@@ -948,15 +974,6 @@ mod tests {
         );
         assert_eq!(
             problem(&chosen("source", "primary")),
-            Some("The card display can't be the primary monitor.")
-        );
-        // Sent to by default, the primary monitor still reads as the primary monitor.
-        let primary_by_default = Settings::default().with_defaults(&sender_monitors());
-        assert_eq!(
-            problem(&Settings {
-                card_display: Some("primary".into()),
-                ..primary_by_default
-            }),
             Some("The card display can't be the primary monitor.")
         );
         let fine = Settings {
