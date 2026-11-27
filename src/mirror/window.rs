@@ -229,7 +229,7 @@ struct Screen {
 }
 
 impl Screen {
-    /// Opens the hidden window on the card display and finds the source monitor's output on the same graphics card.
+    /// Opens the hidden window on the card display, with the device on the source monitor's graphics card.
     fn open(
         source_monitor: &Monitor,
         card_display: &Monitor,
@@ -245,11 +245,10 @@ impl Screen {
             )
         })?;
         let outputs = outputs(&factory);
-        let output =
-            find_output(&card_display.device_path, &monitors, &outputs).ok_or_else(|| {
-                Ended::Restart("The card display is not connected to any graphics card.".into())
-            })?;
-        let source = source_output(&source_monitor.device_path, output, &monitors, &outputs)?;
+        find_output(&card_display.device_path, &monitors, &outputs).ok_or_else(|| {
+            Ended::Restart("The card display is not connected to any graphics card.".into())
+        })?;
+        let source = source_output(&source_monitor.device_path, &monitors, &outputs)?;
         let card_display = monitors
             .iter()
             .find(|monitor| monitor.device_path == card_display.device_path)
@@ -265,7 +264,7 @@ impl Screen {
         };
         // SAFETY: the index came from EnumAdapters1 on this factory just above.
         let adapter =
-            unsafe { factory.EnumAdapters1(output.adapter) }.map_err(failed("graphics card"))?;
+            unsafe { factory.EnumAdapters1(source.adapter) }.map_err(failed("graphics card"))?;
         // SAFETY: the index came from EnumOutputs on this adapter in `outputs`.
         let source = unsafe { adapter.EnumOutputs(source.output) }
             .map_err(|_| Ended::Restart("The source monitor is not connected.".into()))?;

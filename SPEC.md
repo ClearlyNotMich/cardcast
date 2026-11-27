@@ -60,7 +60,7 @@ Behaviour:
 - The mouse pointer is visible in the mirror whenever it is on the source monitor.
 - When capture access is lost (resolution change, a game entering or leaving exclusive fullscreen, a permission prompt), capture is re-created without restarting the program.
 - When the card display disappears, the mirror stops and waits. When it returns, the mirror starts again.
-- Monitors are remembered by the display's device path from the Windows display configuration, not by `\\.\DISPLAYn` or list position. At run time that path is mapped to its DXGI output, and the Direct3D device is created on that output's graphics card, not the default one.
+- Monitors are remembered by the display's device path from the Windows display configuration, not by `\\.\DISPLAYn` or list position. At run time that path is mapped to its DXGI output, and the Direct3D device is created on the source monitor's graphics card, not the default one.
 - The mirror refuses to start when the source monitor and the card display are the same display, or when the card display is the primary monitor.
 - The mirror window runs on its own thread with its own message loop, separate from the settings window.
 
@@ -133,7 +133,7 @@ v1 contains every part below. Each part is handed over as a test build when it i
 
 | Risk | Effect | What to do |
 | --- | --- | --- |
-| The sender's graphics card runs out of outputs with three monitors plus the card display. Not verified. | The card display does not light up | Test with the first mirror build; unplug one monitor to confirm |
+| The sender's graphics card runs out of outputs with three monitors plus the card display. Seen on the sender (issue #25). | The card display does not light up | Plug the card display into another graphics card (ADR 0003) |
 | Capturing the source monitor changes how Windows presents the game | Added input lag | The OBS projector is accepted as feeling right on the reference sender but has not been measured; the input lag check in section 9 compares cardcast against it |
 | HDR to SDR conversion looks different from OBS's | Washed-out or clipped colours on the receiver | Compare against the OBS projector; switch capture method or adjust the conversion |
 | A game in exclusive fullscreen cannot be captured | Black mirror | Recommend borderless mode in the README |
