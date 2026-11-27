@@ -1,10 +1,11 @@
 # cardcast
 
-cardcast is a small Windows program for streaming with two PCs and a capture card. It runs on the sender, the PC the game runs on. It does three things:
+cardcast is a small Windows program for streaming with two PCs and a capture card. It runs on the sender, the PC the game runs on. It does these things:
 
 - It shows a mirror of the source monitor on the card display, so the receiver can capture it.
 - It keeps windows and the mouse pointer off the card display.
 - It plays the chosen audio source into the capture card, so the capture card carries sound.
+- It can switch a monitor's input from a command, for example on a Stream Deck key (see [Switching a monitor's input](#switching-a-monitors-input)).
 
 The receiver needs no cardcast software. OBS on the receiver adds the capture card as a video source.
 
@@ -78,6 +79,30 @@ Run games in borderless (windowed fullscreen) mode. A game in exclusive fullscre
 cardcast records what the audio source plays and plays it again on the sound output. You keep hearing the audio source normally on the sender. Audio problems never stop the mirror.
 
 To choose which programs go to the capture card, use Windows' own per-app sound settings (Settings > System > Sound > Volume mixer): send those programs to the audio source. cardcast has no per-app settings.
+
+## Switching a monitor's input
+
+cardcast can switch a monitor's input over DDC/CI, as the monitor's own buttons do, for example to show the receiver on the AW2523HF and switch back. Run with arguments, `cardcast.exe` does one switch and exits. It opens no window and doesn't touch the settings, and works whether or not the settings window is open.
+
+```
+cardcast.exe input <monitor> <input>
+cardcast.exe input <monitor> toggle <input> <input>
+```
+
+- `<monitor>` is the monitor's EDID serial (for example `4GZY5P3`) or its name as the settings window shows it (for example `"AW2523HF"`), ignoring case. If two monitors share the name, use the serial.
+- `<input>` is `dp`, `dp2`, `hdmi1`, `hdmi2`, or a value `0x01` to `0xFF` for any other input (some makers use their own value for USB-C). The monitor must list it over DDC/CI.
+- `toggle a b` switches to `b` when the monitor is on `a`, otherwise to `a`.
+
+The exit code is 0 when the monitor took the switch or was already on that input, 1 when the switch failed (no such monitor, an input it doesn't list, or no answer over DDC/CI), and 2 when the command was not understood. One line saying what happened goes to standard error, which you only see when you capture it: in a `.cmd` script, `cardcast.exe input 4GZY5P3 hdmi1 2> result.txt` waits for cardcast, then `%ERRORLEVEL%` is the exit code and `result.txt` holds the line. Typed at a command prompt, cmd doesn't wait for cardcast, so `%ERRORLEVEL%` there is not its exit code.
+
+A monitor whose input switched away may drop out of Windows, as if unplugged. Then cardcast can't switch it back; use the monitor's own buttons. If it was the source monitor or the card display, the mirror waits for it and resumes when it is back.
+
+### A Stream Deck key
+
+1. Right-click the desktop and choose **New > Shortcut**. For the location, type the command with the full path to `cardcast.exe` in quotes, for example `"C:\Tools\cardcast\cardcast.exe" input 4GZY5P3 toggle dp hdmi1`. Name it, for example `Toggle AW2523HF`.
+2. In the Stream Deck app, drag **System > Open** onto a key, and for **App / File** choose that shortcut (the `.lnk` file).
+
+Pressing the key switches the monitor without taking focus from the game. Don't set a **Shortcut key** on the shortcut instead: Windows ignores shortcut keys while a fullscreen program runs, so they don't work during games.
 
 ## Known limits
 

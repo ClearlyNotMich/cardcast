@@ -107,12 +107,12 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 
 ## 8. Tech stack and layout
 
-- Stable Rust, one crate named `cardcast`, one binary. Split into modules: `ui`, `mirror`, `guard` and `audio`.
+- Stable Rust, one crate named `cardcast`, one binary. Split into modules: `ui`, `mirror`, `guard`, `audio` and `input` (monitor input switching, section 11).
 - Windows APIs through the `windows` crate: Direct3D 11, DXGI, and Win32 windowing and events.
 - The program declares per-monitor DPI awareness (version 2) in its manifest, so monitor rectangles and window sizes are real pixels on scaled displays.
-- Linux (ADR 0004): the same `Mirror`, `Guard` and `Relay` traits and plain decision functions, with the Linux implementations in `cfg(target_os = "linux")` modules beside the Windows ones; no new traits. Capture through the xdg-desktop-portal ScreenCast and PipeWire on Wayland, MIT-SHM on X11; present as a layer-shell overlay (Plasma, wlroots), an override-redirect window (X11) or a fullscreen window plus the Shell extension (GNOME); audio as a PipeWire loopback; the guards through a helper per desktop (KWin script, GNOME Shell extension, sway or Hyprland IPC, EWMH and XFixes on X11). One plain function, `guard::desktop::detect`, picks the desktop from the environment. Crates and versions: `docs/research/linux-support.md`, section 8; where eframe already pulls a crate in, use that version.
+- Linux (ADR 0004): the same `Mirror`, `Guard`, `Relay` and `Ddc` traits and plain decision functions, with the Linux implementations in `cfg(target_os = "linux")` modules beside the Windows ones; no new traits for existing subsystems. Capture through the xdg-desktop-portal ScreenCast and PipeWire on Wayland, MIT-SHM on X11; present as a layer-shell overlay (Plasma, wlroots), an override-redirect window (X11) or a fullscreen window plus the Shell extension (GNOME); audio as a PipeWire loopback; the guards through a helper per desktop (KWin script, GNOME Shell extension, sway or Hyprland IPC, EWMH and XFixes on X11). One plain function, `guard::desktop::detect`, picks the desktop from the environment. Crates and versions: `docs/research/linux-support.md`, section 8; where eframe already pulls a crate in, use that version.
 - The stand-in mirror, which fakes a running mirror, exists only in tests (`cfg(test)`) for the snapshots; a release build never fakes success.
-- `unsafe` only in the `mirror`, `guard` and `audio` modules, on Windows and Linux alike, each block with a `// SAFETY:` comment.
+- `unsafe` only in the `mirror`, `guard`, `audio` and `input` modules, on Windows and Linux alike, each block with a `// SAFETY:` comment.
 - Check each crate's current version and maintenance status before adding it.
 - Licence: GPL-3.0-or-later (`LICENSE`); only crates with a GPL-compatible licence.
 

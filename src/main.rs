@@ -8,7 +8,7 @@ mod guard;
     not(test),
     allow(
         dead_code,
-        reason = "command mode (issue #38) calls it; its tests run everywhere"
+        reason = "the Copy command (issue #39) and Linux DDC/CI (issue #46) call the rest; its tests run everywhere"
     )
 )]
 mod input;
@@ -16,5 +16,13 @@ mod mirror;
 mod ui;
 
 fn main() -> eframe::Result {
+    // With arguments cardcast is in command mode: one input switch, no window (SPEC section 11).
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if !args.is_empty() {
+        std::process::exit(input::command(&args));
+    }
     ui::run()
 }

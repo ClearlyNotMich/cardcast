@@ -37,6 +37,8 @@ mod window_guard;
 
 #[cfg(windows)]
 pub use displays::DisplayWatcher;
+#[cfg(windows)]
+pub(crate) use displays::device_node;
 
 /// Linux lists no monitors yet (#36), so there are no display changes to follow; it never wakes.
 #[cfg(not(windows))]

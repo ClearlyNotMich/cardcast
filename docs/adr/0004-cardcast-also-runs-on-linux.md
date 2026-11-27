@@ -14,7 +14,7 @@ The Linux build keeps today's module interfaces (the mirror, guard and audio rel
 
 - **Windows only (status quo)**: rejected by the owner.
 - **A separate Linux app**: rejected, because two codebases would drift. The decisions are already platform-free plain functions.
-- **New platform traits for every subsystem**: rejected for now. The existing traits are the seam, and a new trait would be Speculative Generality.
+- **New platform traits for every subsystem**: rejected for now. The existing traits are the seam, and a new trait would be Speculative Generality. A new *subsystem* gets one trait at its own seam, as input switching did on 2026-11-27 (`Ddc`, #38: one Windows implementation, a test fake, and Linux in #46).
 
 ## Consequences
 
