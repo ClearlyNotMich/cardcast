@@ -131,13 +131,14 @@ pub fn animates(status: &Status) -> bool {
 }
 
 /// When the window repaints by itself next, or `None` to wait for input or a report: about 30 Hz
-/// while it animates and has focus, once a second for the frame rate while the game has focus,
-/// and never while minimised or hidden, so the window costs the sender nothing then.
+/// while it animates and has focus, once a second for the frame rate of a running mirror while
+/// the game has focus, and never while minimised or hidden, so the window costs the sender nothing then.
 pub fn next_repaint(status: &Status, visible: bool, focused: bool) -> Option<Duration> {
     match () {
         _ if !visible || !animates(status) => None,
         _ if focused => Some(ANIMATION_FRAME),
-        _ => Some(UNFOCUSED_FRAME),
+        _ if *status == Status::Running => Some(UNFOCUSED_FRAME),
+        _ => None,
     }
 }
 
@@ -247,6 +248,53 @@ pub fn fit_layout(monitors: &[Monitor], area: Rect, gap: f32) -> Vec<Rect> {
         .collect()
 }
 
+/// The live layout's height in a window too small to spare more.
+pub const LAYOUT_HEIGHT: f32 = 180.0;
+
+/// The live layout's height beyond [`LAYOUT_HEIGHT`] for the next pass: last pass's `extra`,
+/// grown by the height the window had spare below the choices (`shown` minus `content`), or
+/// shrunk by what did not fit, down to none. Whole points, so it settles instead of flickering.
+pub fn layout_extra(extra: f32, shown: f32, content: f32) -> f32 {
+    (extra + shown - content).max(0.0).round()
+}
+
+/// Where the live layout draws a chosen card display that is not connected: a 1080p screen a gap
+/// right of the rightmost monitor, level with its top. Its `device_path` is empty.
+pub fn card_display_placeholder(monitors: &[Monitor]) -> Monitor {
+    let rightmost = monitors
+        .iter()
+        .max_by_key(|monitor| monitor.left.saturating_add_unsigned(monitor.width));
+    let (left, top) = rightmost.map_or((0, 0), |monitor| {
+        (
+            monitor
+                .left
+                .saturating_add_unsigned(monitor.width)
+                .saturating_add(240),
+            monitor.top,
+        )
+    });
+    Monitor {
+        device_path: String::new(),
+        gdi_name: String::new(),
+        name: "Card display: not connected".into(),
+        width: 1920,
+        height: 1080,
+        refresh_hz: 0,
+        primary: false,
+        left,
+        top,
+        graphics_card: String::new(),
+    }
+}
+
+/// Whether the picture goes from one graphics card to another (ADR 0003). An unknown card is
+/// taken to be the same one.
+pub fn crosses_cards(source_monitor: &Monitor, card_display: &Monitor) -> bool {
+    !source_monitor.graphics_card.is_empty()
+        && !card_display.graphics_card.is_empty()
+        && source_monitor.graphics_card != card_display.graphics_card
+}
+
 /// The short word the header shows for the mirror; the status line below says the rest.
 pub fn headline(status: &Status) -> &'static str {
     match status {
@@ -261,7 +309,7 @@ pub fn headline(status: &Status) -> &'static str {
 }
 
 /// The picture's path in the live layout: an arc from `from` to `to`, raised by `lift`, as `steps` + 1 points.
-pub fn link_path(from: egui::Pos2, to: egui::Pos2, lift: f32, steps: u16) -> Vec<egui::Pos2> {
+pub fn arc_path(from: egui::Pos2, to: egui::Pos2, lift: f32, steps: u16) -> Vec<egui::Pos2> {
     let control = from.lerp(to, 0.5) - vec2(0.0, lift);
     (0..=steps)
         .map(|step| {
@@ -287,9 +335,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_link_arcs_from_the_source_monitor_to_the_card_display() {
+    fn the_picture_arcs_from_the_source_monitor_to_the_card_display() {
         let (from, to) = (pos2(0.0, 100.0), pos2(200.0, 100.0));
-        let path = link_path(from, to, 40.0, 10);
+        let path = arc_path(from, to, 40.0, 10);
         assert_eq!(path.len(), 11);
         assert_eq!((path[0], path[10]), (from, to));
         assert!(
@@ -355,6 +403,59 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_card_display_is_drawn_beside_the_monitors() {
+        let monitors = [
+            monitor("side", -2560, 0, 2560, 1440),
+            monitor("primary", 0, 0, 2560, 1440),
+            monitor("source", 2560, 180, 1920, 1080),
+        ];
+        let placeholder = card_display_placeholder(&monitors);
+        assert_eq!(
+            (placeholder.left, placeholder.top),
+            (4480 + 240, 180),
+            "a gap right of the rightmost monitor, level with its top"
+        );
+        assert_eq!((placeholder.width, placeholder.height), (1920, 1080));
+        assert_eq!(
+            card_display_placeholder(&[]).left,
+            0,
+            "no monitors: it stands alone"
+        );
+    }
+
+    #[test]
+    fn the_picture_crosses_graphics_cards_only_between_known_different_cards() {
+        let on = |card: &str| Monitor {
+            graphics_card: card.into(),
+            ..monitor("m", 0, 0, 1, 1)
+        };
+        assert!(crosses_cards(&on("RTX 4080"), &on("Integrated GPU")));
+        assert!(!crosses_cards(&on("RTX 4080"), &on("RTX 4080")));
+        assert!(!crosses_cards(&on(""), &on("RTX 4080")), "unknown card");
+    }
+
+    #[test]
+    fn the_live_layout_takes_the_spare_height_and_gives_it_back() {
+        assert_eq!(
+            layout_extra(0.0, 500.0, 400.0),
+            100.0,
+            "a band of 100 spare"
+        );
+        assert_eq!(
+            layout_extra(100.0, 500.0, 500.0),
+            100.0,
+            "it fills the window"
+        );
+        assert_eq!(layout_extra(100.0, 450.0, 500.0), 50.0, "the window shrank");
+        assert_eq!(
+            layout_extra(50.0, 300.0, 500.0),
+            0.0,
+            "too small: it scrolls"
+        );
+        assert_eq!(layout_extra(0.0, 500.4, 400.0), 100.0, "whole points");
+    }
+
+    #[test]
     fn no_monitors_draw_nothing() {
         let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0));
         assert!(fit_layout(&[], area, 0.0).is_empty());
@@ -382,10 +483,11 @@ mod tests {
         assert!(ANIMATION_FRAME >= Duration::from_secs(1) / 31);
         assert_eq!(next_repaint(&running, true, false), Some(UNFOCUSED_FRAME));
         assert_eq!(next_repaint(&running, false, true), None, "minimised");
-        assert_eq!(
-            next_repaint(&Status::Restarting("lost".into()), true, true),
-            Some(ANIMATION_FRAME)
-        );
+        for busy in [Status::Starting, Status::Restarting("lost".into())] {
+            assert_eq!(next_repaint(&busy, true, true), Some(ANIMATION_FRAME));
+            // Without focus they have no frame rate to show and the animation holds still.
+            assert_eq!(next_repaint(&busy, true, false), None, "{busy:?}");
+        }
         for still in [
             Status::Stopped,
             Status::WaitingForCardDisplay,

@@ -2,18 +2,18 @@
 //! and the guard switch. The decisions they draw live in `look`, with tests. No Windows calls.
 
 use super::look::{self, Role, Tone};
-use super::settings::{Settings, Status};
+use super::settings::{self, Settings, Status};
 use crate::guard::Monitor;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke,
     StrokeKind, epaint::RectShape, pos2, vec2,
 };
 
-/// A titled, rounded panel.
+/// A titled, rounded panel, with a hint or warning at the right of its title.
 pub fn section<R>(
     ui: &mut egui::Ui,
     title: &str,
-    hint: &str,
+    hint: RichText,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     egui::Frame::new()
@@ -26,7 +26,7 @@ pub fn section<R>(
             ui.horizontal(|ui| {
                 ui.label(caption(title));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(hint).small().color(look::TEXT_DIM));
+                    ui.label(hint);
                 });
             });
             ui.add_space(4.0);
@@ -178,28 +178,31 @@ pub fn indicator(painter: &egui::Painter, centre: Pos2, status: &Status, time: O
     }
 }
 
-/// The live layout: the sender's monitors as Windows arranges them, to scale. Each shows the roles
-/// it is chosen for, and clicking it chooses them; while the mirror runs, the picture travels
-/// along an arc from the source monitor to the card display.
+/// The live layout: the sender's monitors as Windows arranges them, to scale, `height` high.
+/// Each shows its graphics card and the roles it is chosen for, and clicking it chooses them; a chosen card display that is not connected is a dashed placeholder. While the
+/// mirror runs, the picture travels along an arc from the source monitor to the card display.
 pub fn layout_map(
     ui: &mut egui::Ui,
     monitors: &[Monitor],
     settings: &mut Settings,
     status: &Status,
     time: Option<f64>,
+    height: f32,
 ) {
-    let (area, _) = ui.allocate_exact_size(vec2(ui.available_width(), 180.0), Sense::hover());
+    let size = vec2(ui.available_width(), height);
+    let (area, _) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter_at(area);
     painter.rect_filled(area, 10, look::BACKGROUND);
-    let mut x = area.left() + 24.0;
+    let grid = Stroke::new(1.0, look::BACKGROUND.lerp_to_gamma(look::PANEL, 0.5));
+    let mut x = area.left() + 32.0;
     while x < area.right() {
-        painter.vline(x, area.y_range(), Stroke::new(1.0, look::PANEL));
-        x += 24.0;
+        painter.vline(x, area.y_range(), grid);
+        x += 32.0;
     }
-    let mut y = area.top() + 24.0;
+    let mut y = area.top() + 32.0;
     while y < area.bottom() {
-        painter.hline(area.x_range(), y, Stroke::new(1.0, look::PANEL));
-        y += 24.0;
+        painter.hline(area.x_range(), y, grid);
+        y += 32.0;
     }
     if monitors.is_empty() {
         painter.text(
@@ -211,8 +214,22 @@ pub fn layout_map(
         );
         return;
     }
-    let rects = look::fit_layout(monitors, area.shrink2(vec2(20.0, 24.0)), 3.0);
+    let connected = |path: &Option<String>| {
+        monitors
+            .iter()
+            .find(|monitor| path.as_ref() == Some(&monitor.device_path))
+    };
+    let missing_card_display = (settings.card_display.is_some()
+        && connected(&settings.card_display).is_none())
+    .then(|| look::card_display_placeholder(monitors));
+    let drawn: Vec<Monitor> = monitors
+        .iter()
+        .chain(&missing_card_display)
+        .cloned()
+        .collect();
+    let rects = look::fit_layout(&drawn, area.shrink2(vec2(6.0, 34.0)), 3.0);
     let live = *status == Status::Running;
+    let clash = settings::role_problem(settings).is_some();
     let mut ends = [None, None];
     for (monitor, rect) in monitors.iter().zip(&rects) {
         let roles: Vec<Role> = Role::ALL
@@ -235,21 +252,102 @@ pub fn layout_map(
             )
             .on_hover_text("Click to choose what this monitor is for");
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &monitor.name));
-        monitor_tile(&painter, monitor, *rect, &roles, live, response.hovered());
-        egui::Popup::menu(&response).show(|ui| {
-            ui.label(RichText::new(&monitor.name).strong());
-            for role in Role::ALL {
-                ui.selectable_value(
-                    role.choice(settings),
-                    Some(monitor.device_path.clone()),
-                    RichText::new(role.label()).color(role.colour()),
-                );
-            }
-        });
+        let problem = clash && roles.contains(&Role::CardDisplay);
+        monitor_tile(
+            &painter,
+            monitor,
+            *rect,
+            &roles,
+            live,
+            response.hovered(),
+            problem,
+        );
+        role_menu(&response, monitor, settings);
+    }
+    if let (Some(placeholder), Some(rect)) = (&missing_card_display, rects.last()) {
+        placeholder_tile(&painter, *rect);
+        ui.interact(*rect, ui.scope_id().with("placeholder"), Sense::hover())
+            .widget_info(|| egui::WidgetInfo::labeled(egui::Role::Label, true, &placeholder.name));
+        ends[1] = Some(*rect);
     }
     if let [Some(source), Some(card)] = ends {
-        link(&painter, source.center_top(), card.center_top(), live, time);
+        let crosses = match (
+            connected(&settings.source_monitor),
+            connected(&settings.card_display),
+        ) {
+            (Some(source), Some(card)) => look::crosses_cards(source, card),
+            _ => false,
+        };
+        picture_path(
+            &painter,
+            source.center_top(),
+            card.center_top(),
+            live,
+            crosses,
+            time,
+        );
     }
+}
+
+/// The roles to choose for a clicked monitor; the current ones are ticked. It opens beside the
+/// tile, so it covers neither the tile nor the choices below.
+fn role_menu(response: &egui::Response, monitor: &Monitor, settings: &mut Settings) {
+    egui::Popup::menu(response)
+        .align(egui::RectAlign::RIGHT_START)
+        .align_alternatives(&[egui::RectAlign::LEFT_START, egui::RectAlign::BOTTOM_START])
+        .show(|ui| {
+            ui.label(RichText::new(&monitor.name).strong().color(look::TEXT));
+            for role in Role::ALL {
+                let chosen = role.is(settings, monitor);
+                let row = ui.horizontal(|ui| {
+                    let (tick, _) = ui.allocate_exact_size(vec2(14.0, 14.0), Sense::hover());
+                    if chosen {
+                        check_mark(ui.painter(), tick, role.colour());
+                    }
+                    dot(ui, role.colour());
+                    ui.add(
+                        egui::Button::new(RichText::new(role.label()).color(look::TEXT))
+                            .frame(false),
+                    )
+                });
+                if row.inner.clicked() {
+                    *role.choice(settings) = Some(monitor.device_path.clone());
+                }
+            }
+        });
+}
+
+/// A tick; the default font has no "✔".
+fn check_mark(painter: &egui::Painter, rect: Rect, colour: Color32) {
+    let at = |x: f32, y: f32| rect.lerp_inside(vec2(x, y));
+    painter.add(Shape::line(
+        vec![at(0.1, 0.55), at(0.4, 0.85), at(0.9, 0.2)],
+        Stroke::new(2.0, colour),
+    ));
+}
+
+/// The chosen card display while it is not connected: a dashed outline where it would be.
+fn placeholder_tile(painter: &egui::Painter, rect: Rect) {
+    let corners = [
+        rect.left_top(),
+        rect.right_top(),
+        rect.right_bottom(),
+        rect.left_bottom(),
+        rect.left_top(),
+    ];
+    painter.add(Shape::dashed_line(
+        &corners,
+        Stroke::new(1.5, look::ACCENT.gamma_multiply(0.7)),
+        6.0,
+        4.0,
+    ));
+    painter.with_clip_rect(rect.shrink(3.0)).text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        "Card display\nnot connected",
+        FontId::proportional(12.0),
+        look::ACCENT,
+    );
 }
 
 fn monitor_tile(
@@ -259,6 +357,7 @@ fn monitor_tile(
     roles: &[Role],
     live: bool,
     hovered: bool,
+    problem: bool,
 ) {
     let accent = roles
         .iter()
@@ -273,59 +372,86 @@ fn monitor_tile(
         Some(colour) => colour.gamma_multiply(0.10),
         None => look::RAISED,
     };
-    painter.rect_filled(rect, 8, look::RAISED);
-    painter.rect_filled(rect, 8, fill);
-    let stroke = match (hovered, accent) {
-        (true, _) => Stroke::new(2.0, look::TEXT),
-        (false, Some(colour)) => Stroke::new(2.0, colour),
-        (false, None) => Stroke::new(1.0, look::OUTLINE),
+    // A dark bezel round the screen.
+    painter.rect_filled(rect, 8, look::BACKGROUND);
+    let screen = rect.shrink(4.0);
+    painter.rect_filled(screen, 5, look::RAISED);
+    painter.rect_filled(screen, 5, fill);
+    let stroke = match (hovered, problem, accent) {
+        (true, _, _) => Stroke::new(2.0, look::TEXT),
+        (false, true, _) => Stroke::new(2.0, look::PROBLEM),
+        (false, false, Some(colour)) => Stroke::new(2.0, colour),
+        (false, false, None) => Stroke::new(1.0, look::OUTLINE),
     };
     painter.rect_stroke(rect, 8, stroke, StrokeKind::Inside);
 
-    let painter = painter.with_clip_rect(rect.shrink(3.0));
-    let top = rect.center_top() + vec2(0.0, 8.0);
+    let painter = painter.with_clip_rect(screen.shrink(2.0));
+    let mut line = screen.center_top() + vec2(0.0, 6.0);
     painter.text(
-        top,
+        line,
         Align2::CENTER_TOP,
         &monitor.name,
         FontId::proportional(13.0),
         look::TEXT,
     );
     let primary = if monitor.primary { " · primary" } else { "" };
-    painter.text(
-        top + vec2(0.0, 18.0),
-        Align2::CENTER_TOP,
+    for detail in [
         format!(
             "{}×{} · {} Hz{primary}",
             monitor.width, monitor.height, monitor.refresh_hz
         ),
-        FontId::proportional(10.5),
-        look::TEXT_DIM,
-    );
+        monitor.graphics_card.clone(),
+    ] {
+        line += vec2(0.0, 15.0);
+        painter.text(
+            line,
+            Align2::CENTER_TOP,
+            detail,
+            FontId::proportional(10.5),
+            look::TEXT_DIM,
+        );
+    }
     // Badges stack up from the bottom; a tile too small for them shows its roles by its outline.
-    let mut badge_bottom = rect.bottom() - 7.0;
+    let mut badge_bottom = screen.bottom() - 5.0;
     for role in roles.iter().rev() {
         let text = painter.layout_no_wrap(
             role.label().to_owned(),
             FontId::proportional(10.0),
             role.colour(),
         );
-        let size = text.size() + vec2(12.0, 4.0);
-        if badge_bottom - size.y < top.y + 32.0 {
+        let size = text.size() + vec2(12.0, 3.0);
+        if badge_bottom - size.y < line.y + 14.0 {
             break;
         }
         let badge =
-            Rect::from_center_size(pos2(rect.center().x, badge_bottom - size.y / 2.0), size);
+            Rect::from_center_size(pos2(screen.center().x, badge_bottom - size.y / 2.0), size);
         painter.rect_filled(badge, 255, role.colour().gamma_multiply(0.18));
-        painter.galley(badge.min + vec2(6.0, 2.0), text, role.colour());
+        painter.galley(badge.min + vec2(6.0, 1.5), text, role.colour());
         badge_bottom = badge.top() - 3.0;
     }
 }
 
-/// The arc the picture takes from the source monitor to the card display; dots travel along it while live.
-fn link(painter: &egui::Painter, from: Pos2, to: Pos2, live: bool, time: Option<f64>) {
+/// The arc the picture takes from the source monitor to the card display; dots travel along it
+/// while live. When it `crosses` graphics cards, its top says so.
+fn picture_path(
+    painter: &egui::Painter,
+    from: Pos2,
+    to: Pos2,
+    live: bool,
+    crosses: bool,
+    time: Option<f64>,
+) {
     let lift = 22.0 + from.distance(to) * 0.12;
-    let path = look::link_path(from, to, lift, 32);
+    let path = look::arc_path(from, to, lift, 32);
+    if let (true, Some(top)) = (crosses, look::along(&path, 0.5)) {
+        painter.text(
+            top - vec2(0.0, 4.0),
+            Align2::CENTER_BOTTOM,
+            "across graphics cards",
+            FontId::proportional(10.5),
+            look::TEXT_DIM,
+        );
+    }
     if !live {
         painter.add(Shape::dashed_line(
             &path,
@@ -357,26 +483,45 @@ fn link(painter: &egui::Painter, from: Pos2, to: Pos2, live: bool, time: Option<
     painter.circle_filled(to, 3.5, look::ACCENT);
 }
 
-/// A sliding switch, read by screen readers as the checkbox it replaces.
-pub fn switch(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
-    let (rect, mut response) = ui.allocate_exact_size(vec2(44.0, 24.0), Sense::click());
+/// A sliding switch with its title and a note beside it; a click anywhere on it toggles it.
+/// Screen readers read it as the checkbox it replaces, named `title`.
+pub fn switch(ui: &mut egui::Ui, on: &mut bool, title: &str, note: &str) -> egui::Response {
+    let title =
+        ui.painter()
+            .layout_no_wrap(title.to_owned(), FontId::proportional(14.0), look::TEXT);
+    let note =
+        ui.painter()
+            .layout_no_wrap(note.to_owned(), FontId::proportional(11.0), look::TEXT_DIM);
+    let text_width = title.size().x.max(note.size().x);
+    let height = (title.size().y + 2.0 + note.size().y).max(24.0);
+    let (rect, mut response) =
+        ui.allocate_exact_size(vec2(44.0 + 12.0 + text_width, height), Sense::click());
     if response.clicked() {
         *on = !*on;
         response.mark_changed();
     }
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *on, label)
+        egui::WidgetInfo::selected(egui::Role::CheckBox, ui.is_enabled(), *on, title.text())
     });
+    let track_rect =
+        Rect::from_min_size(pos2(rect.left(), rect.center().y - 12.0), vec2(44.0, 24.0));
     let how_on = ui.ctx().animate_bool_responsive(response.id, *on);
     let track = look::IDLE.lerp_to_gamma(look::LIVE, how_on);
-    ui.painter()
-        .rect_filled(rect, 255, track.gamma_multiply(0.35));
-    ui.painter()
-        .rect_stroke(rect, 255, Stroke::new(1.0, track), StrokeKind::Inside);
+    let painter = ui.painter();
+    painter.rect_filled(track_rect, 255, track.gamma_multiply(0.35));
+    painter.rect_stroke(track_rect, 255, Stroke::new(1.0, track), StrokeKind::Inside);
     let knob = pos2(
-        egui::lerp(rect.left() + 12.0..=rect.right() - 12.0, how_on),
-        rect.center().y,
+        egui::lerp(track_rect.left() + 12.0..=track_rect.right() - 12.0, how_on),
+        track_rect.center().y,
     );
-    ui.painter().circle_filled(knob, 8.0, look::TEXT);
+    painter.circle_filled(knob, 8.0, look::TEXT);
+    let text_left = track_rect.right() + 12.0;
+    let title_height = title.size().y;
+    painter.galley(pos2(text_left, rect.top()), title, look::TEXT);
+    painter.galley(
+        pos2(text_left, rect.top() + title_height + 2.0),
+        note,
+        look::TEXT_DIM,
+    );
     response
 }

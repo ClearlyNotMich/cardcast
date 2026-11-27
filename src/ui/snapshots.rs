@@ -7,7 +7,18 @@ use crate::mirror::StandInMirror;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
-fn monitor(device_path: &str, name: &str, size: (u32, u32), hz: u32, at: (i32, i32)) -> Monitor {
+/// The sender's graphics card, and the processor's integrated graphics the card display is on.
+const RTX_4080: &str = "NVIDIA GeForce RTX 4080";
+const INTEGRATED: &str = "Integrated graphics";
+
+fn monitor(
+    device_path: &str,
+    name: &str,
+    size: (u32, u32),
+    hz: u32,
+    at: (i32, i32),
+    graphics_card: &str,
+) -> Monitor {
     Monitor {
         device_path: device_path.into(),
         gdi_name: String::new(),
@@ -18,18 +29,40 @@ fn monitor(device_path: &str, name: &str, size: (u32, u32), hz: u32, at: (i32, i
         primary: at == (0, 0),
         left: at.0,
         top: at.1,
-        graphics_card: String::new(),
+        graphics_card: graphics_card.into(),
     }
 }
 
-/// The sender of SPEC section 3: a 1440p 500 Hz source monitor left of the primary monitor, and
-/// the capture card's display to the right.
+/// The real sender: a 1440p monitor left of the primary 1440p monitor, the 500 Hz source monitor
+/// right of it, all on the RTX 4080, and the capture card's display on the integrated graphics.
 fn sender(status: Status) -> SettingsWindow {
     let mut window = super::tests::window("card");
     window.monitors = vec![
-        monitor("source", "Gaming monitor", (2560, 1440), 500, (-2560, -180)),
-        monitor("primary", "Desk monitor", (1920, 1080), 144, (0, 0)),
-        monitor("card", "HD60 X", (1920, 1080), 60, (1920, 0)),
+        monitor(
+            "side",
+            "MSI MAG 272Q X50",
+            (2560, 1440),
+            144,
+            (-2560, 0),
+            RTX_4080,
+        ),
+        monitor(
+            "primary",
+            "Dell S2417DG",
+            (2560, 1440),
+            144,
+            (0, 0),
+            RTX_4080,
+        ),
+        monitor(
+            "source",
+            "Dell AW2523HF",
+            (1920, 1080),
+            500,
+            (2560, 180),
+            RTX_4080,
+        ),
+        monitor("card", "HD60 X", (1920, 1080), 60, (4480, 180), INTEGRATED),
     ];
     window.playback_devices = vec![
         AudioDevice {
@@ -96,12 +129,18 @@ fn snapshot_waiting_for_card_display() {
 
 #[test]
 fn snapshot_error() {
-    let mut window = sender(Status::Error(
+    let window = sender(Status::Error(
         "Could not start the mirror: the graphics driver is too old. Update it. (Direct3D 11.1)"
             .into(),
     ));
-    window.settings.card_display = Some("primary".into());
     snapshot("error", window);
+}
+
+#[test]
+fn snapshot_invalid_roles() {
+    let mut window = sender(Status::Stopped);
+    window.settings.send_windows_to = Some("card".into());
+    snapshot("invalid_roles", window);
 }
 
 #[test]
@@ -117,7 +156,25 @@ fn snapshot_guard_notice() {
 #[test]
 fn snapshot_role_menu_opens_on_a_monitor_click() {
     let mut harness = harness(sender(Status::Stopped));
-    harness.get_by_label("Desk monitor").click();
+    harness.get_by_label("Dell S2417DG").click();
     harness.run();
     harness.snapshot("role_menu");
+}
+
+#[test]
+fn the_guard_switch_is_read_once_and_its_text_toggles_it() {
+    let mut harness = Harness::new_ui_state(
+        |ui, on: &mut bool| {
+            live::switch(ui, on, "Guard", "Keeps windows off the card display");
+        },
+        true,
+    );
+    harness.run();
+    // One node named "Guard": `get_by_label` fails on two.
+    let switch = harness.get_by_label("Guard");
+    // A click lands on the node's centre, which is on the text right of the 44-point track.
+    assert!(switch.rect().center().x > switch.rect().left() + 44.0);
+    switch.click();
+    harness.run();
+    assert!(!*harness.state());
 }

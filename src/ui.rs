@@ -54,6 +54,8 @@ struct SettingsWindow {
     /// `None` if it could not start; the status line says so.
     _display_watcher: Option<guard::DisplayWatcher>,
     frame_rate: FrameRate,
+    /// Height the live layout takes beyond `look::LAYOUT_HEIGHT`, so the window has no empty band.
+    layout_extra: f32,
 }
 
 impl SettingsWindow {
@@ -97,6 +99,7 @@ impl SettingsWindow {
             displays_changed,
             _display_watcher: display_watcher,
             frame_rate: FrameRate::default(),
+            layout_extra: 0.0,
         }
     }
 
@@ -327,16 +330,17 @@ impl SettingsWindow {
                 }
             }
             ui.add_space(12.0);
-            live::switch(ui, &mut self.settings.guard_enabled, "Guard");
-            ui.vertical(|ui| {
-                ui.label(RichText::new("Guard").strong().color(look::TEXT));
-                ui.label(
-                    RichText::new("Keeps windows and the pointer off the card display")
-                        .small()
-                        .color(look::TEXT_DIM),
-                );
-            });
+            live::switch(
+                ui,
+                &mut self.settings.guard_enabled,
+                "Guard",
+                "Keeps windows and the pointer off the card display",
+            );
         });
+        // The header shows the mirror's state; this box only says what it cannot.
+        let Some(details) = self.status.details() else {
+            return;
+        };
         ui.add_space(6.0);
         let tone = look::Tone::of(&self.status.mirror);
         egui::Frame::new()
@@ -348,8 +352,13 @@ impl SettingsWindow {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
                     live::dot(ui, tone.colour());
-                    ui.label(RichText::new(self.status.text()).color(look::TEXT));
-                    if self.status.guard.is_some() && ui.button("Dismiss guard notice").clicked() {
+                    ui.label(RichText::new(details).color(look::TEXT));
+                    if self.status.guard.is_some()
+                        && ui
+                            .small_button("Dismiss")
+                            .on_hover_text("Dismiss the guard notice")
+                            .clicked()
+                    {
                         self.status.dismiss_guard_notice();
                     }
                 });
@@ -410,24 +419,26 @@ impl eframe::App for SettingsWindow {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(look::BACKGROUND).inner_margin(16))
             .show(ui, |ui| {
+                let hint = match settings::role_problem(&self.settings) {
+                    Some(problem) => RichText::new(problem).small().color(look::PROBLEM),
+                    None => RichText::new("Click a monitor to choose its role")
+                        .small()
+                        .color(look::TEXT_DIM),
+                };
                 // A small window scrolls instead of hiding the choices under the controls.
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    live::section(
-                        ui,
-                        "LIVE LAYOUT",
-                        "Click a monitor to choose its role",
-                        |ui| {
-                            live::layout_map(
-                                ui,
-                                &self.monitors,
-                                &mut self.settings,
-                                &self.status.mirror,
-                                time,
-                            );
-                        },
-                    );
+                let shown = egui::ScrollArea::vertical().show(ui, |ui| {
+                    live::section(ui, "LIVE LAYOUT", hint, |ui| {
+                        live::layout_map(
+                            ui,
+                            &self.monitors,
+                            &mut self.settings,
+                            &self.status.mirror,
+                            time,
+                            look::LAYOUT_HEIGHT + self.layout_extra,
+                        );
+                    });
                     ui.add_space(8.0);
-                    live::section(ui, "CHOICES", "", |ui| {
+                    live::section(ui, "CHOICES", RichText::new(""), |ui| {
                         ui.columns(2, |columns| {
                             self.monitor_dropdown(&mut columns[0], Role::SourceMonitor);
                             self.monitor_dropdown(&mut columns[1], Role::CardDisplay);
@@ -439,6 +450,17 @@ impl eframe::App for SettingsWindow {
                         });
                     });
                 });
+                // The live layout takes the spare height; a pass drawn with the old height is redone.
+                let extra = look::layout_extra(
+                    self.layout_extra,
+                    shown.inner_rect.height(),
+                    shown.content_size.y,
+                );
+                if extra != self.layout_extra {
+                    self.layout_extra = extra;
+                    ui.ctx()
+                        .request_discard("the live layout takes the spare height");
+                }
             });
         if self.settings != before {
             self.follow_settings(&before);
@@ -539,6 +561,7 @@ mod tests {
             displays_changed: Arc::default(),
             _display_watcher: None,
             frame_rate: FrameRate::default(),
+            layout_extra: 0.0,
         }
     }
 
@@ -642,6 +665,7 @@ mod tests {
             displays_changed,
             _display_watcher: display_watcher,
             frame_rate: FrameRate::default(),
+            layout_extra: 0.0,
         };
         (window, guard)
     }
