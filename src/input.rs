@@ -1,13 +1,24 @@
-//! Input switch decisions and command mode (SPEC section 11). Windows calls only in `ddc`, so every platform's DDC/CI code can share the rest.
+//! Input switch decisions and command mode (SPEC section 11). Platform calls only in `ddc` (Windows) and `linux`, so both share the rest.
 
 #[cfg(windows)]
 mod ddc;
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as ddc;
 
 use crate::guard::Monitor;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
+
+/// The program's name in commands.
+const EXE: &str = if cfg!(windows) {
+    "cardcast.exe"
+} else {
+    "cardcast"
+};
 
 /// A monitor's DDC/CI connection. Every call blocks, the capabilities string for up to seconds (docs/win32-ddc.md).
 pub trait Ddc {
@@ -21,19 +32,7 @@ pub trait Ddc {
 
 /// Command mode: does the switch `args` (the arguments after the program name) asks for, writes one line to standard error, and returns the exit code.
 pub fn command(args: &[String]) -> i32 {
-    #[cfg(windows)]
     let (code, line) = run_command(args, ddc::monitors, ddc::open);
-    // shortcut: no DDC/CI on Linux yet, so a valid command exits 1; issue #46 adds it.
-    #[cfg(not(windows))]
-    let (code, line) = run_command(
-        args,
-        || {
-            Err::<Vec<(MonitorId, ())>, _>(
-                "Input switching is not available on Linux yet.".to_owned(),
-            )
-        },
-        |()| None,
-    );
     // Fails silently when the caller didn't capture standard error, as a GUI program has none.
     let _ = writeln!(std::io::stderr(), "{line}");
     code
@@ -182,11 +181,25 @@ pub fn edid_serial(edid: &[u8]) -> Option<String> {
 }
 
 /// The monitor's name from its EDID name descriptor, for example `DELL AW2523HF`; `None` when it has none or the EDID is broken.
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "only the Linux monitor list reads it; Windows has its own"
+    )
+)]
 pub fn edid_name(edid: &[u8]) -> Option<String> {
     descriptor_text(edid_block(edid)?, 0xFC)?
 }
 
 /// The EDID's maker and product code as Windows writes them in a monitor's device path, for example `DEL42B9`.
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "only the Linux monitor list reads it; Windows has its own"
+    )
+)]
 pub fn edid_product(edid: &[u8]) -> Option<String> {
     let block = edid_block(edid)?;
     let maker = u16::from_be_bytes([block[8], block[9]]);
@@ -291,7 +304,7 @@ pub struct InputRequest {
 pub fn parse_input_command(args: &[String]) -> Result<InputRequest, String> {
     let not_understood = |what: &str| {
         format!(
-            "Not understood: {what}. Use: cardcast.exe input <monitor> <input>, or cardcast.exe input <monitor> toggle <input> <input>, where <input> is dp, dp2, hdmi1, hdmi2 or 0x01 to 0xFF."
+            "Not understood: {what}. Use: {EXE} input <monitor> <input>, or {EXE} input <monitor> toggle <input> <input>, where <input> is dp, dp2, hdmi1, hdmi2 or 0x01 to 0xFF."
         )
     };
     let value = |word: &String| {
@@ -352,19 +365,13 @@ pub fn decide_switch(
     })
 }
 
-/// What the status line says while input switching is on and not built for this platform (#46).
-#[cfg(not(windows))]
-pub const NOT_BUILT: &str = "Input switching does not work on Linux yet.";
-
 /// The input thread for the settings window; `wake` asks it to repaint when a report is waiting.
 pub fn new_input_thread(wake: impl Fn() + Send + 'static) -> Result<InputThread, String> {
-    #[cfg(windows)]
-    return InputThread::spawn(ddc::serial, ddc::open_monitor, wake);
-    #[cfg(not(windows))]
-    {
-        let _ = wake;
-        Err(NOT_BUILT.to_owned())
+    #[cfg(target_os = "linux")]
+    if let Some(problem) = linux::access_problem() {
+        return Err(problem.to_owned());
     }
+    InputThread::spawn(ddc::serial, ddc::open_monitor, wake)
 }
 
 /// The settings window's DDC/CI calls, one at a time on their own thread, never the settings
@@ -582,10 +589,8 @@ pub fn command_line(exe: &str, monitor: &str, value: u8) -> String {
 
 /// [`command_line`] for this cardcast, as the Copy command button copies it.
 pub fn copy_command(monitor: &str, value: u8) -> String {
-    let exe = std::env::current_exe().map_or_else(
-        |_| "cardcast.exe".to_owned(),
-        |exe| exe.display().to_string(),
-    );
+    let exe =
+        std::env::current_exe().map_or_else(|_| EXE.to_owned(), |exe| exe.display().to_string());
     command_line(&exe, monitor, value)
 }
 
@@ -1046,6 +1051,8 @@ mod tests {
             );
             assert_eq!(code, 2, "{command:?}");
             assert!(line.starts_with("Not understood: "), "{command:?}: {line}");
+            let usage = format!("Use: {EXE} input <monitor> <input>, or {EXE} input");
+            assert!(line.contains(&usage), "{line}");
         }
     }
 
