@@ -197,8 +197,9 @@ pub(super) fn connector(adapter: windows::Win32::Foundation::LUID, target: u32) 
         return String::new();
     }
     format!(
-        "{} target {target}",
-        super::wide_to_string(&name.adapterDevicePath)
+        "{} LUID {:?} target {target}",
+        super::wide_to_string(&name.adapterDevicePath),
+        (adapter.HighPart, adapter.LowPart)
     )
 }
 
