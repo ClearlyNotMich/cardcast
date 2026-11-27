@@ -69,7 +69,12 @@ impl SettingsWindow {
             status.other = Some(error);
             Vec::new()
         });
-        let settings = Settings::load().with_defaults(&monitors);
+        let mut settings = Settings::load().with_defaults(&monitors);
+        if settings::follow_card_display(&mut settings, &monitors)
+            && let Err(error) = settings.save()
+        {
+            status.other = Some(error);
+        }
         let relay_context = context.clone();
         let mirror_context = context.clone();
         let guard_context = context.clone();
@@ -151,7 +156,8 @@ impl SettingsWindow {
         if let (Some(audio_source), Some(card_display)) =
             (&self.settings.audio_source, card_display)
         {
-            self.relay.start(audio_source, &card_display.name);
+            self.relay
+                .start(audio_source, &card_display.container_id, &card_display.name);
         }
     }
 
@@ -233,15 +239,22 @@ impl SettingsWindow {
     }
 
     fn follow_monitors(&mut self, monitors: Vec<Monitor>) {
-        let chosen = |monitors: &'_ [Monitor]| {
-            [&self.settings.source_monitor, &self.settings.card_display].map(|chosen| {
+        let chosen = |settings: &Settings, monitors: &'_ [Monitor]| {
+            [&settings.source_monitor, &settings.card_display].map(|chosen| {
                 monitors
                     .iter()
                     .find(|monitor| chosen.as_ref() == Some(&monitor.device_path))
                     .cloned()
             })
         };
-        let (before, now) = (chosen(&self.monitors), chosen(&monitors));
+        let before = chosen(&self.settings, &self.monitors);
+        if settings::follow_card_display(&mut self.settings, &monitors) {
+            update_guard(&mut *self.guard, &self.settings);
+            if let Err(error) = self.settings.save() {
+                self.status.other = Some(error);
+            }
+        }
+        let now = chosen(&self.settings, &monitors);
         let follow = settings::follow_displays(
             self.status.shows_stop(),
             self.mirror.is_running() || matches!(self.status.mirror, Status::Restarting(_)),
@@ -462,6 +475,8 @@ impl eframe::App for SettingsWindow {
                         .request_discard("the live layout takes the spare height");
                 }
             });
+        // A newly chosen card display's connector is saved with it.
+        settings::follow_card_display(&mut self.settings, &self.monitors);
         if self.settings != before {
             self.follow_settings(&before);
             if let Err(error) = self.settings.save() {
@@ -494,10 +509,10 @@ mod tests {
     );
 
     impl audio::Relay for RecordingRelay {
-        fn start(&mut self, audio_source: &str, card_display_name: &str) {
-            self.0
-                .borrow_mut()
-                .push(format!("start {audio_source} to {card_display_name}"));
+        fn start(&mut self, audio_source: &str, container: &str, card_display_name: &str) {
+            self.0.borrow_mut().push(format!(
+                "start {audio_source} to {card_display_name} in {container}"
+            ));
         }
         fn stop(&mut self) {
             self.0.borrow_mut().push("stop".into());
@@ -539,6 +554,8 @@ mod tests {
             left: 0,
             top: 0,
             graphics_card: String::new(),
+            container_id: format!("{device_path} container"),
+            connector: format!("{device_path} connector"),
         }
     }
 
@@ -611,7 +628,7 @@ mod tests {
         window.stop(Status::Stopped);
         assert_eq!(
             *relay.0.borrow(),
-            ["stop", "start speakers to card", "stop"]
+            ["stop", "start speakers to card in card container", "stop"]
         );
     }
 
@@ -849,7 +866,7 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
         assert_eq!(
             relay.0.borrow().last().map(String::as_str),
-            Some("start speakers to card")
+            Some("start speakers to card in card container")
         );
     }
 
@@ -882,7 +899,36 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
         assert_eq!(
             relay.0.borrow().last().map(String::as_str),
-            Some("start speakers to card")
+            Some("start speakers to card in card container")
+        );
+    }
+
+    #[test]
+    fn card_display_with_a_new_device_path_is_followed_on_its_connector() {
+        let guard = ReportingGuard::default();
+        let (mut window, relay) = with_relay(window("card"), Some("speakers"));
+        window.guard = Box::new(guard.clone());
+        window.start();
+        // Display EDID mode: the card display comes back named after the next display, with a new device path.
+        let monitors = window.monitors.clone();
+        window.follow_monitors(monitors.clone());
+        let renamed = Monitor {
+            device_path: "card renamed".into(),
+            name: "LG TV".into(),
+            container_id: "TV container".into(),
+            ..monitors[1].clone()
+        };
+        window.follow_monitors(vec![monitors[0].clone(), renamed]);
+        assert_eq!(
+            window.settings.card_display.as_deref(),
+            Some("card renamed")
+        );
+        assert_eq!(guard.1.borrow().as_deref(), Some("card renamed"));
+        assert!(window.mirror.is_running());
+        assert_eq!(window.status.text(), "Running");
+        assert_eq!(
+            relay.0.borrow().last().map(String::as_str),
+            Some("start speakers to LG TV in TV container")
         );
     }
 
@@ -900,7 +946,7 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
         assert_eq!(
             relay.0.borrow().last().map(String::as_str),
-            Some("start speakers to card 2")
+            Some("start speakers to card 2 in card 2 container")
         );
         assert_eq!(guard.1.borrow().as_deref(), Some("card 2"));
     }
@@ -1110,7 +1156,7 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
         assert_eq!(
             relay.0.borrow().last().map(String::as_str),
-            Some("start speakers to card")
+            Some("start speakers to card in card container")
         );
         let mut output = context.run_ui(egui::RawInput::default(), |_| {});
         output.textures_delta.clear();

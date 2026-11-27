@@ -28,9 +28,10 @@ mod samples;
 /// What the settings window needs from the audio relay, which records the audio source and
 /// plays it on the card display's sound output.
 pub trait Relay {
-    /// Starts relaying `audio_source` (a playback device id) to the sound output named after the
-    /// card display. Problems arrive later through `take_report`, as the relay keeps retrying.
-    fn start(&mut self, audio_source: &str, card_display_name: &str);
+    /// Starts relaying `audio_source` (a playback device id) to the card display's sound output,
+    /// found by the card display's container ID, else its name (see [`card_output`]). Problems
+    /// arrive later through `take_report`, as the relay keeps retrying.
+    fn start(&mut self, audio_source: &str, card_display_container: &str, card_display_name: &str);
     fn stop(&mut self);
     /// The relay's latest change for the status line.
     fn take_report(&mut self) -> Option<RelayReport>;
@@ -67,7 +68,7 @@ pub struct StandInRelay;
 
 #[cfg(not(windows))]
 impl Relay for StandInRelay {
-    fn start(&mut self, _audio_source: &str, _card_display_name: &str) {}
+    fn start(&mut self, _audio_source: &str, _container: &str, _card_display_name: &str) {}
     fn stop(&mut self) {}
     fn take_report(&mut self) -> Option<RelayReport> {
         None
@@ -82,10 +83,13 @@ pub struct AudioDevice {
     pub name: String,
     /// `PKEY_Device_DeviceDesc`; for an HDMI sound output it is the monitor's EDID name.
     pub description: String,
+    /// `PKEY_Device_ContainerId`, the physical device it is part of; empty if unknown.
+    pub container_id: String,
 }
 
-/// The card display's sound output: the playback device named after the card display, which
-/// must not be the audio source itself.
+/// The card display's sound output, which must not be the audio source itself: the one playback
+/// device in the card display's container (Windows gives a monitor and its HDMI or DisplayPort
+/// sound output the same container ID), else the playback device named after the card display.
 #[cfg_attr(
     not(windows),
     allow(dead_code, reason = "only the Windows relay calls it")
@@ -93,19 +97,39 @@ pub struct AudioDevice {
 pub fn card_output<'a>(
     devices: &'a [AudioDevice],
     audio_source: &str,
+    card_display_container: &str,
     card_display_name: &str,
 ) -> Result<&'a AudioDevice, String> {
     if !devices.iter().any(|device| device.id == audio_source) {
         return Err("The audio source is not connected.".into());
     }
     let card_display_name = card_display_name.trim();
-    let output = devices
-        .iter()
-        .find(|device| without_number(&device.description).eq_ignore_ascii_case(card_display_name))
+    let mut in_container = devices.iter().filter(|device| {
+        !card_display_container.is_empty()
+            && device
+                .container_id
+                .eq_ignore_ascii_case(card_display_container)
+    });
+    let by_container = match (in_container.next(), in_container.next()) {
+        (Some(device), None) => Some(device),
+        _ => None,
+    };
+    let output = by_container
+        .or_else(|| {
+            devices.iter().find(|device| {
+                without_number(&device.description).eq_ignore_ascii_case(card_display_name)
+            })
+        })
         .ok_or_else(|| {
-            format!(
-                "Could not find the card display's sound output (a playback device named {card_display_name})."
-            )
+            if card_display_container.is_empty() {
+                format!(
+                    "Could not find the card display's sound output: Windows did not say which device the card display is part of, and no playback device is named {card_display_name}."
+                )
+            } else {
+                format!(
+                    "Could not find the card display's sound output: no playback device is part of the card display, and none is named {card_display_name}."
+                )
+            }
         })?;
     if output.id == audio_source {
         return Err(
@@ -137,6 +161,7 @@ pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
         id: "stand-in-speakers".into(),
         name: "Stand-in speakers".into(),
         description: "Speakers".into(),
+        container_id: String::new(),
     }])
 }
 
@@ -144,11 +169,12 @@ pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
 #[cfg(windows)]
 pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
     use windows::Win32::Devices::FunctionDiscovery::{
-        PKEY_Device_DeviceDesc, PKEY_Device_FriendlyName,
+        PKEY_Device_ContainerId, PKEY_Device_DeviceDesc, PKEY_Device_FriendlyName,
     };
     use windows::Win32::Media::Audio::{
         DEVICE_STATE_ACTIVE, IMMDeviceEnumerator, MMDeviceEnumerator, eRender,
     };
+    use windows::Win32::System::Com::StructuredStorage::PropVariantToGUID;
     use windows::Win32::System::Com::{
         CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
         STGM_READ,
@@ -184,10 +210,15 @@ pub fn playback_devices() -> Result<Vec<AudioDevice>, String> {
         let name = unsafe { store.GetValue(&PKEY_Device_FriendlyName) }.map_err(failed)?;
         // SAFETY: store is a live COM object and the key is a static PROPERTYKEY.
         let description = unsafe { store.GetValue(&PKEY_Device_DeviceDesc) }.map_err(failed)?;
+        // SAFETY: store is a live COM object and the key is a static PROPERTYKEY.
+        let container = unsafe { store.GetValue(&PKEY_Device_ContainerId) };
+        // SAFETY: the PROPVARIANT is GetValue's own; PropVariantToGUID fails on any type but a GUID.
+        let container = container.and_then(|value| unsafe { PropVariantToGUID(&value) });
         devices.push(AudioDevice {
             id: id.map_err(|_| "A playback device has an unreadable id.".to_owned())?,
             name: name.to_string(),
             description: description.to_string(),
+            container_id: container.map_or_else(|_| String::new(), |guid| format!("{guid:?}")),
         });
     }
     Ok(devices)
@@ -202,7 +233,73 @@ mod tests {
             id: id.into(),
             name: format!("{description} (High Definition Audio)"),
             description: description.into(),
+            container_id: format!("container of {id}"),
         }
+    }
+
+    fn in_container(id: &str, description: &str, container_id: &str) -> AudioDevice {
+        AudioDevice {
+            container_id: container_id.into(),
+            ..device(id, description)
+        }
+    }
+
+    #[test]
+    fn card_output_is_the_device_in_the_card_displays_container_whatever_its_name() {
+        // Display EDID mode: the monitor takes the next display's name, the playback device keeps "HD60 X".
+        let devices = sender_devices();
+        assert_eq!(
+            card_output(
+                &devices,
+                "headphones",
+                "container of hdmi-card",
+                "LG TV SSCR2"
+            ),
+            Ok(&devices[1])
+        );
+    }
+
+    #[test]
+    fn container_match_ignores_case() {
+        let devices = vec![
+            device("headphones", "Headphones"),
+            in_container(
+                "hdmi-card",
+                "HD60 X",
+                "8C7ED206-3F8A-4827-B3AB-AE9E1FAEFC6C",
+            ),
+        ];
+        assert_eq!(
+            card_output(
+                &devices,
+                "headphones",
+                "8c7ed206-3f8a-4827-b3ab-ae9e1faefc6c",
+                "TV"
+            ),
+            Ok(&devices[1])
+        );
+    }
+
+    #[test]
+    fn a_container_shared_by_several_devices_falls_back_to_the_name() {
+        // As when the card display reports the computer's own container, which the speakers share.
+        let devices = vec![
+            in_container("speakers", "Speakers", "computer"),
+            in_container("hdmi-card", "HD60 X", "computer"),
+        ];
+        assert_eq!(
+            card_output(&devices, "speakers", "computer", "HD60 X"),
+            Ok(&devices[1])
+        );
+    }
+
+    #[test]
+    fn an_unknown_container_falls_back_to_the_name() {
+        let devices = sender_devices();
+        assert_eq!(
+            card_output(&devices, "headphones", "", "HD60 X"),
+            Ok(&devices[1])
+        );
     }
 
     fn sender_devices() -> Vec<AudioDevice> {
@@ -217,7 +314,7 @@ mod tests {
     fn card_output_is_the_device_named_after_the_card_display() {
         let devices = sender_devices();
         assert_eq!(
-            card_output(&devices, "headphones", "HD60 X"),
+            card_output(&devices, "headphones", "", "HD60 X"),
             Ok(&devices[1])
         );
     }
@@ -226,7 +323,7 @@ mod tests {
     fn card_output_name_match_ignores_case_and_spaces() {
         let devices = sender_devices();
         assert_eq!(
-            card_output(&devices, "headphones", " hd60 x "),
+            card_output(&devices, "headphones", "", " hd60 x "),
             Ok(&devices[1])
         );
     }
@@ -239,7 +336,7 @@ mod tests {
                 device("hdmi-card", description),
             ];
             assert_eq!(
-                card_output(&devices, "headphones", "HD60 X"),
+                card_output(&devices, "headphones", "", "HD60 X"),
                 Ok(&devices[1]),
                 "{description}"
             );
@@ -257,7 +354,7 @@ mod tests {
     fn card_output_cannot_be_the_audio_source() {
         let devices = sender_devices();
         assert_eq!(
-            card_output(&devices, "hdmi-card", "HD60 X"),
+            card_output(&devices, "hdmi-card", "container of hdmi-card", "HD60 X"),
             Err("The audio source is the card display's own sound output. Choose another audio source.".into())
         );
     }
@@ -266,12 +363,16 @@ mod tests {
     fn missing_audio_source_or_card_output_is_reported() {
         let devices = sender_devices();
         assert_eq!(
-            card_output(&devices, "gone", "HD60 X"),
+            card_output(&devices, "gone", "", "HD60 X"),
             Err("The audio source is not connected.".into())
         );
         assert_eq!(
-            card_output(&devices, "headphones", "Live Gamer Mini"),
-            Err("Could not find the card display's sound output (a playback device named Live Gamer Mini).".into())
+            card_output(&devices, "headphones", "container of the TV", "Live Gamer Mini"),
+            Err("Could not find the card display's sound output: no playback device is part of the card display, and none is named Live Gamer Mini.".into())
+        );
+        assert_eq!(
+            card_output(&devices, "headphones", "", "Live Gamer Mini"),
+            Err("Could not find the card display's sound output: Windows did not say which device the card display is part of, and no playback device is named Live Gamer Mini.".into())
         );
     }
 }

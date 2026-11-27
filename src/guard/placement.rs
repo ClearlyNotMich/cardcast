@@ -440,6 +440,8 @@ mod tests {
             left: 0,
             top: 0,
             graphics_card: String::new(),
+            container_id: String::new(),
+            connector: String::new(),
         }
     }
 

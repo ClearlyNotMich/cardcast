@@ -104,19 +104,21 @@ impl StatusLine {
     /// restarts, then any problem. The header already shows the mirror's state.
     pub fn details(&self) -> Option<String> {
         let reason = match &self.mirror {
-            Status::Restarting(message) | Status::Error(message) => Some(message),
+            Status::Restarting(message) | Status::Error(message) => Some(message.as_str()),
+            Status::WaitingForCardDisplay => Some(
+                "The saved card display is not connected. Plug it in, or choose another card display.",
+            ),
             _ => None,
         };
         let parts: Vec<&str> = [
             reason,
-            self.audio.as_ref(),
-            self.guard.as_ref(),
-            self.displays.as_ref(),
-            self.other.as_ref(),
+            self.audio.as_deref(),
+            self.guard.as_deref(),
+            self.displays.as_deref(),
+            self.other.as_deref(),
         ]
         .into_iter()
         .flatten()
-        .map(String::as_str)
         .collect();
         (!parts.is_empty()).then(|| parts.join(" | "))
     }
@@ -231,6 +233,39 @@ pub fn starts_on_launch(settings: &Settings) -> bool {
     settings.source_monitor.is_some() && settings.card_display.is_some()
 }
 
+/// Keeps the saved card display found: a new EDID (Display EDID mode on a capture card) gives it
+/// a new device path on the same connector, so a card display missing by its path is the monitor
+/// on its saved connector, and takes that monitor's path. The connector of the card display found
+/// is saved too. Returns whether the settings changed, so they are saved.
+pub fn follow_card_display(settings: &mut Settings, monitors: &[Monitor]) -> bool {
+    let Some(card_path) = &settings.card_display else {
+        return false;
+    };
+    let saved_connector = settings.card_display_connector.as_deref().unwrap_or("");
+    let found = monitors
+        .iter()
+        .find(|monitor| &monitor.device_path == card_path)
+        .or_else(|| {
+            monitors
+                .iter()
+                .find(|monitor| !saved_connector.is_empty() && monitor.connector == saved_connector)
+        });
+    let Some(card_display) = found.filter(|monitor| !monitor.connector.is_empty()) else {
+        return false;
+    };
+    let before = (
+        settings.card_display.clone(),
+        settings.card_display_connector.clone(),
+    );
+    settings.card_display = Some(card_display.device_path.clone());
+    settings.card_display_connector = Some(card_display.connector.clone());
+    before
+        != (
+            settings.card_display.clone(),
+            settings.card_display_connector.clone(),
+        )
+}
+
 /// The user's choices. Monitors are stored by their display-configuration device path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -238,6 +273,8 @@ pub struct Settings {
     pub card_display: Option<String>,
     pub send_windows_to: Option<String>,
     pub audio_source: Option<String>,
+    /// The card display's connector ([`Monitor::connector`]), to find it when its device path changes.
+    pub card_display_connector: Option<String>,
     pub guard_enabled: bool,
 }
 
@@ -249,6 +286,7 @@ impl Default for Settings {
             card_display: None,
             send_windows_to: None,
             audio_source: None,
+            card_display_connector: None,
             guard_enabled: true,
         }
     }
@@ -292,6 +330,7 @@ impl Settings {
             ("card_display", &self.card_display),
             ("send_windows_to", &self.send_windows_to),
             ("audio_source", &self.audio_source),
+            ("card_display_connector", &self.card_display_connector),
         ] {
             if let Some(value) = value {
                 text.push_str(&format!("{key}={value}\n"));
@@ -311,6 +350,7 @@ impl Settings {
                 "card_display" => settings.card_display = value,
                 "send_windows_to" => settings.send_windows_to = value,
                 "audio_source" => settings.audio_source = value,
+                "card_display_connector" => settings.card_display_connector = value,
                 "guard_enabled" => settings.guard_enabled = value.as_deref() == Some("true"),
                 _ => {}
             }
@@ -321,6 +361,14 @@ impl Settings {
 
 /// %APPDATA%\\cardcast on Windows, the XDG config folder elsewhere.
 fn settings_path() -> Option<std::path::PathBuf> {
+    // Tests never touch the user's own settings.
+    if cfg!(test) {
+        return Some(
+            std::env::temp_dir()
+                .join("cardcast-tests")
+                .join("settings.txt"),
+        );
+    }
     let folder = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .map(std::path::PathBuf::from)
@@ -342,6 +390,7 @@ mod tests {
             card_display: Some(r"\\?\DISPLAY#ELG1#5&2&UID2".into()),
             send_windows_to: Some(r"\\?\DISPLAY#DEL1#5&3&UID3".into()),
             audio_source: Some("{0.0.0.00000000}.{abc}".into()),
+            card_display_connector: Some(r"\\?\PCI#VEN_8086#3&1&0#{guid} target 4353".into()),
             guard_enabled: true,
         };
         assert_eq!(Settings::from_text(&saved.to_text()), saved);
@@ -366,6 +415,8 @@ mod tests {
             left: 0,
             top: 0,
             graphics_card: String::new(),
+            container_id: String::new(),
+            connector: String::new(),
         }
     }
 
@@ -375,6 +426,69 @@ mod tests {
             monitor("primary", true),
             monitor("card", false),
         ]
+    }
+
+    fn on_connector(device_path: &str, connector: &str) -> Monitor {
+        Monitor {
+            connector: connector.into(),
+            ..monitor(device_path, false)
+        }
+    }
+
+    #[test]
+    fn the_card_display_found_by_its_device_path_saves_its_connector() {
+        let mut settings = chosen("source", "card");
+        let monitors = [on_connector("card", "gpu target 1")];
+        assert!(follow_card_display(&mut settings, &monitors));
+        assert_eq!(
+            settings.card_display_connector.as_deref(),
+            Some("gpu target 1")
+        );
+        assert!(
+            !follow_card_display(&mut settings, &monitors),
+            "nothing new to save"
+        );
+    }
+
+    #[test]
+    fn a_card_display_with_a_new_device_path_is_found_on_its_connector() {
+        // A new EDID (Display EDID mode on the capture card) gives the monitor a new device path.
+        let mut settings = Settings {
+            card_display_connector: Some("gpu target 1".into()),
+            ..chosen("source", "old card")
+        };
+        let monitors = [
+            on_connector("source", "gpu target 0"),
+            on_connector("new card", "gpu target 1"),
+        ];
+        assert!(follow_card_display(&mut settings, &monitors));
+        assert_eq!(settings.card_display.as_deref(), Some("new card"));
+        assert_eq!(
+            settings.card_display_connector.as_deref(),
+            Some("gpu target 1")
+        );
+    }
+
+    #[test]
+    fn a_card_display_gone_from_its_path_and_connector_is_not_found() {
+        let mut settings = Settings {
+            card_display_connector: Some("gpu target 1".into()),
+            ..chosen("source", "old card")
+        };
+        let unchanged = settings.clone();
+        // An unknown connector (empty) never matches.
+        let monitors = [
+            on_connector("source", "gpu target 0"),
+            on_connector("other", ""),
+        ];
+        assert!(!follow_card_display(&mut settings, &monitors));
+        assert_eq!(settings, unchanged);
+        let mut unknown = Settings {
+            card_display_connector: Some(String::new()),
+            ..chosen("source", "old card")
+        };
+        assert!(!follow_card_display(&mut unknown, &monitors));
+        assert_eq!(unknown.card_display.as_deref(), Some("old card"));
     }
 
     #[test]
@@ -605,10 +719,14 @@ mod tests {
 
     #[test]
     fn details_hold_only_what_the_header_does_not_say() {
+        assert_eq!(StatusLine::new(Status::Stopped).details(), None);
         assert_eq!(StatusLine::new(Status::Running).details(), None);
         assert_eq!(
             StatusLine::new(Status::WaitingForCardDisplay).details(),
-            None
+            Some(
+                "The saved card display is not connected. Plug it in, or choose another card display."
+                    .into()
+            )
         );
         assert_eq!(
             StatusLine::new(Status::Error("driver too old".into())).details(),
@@ -766,5 +884,109 @@ mod tests {
             ..Settings::default()
         };
         assert!(!starts_on_launch(&half));
+    }
+}
+
+/// Runs in the CI `second-monitor` job: the virtual display driver there can load a custom EDID.
+#[cfg(test)]
+#[cfg(windows)]
+mod second_monitor_tests {
+    use super::{Settings, follow_card_display};
+    use crate::guard::{self, second_monitor};
+
+    const FOLDER: &str = r"C:\VirtualDisplayDriver";
+
+    /// Both virtual monitors with a new EDID named "cardcast EDID", as when a capture card switches
+    /// to Display EDID mode; the driver loads it when its graphics card restarts. Restored on drop.
+    struct NewEdid(String);
+
+    impl NewEdid {
+        fn new() -> Self {
+            let settings = format!(r"{FOLDER}\vdd_settings.xml");
+            let before = std::fs::read_to_string(&settings).unwrap();
+            assert!(
+                before.contains("<CustomEdid>false</CustomEdid>"),
+                "{before}"
+            );
+            std::fs::write(format!(r"{FOLDER}\user_edid.bin"), edid()).unwrap();
+            std::fs::write(
+                &settings,
+                before.replace(
+                    "<CustomEdid>false</CustomEdid>",
+                    "<CustomEdid>true</CustomEdid>",
+                ),
+            )
+            .unwrap();
+            drop(second_monitor::Unplugged::new());
+            Self(before)
+        }
+    }
+
+    impl Drop for NewEdid {
+        fn drop(&mut self) {
+            let _ = std::fs::write(format!(r"{FOLDER}\vdd_settings.xml"), &self.0);
+            let _ = std::fs::remove_file(format!(r"{FOLDER}\user_edid.bin"));
+            drop(second_monitor::Unplugged::new());
+        }
+    }
+
+    /// A 1080p EDID 1.4 from manufacturer "CCT", product 0x1234, named "cardcast EDID".
+    fn edid() -> Vec<u8> {
+        let mut edid = vec![0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+        edid.extend([
+            0x0C, 0x74, 0x34, 0x12, 0x01, 0x00, 0x00, 0x00, 0x01, 0x22, 0x01, 0x04,
+        ]);
+        edid.extend([0x80, 0x35, 0x1E, 0x78, 0x0A]);
+        edid.extend([0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54]);
+        edid.extend([0x00; 3]);
+        edid.extend([0x01; 16]);
+        edid.extend([
+            0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40, 0x58, 0x2C, 0x45, 0x00, 0x0F, 0x28,
+            0x21, 0x00, 0x00, 0x1E,
+        ]);
+        edid.extend([0x00, 0x00, 0x00, 0xFC, 0x00]);
+        edid.extend(b"cardcast EDID");
+        edid.extend([
+            0x00, 0x00, 0x00, 0xFD, 0x00, 0x32, 0x4B, 0x1E, 0x53, 0x11, 0x00, 0x0A, 0x20, 0x20,
+            0x20, 0x20, 0x20, 0x20,
+        ]);
+        edid.extend([0x00, 0x00, 0x00, 0x10, 0x00]);
+        edid.extend([0x00; 13]);
+        edid.push(0x00);
+        assert_eq!(edid.len(), 127);
+        let sum = edid.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        edid.push(0u8.wrapping_sub(sum));
+        edid
+    }
+
+    #[test]
+    fn second_monitor_card_display_with_a_new_edid_is_found_on_its_connector() {
+        let Some(monitors) = second_monitor::monitors(3) else {
+            return;
+        };
+        let card = monitors[2].clone();
+        println!("before: {card:#?}");
+        assert!(!card.connector.is_empty(), "no connector: {card:?}");
+        assert!(!card.container_id.is_empty(), "no container ID: {card:?}");
+        let mut settings = Settings {
+            card_display: Some(card.device_path.clone()),
+            card_display_connector: Some(card.connector.clone()),
+            ..Settings::default()
+        };
+        let _edid = NewEdid::new();
+        let now = guard::monitors().unwrap();
+        println!("after: {now:#?}");
+        assert!(
+            now.iter()
+                .all(|monitor| monitor.device_path != card.device_path),
+            "the new EDID kept the device path"
+        );
+        assert!(follow_card_display(&mut settings, &now));
+        let found = now
+            .iter()
+            .find(|monitor| settings.card_display.as_ref() == Some(&monitor.device_path))
+            .unwrap();
+        assert_eq!(found.name, "cardcast EDID");
+        assert_eq!(found.connector, card.connector);
     }
 }

@@ -30,6 +30,8 @@ fn monitor(
         left: at.0,
         top: at.1,
         graphics_card: graphics_card.into(),
+        container_id: String::new(),
+        connector: String::new(),
     }
 }
 
@@ -69,11 +71,13 @@ fn sender(status: Status) -> SettingsWindow {
             id: "speakers".into(),
             name: "Speakers (Realtek)".into(),
             description: "Speakers".into(),
+            container_id: String::new(),
         },
         AudioDevice {
             id: "headset".into(),
             name: "Headset".into(),
             description: "Headphones".into(),
+            container_id: String::new(),
         },
     ];
     window.settings.send_windows_to = Some("primary".into());

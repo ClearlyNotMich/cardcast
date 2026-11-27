@@ -58,6 +58,12 @@ pub struct Monitor {
     pub top: i32,
     /// Name of the graphics card the monitor is plugged into, as DXGI lists it; empty if unknown.
     pub graphics_card: String,
+    /// The physical device the monitor is part of (`DEVPKEY_Device_ContainerId`), shared with its
+    /// HDMI or DisplayPort sound output; empty if unknown.
+    pub container_id: String,
+    /// The graphics card's device path and the target id of the video output the monitor is on;
+    /// unlike `device_path` it stays when the monitor's EDID (its name) changes. Empty if unknown.
+    pub connector: String,
 }
 
 /// What the settings window needs from the window guard and pointer guard.
@@ -130,6 +136,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             } else {
                 "Stand-in graphics card".into()
             },
+            container_id: String::new(),
+            connector: format!("{device_path} connector"),
         };
     // Arranged as on the sender: the source monitor left of the primary monitor, the card display right of it.
     Ok(vec![
@@ -306,6 +314,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             .find(|(output, _)| output.eq_ignore_ascii_case(&gdi_name))
             .map(|(_, card)| card.clone())
             .unwrap_or_default();
+        let container_id = displays::container_id(&device_path);
         monitors.push(Monitor {
             device_path,
             gdi_name,
@@ -324,6 +333,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             left: source_mode.position.x,
             top: source_mode.position.y,
             graphics_card,
+            container_id,
+            connector: displays::connector(path.targetInfo.adapterId, path.targetInfo.id),
         });
     }
     Ok(monitors)

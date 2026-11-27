@@ -118,6 +118,90 @@ extern "system" fn window_proc(
     unsafe { DefWindowProcW(window, message, wparam, lparam) }
 }
 
+/// The container ID of the monitor with this display-configuration device path (a device
+/// interface path): interface → device instance id → devnode → `DEVPKEY_Device_ContainerId`.
+/// Empty if Windows cannot say.
+pub(super) fn container_id(device_path: &str) -> String {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_PropertyW, CM_Get_Device_Interface_PropertyW, CM_LOCATE_DEVNODE_NORMAL,
+        CM_Locate_DevNodeW, CR_SUCCESS, MAX_DEVICE_ID_LEN,
+    };
+    use windows::Win32::Devices::Properties::{
+        DEVPKEY_Device_ContainerId, DEVPKEY_Device_InstanceId, DEVPROP_TYPE_GUID,
+        DEVPROP_TYPE_STRING, DEVPROPTYPE,
+    };
+    use windows::core::{GUID, PCWSTR};
+
+    let path: Vec<u16> = device_path.encode_utf16().chain([0]).collect();
+    let mut instance = [0u16; MAX_DEVICE_ID_LEN as usize];
+    let mut size = u32::try_from(size_of_val(&instance)).unwrap_or(0);
+    let mut kind = DEVPROPTYPE::default();
+    // SAFETY: path is null-terminated; the buffer holds `size` bytes and Windows writes no more.
+    let found = unsafe {
+        CM_Get_Device_Interface_PropertyW(
+            PCWSTR(path.as_ptr()),
+            &DEVPKEY_Device_InstanceId,
+            &mut kind,
+            Some(instance.as_mut_ptr().cast()),
+            &mut size,
+            0,
+        )
+    };
+    if found != CR_SUCCESS || kind != DEVPROP_TYPE_STRING {
+        return String::new();
+    }
+    let mut node = 0;
+    // SAFETY: instance holds the null-terminated id just written (shorter than MAX_DEVICE_ID_LEN).
+    let located = unsafe {
+        CM_Locate_DevNodeW(
+            &mut node,
+            PCWSTR(instance.as_ptr()),
+            CM_LOCATE_DEVNODE_NORMAL,
+        )
+    };
+    if located != CR_SUCCESS {
+        return String::new();
+    }
+    let mut container = GUID::zeroed();
+    let mut size = u32::try_from(size_of::<GUID>()).unwrap_or(0);
+    // SAFETY: the buffer is one GUID, as `size` says; a bigger value fails instead of being written.
+    let read = unsafe {
+        CM_Get_DevNode_PropertyW(
+            node,
+            &DEVPKEY_Device_ContainerId,
+            &mut kind,
+            Some((&raw mut container).cast()),
+            &mut size,
+            0,
+        )
+    };
+    if read != CR_SUCCESS || kind != DEVPROP_TYPE_GUID {
+        return String::new();
+    }
+    format!("{container:?}")
+}
+
+/// The monitor's connector: its graphics card's device path, which stays across boots unlike the
+/// card's LUID, and the target id of the video output. Empty if Windows cannot name the card.
+pub(super) fn connector(adapter: windows::Win32::Foundation::LUID, target: u32) -> String {
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_ADAPTER_NAME, DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME,
+        DisplayConfigGetDeviceInfo,
+    };
+    let mut name = DISPLAYCONFIG_ADAPTER_NAME::default();
+    name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME;
+    name.header.size = u32::try_from(size_of::<DISPLAYCONFIG_ADAPTER_NAME>()).unwrap_or(0);
+    name.header.adapterId = adapter;
+    // SAFETY: header is the first field of a correctly sized DISPLAYCONFIG_ADAPTER_NAME, as size says.
+    if unsafe { DisplayConfigGetDeviceInfo(&mut name.header) } != 0 {
+        return String::new();
+    }
+    format!(
+        "{} target {target}",
+        super::wide_to_string(&name.adapterDevicePath)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
