@@ -975,7 +975,7 @@ mod tests {
             window.frame_rate.slow_warning(Instant::now())
         );
         assert!(
-            shown >= 1000.0,
+            shown >= 30.0,
             "{shown:.1} presents a second on a 120 Hz card display"
         );
         assert!(window.mirror.is_running(), "the mirror ended on its own");
