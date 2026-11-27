@@ -78,10 +78,6 @@ impl SettingsWindow {
             status.other = Some(error);
             Vec::new()
         });
-        let playback_devices = audio::playback_devices().unwrap_or_else(|error| {
-            status.other = Some(error);
-            Vec::new()
-        });
         let mut settings = Settings::load();
         let cleared = settings.clear_role_clashes();
         let mut settings = settings.with_defaults(&monitors);
@@ -114,7 +110,7 @@ impl SettingsWindow {
         Self {
             settings,
             monitors,
-            playback_devices,
+            playback_devices: Vec::new(),
             device_lister: audio::DeviceLister::new(audio::playback_devices, move || {
                 lister_context.request_repaint()
             }),
@@ -142,6 +138,7 @@ impl SettingsWindow {
 
     /// Starts the mirror from saved settings; the window minimises once it runs.
     fn launch(&mut self, context: &egui::Context) {
+        self.device_lister.list();
         self.follow_input_switching(None, false);
         if settings::starts_on_launch(&self.settings) {
             // A problem found while loading outlives the start, which clears the status line's.
@@ -1224,6 +1221,26 @@ mod tests {
             description: "Speakers".into(),
             container_id: String::new(),
         }])
+    }
+
+    #[test]
+    fn launch_lists_the_playback_devices_off_the_ui_thread() {
+        let mut window = window("card");
+        let (woken_sender, woken) = std::sync::mpsc::channel();
+        let woken_sender = std::sync::Mutex::new(woken_sender);
+        window.device_lister = audio::DeviceLister::new(listed_after_the_lock, move || {
+            let _ = woken_sender.lock().map(|sender| sender.send(()));
+        });
+        let listing = LISTING.lock().unwrap();
+        window.launch(&egui::Context::default());
+        assert!(
+            window.playback_devices.is_empty(),
+            "a hung PipeWire would block here"
+        );
+        drop(listing);
+        woken.recv_timeout(Duration::from_secs(10)).unwrap();
+        window.follow_reports();
+        assert_eq!(window.playback_devices.len(), 1);
     }
 
     #[test]

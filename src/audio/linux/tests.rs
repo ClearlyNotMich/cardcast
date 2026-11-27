@@ -458,3 +458,14 @@ fn a_stopped_pipewire_is_reported_after_the_timeout() {
         "waited {waited:?}"
     );
 }
+
+#[test]
+fn a_missing_timeout_is_reported_in_plain_words() {
+    assert_eq!(
+        dump_through("cardcast-no-such-timeout"),
+        Err(
+            "Could not list playback devices: the timeout command (coreutils) is not installed."
+                .into()
+        )
+    );
+}

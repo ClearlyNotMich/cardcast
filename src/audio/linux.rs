@@ -327,7 +327,12 @@ fn unreadable(_error: String) -> String {
 
 /// What `pw-dump` prints, ended after [`DUMP_TIMEOUT`] so a hung PipeWire can't hang cardcast.
 fn pw_dump() -> Result<String, String> {
-    let dump = Command::new("timeout")
+    dump_through("timeout")
+}
+
+/// [`pw_dump`] through the `timeout` command.
+fn dump_through(timeout: &str) -> Result<String, String> {
+    let dump = Command::new(timeout)
         .args([
             "--kill-after=1",
             &format!("{}", DUMP_TIMEOUT.as_secs()),
@@ -341,6 +346,10 @@ fn pw_dump() -> Result<String, String> {
         // timeout's codes: 124 timed out, 137 killed after it, 127 no pw-dump.
         Ok((Some(124 | 137), _)) => Err(NO_ANSWER.to_owned()),
         Ok((Some(127), _)) => Err("Could not list playback devices: pw-dump is not installed. Install PipeWire's tools (see README, Sound).".to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
+            "Could not list playback devices: the timeout command (coreutils) is not installed."
+                .to_owned(),
+        ),
         _ => Err("Could not list playback devices. Is PipeWire running?".to_owned()),
     }
 }
