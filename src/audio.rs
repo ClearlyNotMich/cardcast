@@ -101,7 +101,7 @@ pub fn card_output<'a>(
     let card_display_name = card_display_name.trim();
     let output = devices
         .iter()
-        .find(|device| device.description.trim().eq_ignore_ascii_case(card_display_name))
+        .find(|device| without_number(&device.description).eq_ignore_ascii_case(card_display_name))
         .ok_or_else(|| {
             format!(
                 "Could not find the card display's sound output (a playback device named {card_display_name})."
@@ -114,6 +114,20 @@ pub fn card_output<'a>(
         );
     }
     Ok(output)
+}
+
+/// A playback device's name without the number Windows puts in front when names repeat, so
+/// "1- HD60 X" and "2- HD60 X" both read "HD60 X".
+fn without_number(name: &str) -> &str {
+    let name = name.trim();
+    let rest = name.trim_start_matches(|c: char| c.is_ascii_digit());
+    if rest.len() == name.len() {
+        return name;
+    }
+    match rest.trim_start().strip_prefix('-') {
+        Some(rest) => rest.trim(),
+        None => name,
+    }
 }
 
 /// Stand-in playback devices so the settings window can be laid out on Linux.
@@ -215,6 +229,28 @@ mod tests {
             card_output(&devices, "headphones", " hd60 x "),
             Ok(&devices[1])
         );
+    }
+
+    #[test]
+    fn card_output_name_match_ignores_the_number_windows_adds() {
+        for description in ["1- HD60 X", "2-HD60 X", "12 - HD60 X"] {
+            let devices = vec![
+                device("headphones", "Headphones"),
+                device("hdmi-card", description),
+            ];
+            assert_eq!(
+                card_output(&devices, "headphones", "HD60 X"),
+                Ok(&devices[1]),
+                "{description}"
+            );
+        }
+    }
+
+    #[test]
+    fn names_that_only_start_with_digits_keep_them() {
+        assert_eq!(without_number("27GR95QE"), "27GR95QE");
+        assert_eq!(without_number("2 Speakers"), "2 Speakers");
+        assert_eq!(without_number(" HD60 X "), "HD60 X");
     }
 
     #[test]

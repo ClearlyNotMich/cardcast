@@ -228,11 +228,44 @@ pub(crate) fn device_path(
     ))
 }
 
+/// A monitor's size on the desktop. The display configuration gives the source mode before the
+/// monitor's rotation, so a monitor turned to portrait has its width and height swapped.
+#[cfg_attr(
+    not(windows),
+    allow(
+        dead_code,
+        reason = "only the Windows monitor list calls it; its tests run everywhere"
+    )
+)]
+fn desktop_size(width: u32, height: u32, sideways: bool) -> (u32, u32) {
+    if sideways {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
+#[cfg(test)]
+mod desktop_size_tests {
+    use super::desktop_size;
+
+    #[test]
+    fn a_portrait_monitor_is_taller_than_wide() {
+        assert_eq!(desktop_size(2560, 1440, true), (1440, 2560));
+    }
+
+    #[test]
+    fn a_landscape_or_upside_down_monitor_keeps_its_size() {
+        assert_eq!(desktop_size(2560, 1440, false), (2560, 1440));
+    }
+}
+
 /// Active monitors from the Windows display configuration, keyed by device path.
 #[cfg(windows)]
 pub fn monitors() -> Result<Vec<Monitor>, String> {
     use windows::Win32::Devices::Display::{
-        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_ROTATION_ROTATE90,
+        DISPLAYCONFIG_ROTATION_ROTATE270, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
         DisplayConfigGetDeviceInfo,
     };
 
@@ -262,6 +295,11 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         // SAFETY: the mode a path's source index points to is a source mode.
         let source_mode = unsafe { mode.Anonymous.sourceMode };
         let rate = path.targetInfo.refreshRate;
+        let sideways = matches!(
+            path.targetInfo.rotation,
+            DISPLAYCONFIG_ROTATION_ROTATE90 | DISPLAYCONFIG_ROTATION_ROTATE270
+        );
+        let (width, height) = desktop_size(source_mode.width, source_mode.height, sideways);
         let gdi_name = wide_to_string(&source.viewGdiDeviceName);
         let graphics_card = cards
             .iter()
@@ -276,8 +314,8 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             } else {
                 name
             },
-            width: source_mode.width,
-            height: source_mode.height,
+            width,
+            height,
             refresh_hz: (rate.Numerator + rate.Denominator / 2)
                 .checked_div(rate.Denominator)
                 .unwrap_or(0),
