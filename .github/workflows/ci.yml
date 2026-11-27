@@ -59,15 +59,35 @@ jobs:
       # The mirror capture (#42): a frame of a known colour through MIT-SHM on Xvfb, and through
       # xdg-desktop-portal-wlr and PipeWire on headless sway. -noreset keeps xsetroot's colour.
       - if: runner.os == 'Linux'
-        run: sudo apt-get install -y swaybg x11-xserver-utils xdg-desktop-portal xdg-desktop-portal-wlr pipewire wireplumber
+        run: sudo apt-get install -y swaybg x11-xserver-utils xdg-desktop-portal xdg-desktop-portal-wlr pipewire wireplumber grim
       - if: runner.os == 'Linux'
         name: Mirror capture on Xvfb
         env:
           CARDCAST_CAPTURE: screen
           CARDCAST_EXPECT_COLOUR: '#cc6633'
         run: xvfb-run -s '-screen 0 1280x1024x24 -noreset' sh -c 'xsetroot -solid "#cc6633" && cargo test mirror::linux::tests::desktop_captures -- --nocapture'
+      # The mirror present (#43) from one output to another on X11, read back with GetImage. Xvfb
+      # has one output, so this is X.Org with two of the dummy driver's; the test paints the
+      # source monitor. No Fifo check: lavapipe's X11 present doesn't wait for a vertical blank.
       - if: runner.os == 'Linux'
-        name: Mirror capture through the portal on headless sway
+        name: Mirror on X.Org with two dummy outputs
+        env:
+          CARDCAST_MIRROR_FROM: DUMMY0
+          CARDCAST_MIRROR_TO: DUMMY1
+          CARDCAST_EXPECT_COLOUR: '#cc6633'
+        run: |
+          sudo apt-get install -y xserver-xorg-core xserver-xorg-video-dummy
+          printf 'Section "Device"\n Identifier "dummy"\n Driver "dummy"\n VideoRam 256000\nEndSection\nSection "Screen"\n Identifier "screen"\n Device "dummy"\n DefaultDepth 24\n SubSection "Display"\n  Depth 24\n  Virtual 2048 768\n EndSubSection\nEndSection\n' > "$RUNNER_TEMP/dummy.conf"
+          sudo Xorg :5 -config "$RUNNER_TEMP/dummy.conf" -noreset -logfile "$RUNNER_TEMP/xorg.log" &
+          export DISPLAY=:5
+          for _ in $(seq 50); do xrandr >/dev/null 2>&1 && break; sleep 0.2; done
+          xrandr --addmode DUMMY1 1024x768
+          xrandr --output DUMMY1 --mode 1024x768 --right-of DUMMY0
+          xrandr | grep ' connected'
+          cargo test mirror::linux::tests::desktop_mirrors -- --nocapture
+      # Then the mirror present (#43) from HEADLESS-1 to HEADLESS-2, read back with grim.
+      - if: runner.os == 'Linux'
+        name: Mirror capture and present through the portal on headless sway
         env:
           WLR_BACKENDS: headless
           WLR_HEADLESS_OUTPUTS: 2
@@ -82,7 +102,7 @@ jobs:
           mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr" "$XDG_CONFIG_HOME/xdg-desktop-portal"
           printf '[screencast]\noutput_name=HEADLESS-1\nchooser_type=none\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr/config"
           printf '[preferred]\ndefault=wlr\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
-          printf 'output * bg #3366cc solid_color\n' > "$XDG_CONFIG_HOME/sway.conf"
+          printf 'output HEADLESS-1 bg #3366cc solid_color\noutput HEADLESS-2 bg #222222 solid_color\n' > "$XDG_CONFIG_HOME/sway.conf"
           cat > "$RUNNER_TEMP/capture.sh" <<'EOF'
           pipewire & wireplumber &
           sway -c "$XDG_CONFIG_HOME/sway.conf" &
@@ -92,7 +112,12 @@ jobs:
           # The portals start on the session bus, so they need the desktop's variables.
           dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_CONFIG_HOME XDG_RUNTIME_DIR
           for _ in $(seq 10); do swaymsg -t get_outputs >/dev/null && break; sleep 1; done
-          cargo test mirror::linux::tests::desktop_captures -- --nocapture
+          failed=0
+          cargo test mirror::linux::tests::desktop_captures -- --nocapture || failed=1
+          # wlroots' headless outputs refresh at 60 Hz.
+          CARDCAST_MIRROR_FROM=HEADLESS-1 CARDCAST_MIRROR_TO=HEADLESS-2 CARDCAST_EXPECT_HZ=60 \
+            cargo test mirror::linux::tests::desktop_mirrors -- --nocapture || failed=1
+          exit $failed
           EOF
           dbus-run-session -- bash "$RUNNER_TEMP/capture.sh"
       # The audio relay (#44): PipeWire and WirePlumber with two null sinks, a tone played into one.

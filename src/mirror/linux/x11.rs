@@ -128,10 +128,6 @@ impl Shm {
 }
 
 impl Picture for Shm {
-    fn size(&self) -> (u32, u32) {
-        (u32::from(self.width), u32::from(self.height))
-    }
-
     /// A fresh copy on every call: X11 says nothing about when the desktop changed.
     fn take_frame(&mut self) -> Result<Option<Frame>, Ended> {
         self.grab().map(Some).map_err(|error| {

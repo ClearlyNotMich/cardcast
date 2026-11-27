@@ -613,6 +613,7 @@ dependencies = [
 name = "cardcast"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "eframe",
  "egui_kittest",
  "libc",
@@ -621,6 +622,8 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-plasma",
+ "wayland-protocols-wlr",
+ "wgpu",
  "windows",
  "x11rb",
  "zbus",

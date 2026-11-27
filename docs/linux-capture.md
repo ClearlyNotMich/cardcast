@@ -115,6 +115,26 @@ hotspot [5], blended into the frame by `linux::draw_pointer`.
 - Xvfb with `xsetroot -solid '#cc6633'`; `-noreset` stops the server resetting the root window when
   xsetroot disconnects.
 
+## The present (`mirror/linux/present.rs`, `screen.rs`, `gpu.rs`, #43)
+
+`LinuxMirror` is the Linux `Mirror`. Start returns at once; a thread opens the surface and a wgpu
+Vulkan device, then runs `capture` on a second thread that nothing joins, because `portal::share`
+blocks until the dialog is answered. Stop joins only the first thread. The capture thread always
+stores its `restore_token` and wakes the settings window, which saves it (`take_restore_token`),
+even after Stop; its picture then has no receiver and is dropped, ending the stream.
+
+- **Surface** (research section 2): a `zwlr_layer_shell_v1` overlay on the card display's
+  `wl_output` (matched by name), anchored to all edges, `exclusive_zone` -1, keyboard
+  interactivity none, drawn at the card display's resolution and scaled to its logical size with
+  `wp_viewporter`; on X11 an override-redirect window over its RandR rectangle. On GNOME the start
+  stops with "needs the GNOME extension (Linux 9)". The surface shows with the first picture.
+- **Drawing**: `PresentMode::Fifo`, frame latency 1, a black clear, then the picture aspect-fitted
+  with `mirror::fit`, each refresh; `presents()` counts the presents. A memory frame is uploaded
+  with `write_texture`. A DMA-BUF frame is imported with wgpu-hal's `texture_from_dmabuf_fd`
+  (single plane, modifiers the device lists with `TRANSFER_SRC` for both BGRA and RGBA), copied
+  into the kept texture, and dropped once the copy finished. A failed import restarts the mirror
+  offering no modifiers, so the stream falls back to shared memory.
+
 ## Sources
 
 [1] xdg-desktop-portal, `org.freedesktop.portal.ScreenCast.xml`,

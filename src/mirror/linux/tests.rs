@@ -1,5 +1,6 @@
 use super::portal::{answered, request_path, select_options};
 use super::*;
+use crate::mirror::linux::LinuxMirror;
 use crate::mirror::{Frame, Pixels, Release};
 use zbus::zvariant::Value;
 
@@ -56,9 +57,6 @@ fn decide(
 struct Still;
 
 impl Picture for Still {
-    fn size(&self) -> (u32, u32) {
-        (0, 0)
-    }
     fn take_frame(&mut self) -> Result<Option<Frame>, Ended> {
         Ok(None)
     }
@@ -343,12 +341,8 @@ fn desktop_captures_a_frame_of_the_source_monitor() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     eprintln!(
-        "frame {}x{} fourcc {:08X}, size {:?}, restore token {:?}",
-        frame.width,
-        frame.height,
-        frame.fourcc,
-        picture.size(),
-        capture.restore_token
+        "frame {}x{} fourcc {:08X}, restore token {:?}",
+        frame.width, frame.height, frame.fourcc, capture.restore_token
     );
     // The portal hands a token only for a persistent permission (`persist_mode`).
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
@@ -367,4 +361,303 @@ fn desktop_captures_a_frame_of_the_source_monitor() {
         Some(expected),
         "the frame is not {colour}"
     );
+}
+
+#[test]
+fn the_mirror_shows_without_focus_on_each_desktop_and_says_why_not_on_gnome() {
+    use super::present::{NEEDS_GNOME_EXTENSION, Shown, shown_on};
+    assert_eq!(shown_on(Some(Desktop::X11)), Ok(Shown::OverrideRedirect));
+    for desktop in [
+        Desktop::PlasmaWayland,
+        Desktop::Sway,
+        Desktop::Hyprland,
+        Desktop::OtherWayland,
+    ] {
+        assert_eq!(shown_on(Some(desktop)), Ok(Shown::LayerShell));
+    }
+    assert_eq!(
+        shown_on(Some(Desktop::GnomeWayland)),
+        Err(Ended::Stop(NEEDS_GNOME_EXTENSION.into()))
+    );
+    assert!(matches!(shown_on(None), Err(Ended::Stop(_))));
+}
+
+#[test]
+fn each_capture_layout_is_drawn_from_its_byte_order() {
+    use super::gpu::texture_format;
+    use wgpu::TextureFormat::{Bgra8Unorm, Rgba8Unorm};
+    assert_eq!(texture_format(XRGB8888), Some(Bgra8Unorm));
+    assert_eq!(texture_format(ARGB8888), Some(Bgra8Unorm));
+    assert_eq!(texture_format(XBGR8888), Some(Rgba8Unorm));
+    assert_eq!(texture_format(ABGR8888), Some(Rgba8Unorm));
+    assert_eq!(texture_format(u32::from_le_bytes(*b"NV12")), None);
+}
+
+#[test]
+fn only_single_plane_copyable_dma_buf_layouts_are_offered() {
+    use super::gpu::importable;
+    use ash::vk::{DrmFormatModifierPropertiesEXT, FormatFeatureFlags};
+    let layout = |modifier, planes, features| DrmFormatModifierPropertiesEXT {
+        drm_format_modifier: modifier,
+        drm_format_modifier_plane_count: planes,
+        drm_format_modifier_tiling_features: features,
+    };
+    let copyable = FormatFeatureFlags::TRANSFER_SRC | FormatFeatureFlags::SAMPLED_IMAGE;
+    assert_eq!(
+        importable(&[
+            layout(0, 1, copyable),
+            // A compressed layout with its metadata in a second plane.
+            layout(7, 2, copyable),
+            layout(9, 1, FormatFeatureFlags::SAMPLED_IMAGE),
+            layout(11, 1, copyable),
+        ]),
+        [0, 11]
+    );
+}
+
+/// A picture that counts its drops, for the capture thread's tests.
+struct Counted(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl Picture for Counted {
+    fn take_frame(&mut self) -> Result<Option<Frame>, Ended> {
+        Ok(None)
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn stop_does_not_wait_for_the_dialog_and_a_late_capture_keeps_its_token_but_not_its_stream() {
+    use super::present::{Token, start_capture, wait_for_picture};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
+    let token = Arc::new(Mutex::new(Token::default()));
+    let woken = Arc::new(AtomicU32::new(0));
+    let dropped = Arc::new(AtomicU32::new(0));
+    // The dialog stays open until `answer` sends.
+    let (answer, answered) = mpsc::channel::<()>();
+    let captured = {
+        let (dropped, woken) = (dropped.clone(), woken.clone());
+        start_capture(
+            move |saved| {
+                assert_eq!(saved, None);
+                answered.recv().unwrap();
+                Capture {
+                    picture: Ok(Box::new(Counted(dropped))),
+                    restore_token: Some("new".into()),
+                }
+            },
+            token.clone(),
+            Arc::new(move || {
+                woken.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+    };
+    let stopped = Instant::now();
+    let quit = AtomicBool::new(true);
+    assert!(matches!(wait_for_picture(&captured, &quit), Ok(None)));
+    assert!(stopped.elapsed() < Duration::from_secs(1), "Stop waited");
+    // The mirror thread is gone; then the user answers the dialog.
+    drop(captured);
+    answer.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while dropped.load(Ordering::Relaxed) == 0 {
+        assert!(Instant::now() < deadline, "the late capture was kept");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(woken.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        super::present::take_unsaved(&token),
+        Some(Some("new".into()))
+    );
+    assert_eq!(super::present::take_unsaved(&token), None, "saved twice");
+}
+
+#[test]
+fn an_unchanged_token_is_not_saved_again() {
+    use super::present::{Token, start_capture, wait_for_picture};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    let token = Arc::new(Mutex::new(Token::default()));
+    // X11 keeps the token it was given: none.
+    let captured = start_capture(
+        |_| Capture {
+            picture: Ok(Box::new(Still)),
+            restore_token: None,
+        },
+        token.clone(),
+        Arc::new(|| {}),
+    );
+    assert!(matches!(
+        wait_for_picture(&captured, &AtomicBool::new(false)),
+        Ok(Some(_))
+    ));
+    assert_eq!(super::present::take_unsaved(&token), None);
+}
+
+/// The colour at (`x`, `y`) of the card display's output, as the desktop shows it: `grim` (the
+/// compositor's screencopy) on Wayland, `GetImage` of the root window on X11.
+fn shown_on_output(card_display: &Monitor, x: u32, y: u32) -> [u8; 3] {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        let shot = std::process::Command::new("grim")
+            .args(["-t", "ppm", "-o", &card_display.gdi_name, "-"])
+            .output()
+            .unwrap();
+        assert!(shot.status.success(), "grim: {shot:?}");
+        // P6: "P6", width, height and maximum value, each followed by one whitespace byte.
+        let mut header = shot.stdout.splitn(5, u8::is_ascii_whitespace);
+        let fields: Vec<&[u8]> = header.by_ref().take(4).collect();
+        let width: u32 = std::str::from_utf8(fields[1]).unwrap().parse().unwrap();
+        let pixels = header.next().unwrap();
+        let at = usize::try_from((y * width + x) * 3).unwrap();
+        pixels[at..at + 3].try_into().unwrap()
+    } else {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+        let (connection, screen) = x11rb::connect(None).unwrap();
+        let root = connection.setup().roots[screen].root;
+        let image = connection
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                root,
+                i16::try_from(card_display.left + i32::try_from(x).unwrap()).unwrap(),
+                i16::try_from(card_display.top + i32::try_from(y).unwrap()).unwrap(),
+                1,
+                1,
+                !0,
+            )
+            .unwrap()
+            .reply()
+            .unwrap();
+        // XRGB8888, little-endian: blue, green, red.
+        [image.data[2], image.data[1], image.data[0]]
+    }
+}
+
+/// X11 has no background per output, so the source monitor gets a window of `colour` over it,
+/// open while the returned connection is.
+fn paint_x11_source_monitor(
+    source_monitor: &Monitor,
+    colour: [u8; 3],
+) -> x11rb::rust_connection::RustConnection {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+    let (connection, screen) = x11rb::connect(None).unwrap();
+    let root = connection.setup().roots[screen].root;
+    let window = connection.generate_id().unwrap();
+    let [red, green, blue] = colour.map(u32::from);
+    connection
+        .create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            i16::try_from(source_monitor.left).unwrap(),
+            i16::try_from(source_monitor.top).unwrap(),
+            u16::try_from(source_monitor.layout_size.0).unwrap(),
+            u16::try_from(source_monitor.layout_size.1).unwrap(),
+            0,
+            WindowClass::INPUT_OUTPUT,
+            x11rb::COPY_FROM_PARENT,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .background_pixel(red << 16 | green << 8 | blue),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    connection.map_window(window).unwrap().check().unwrap();
+    connection
+}
+
+/// CI's desktops (headless sway with xdg-desktop-portal-wlr, X.Org with two dummy outputs): the
+/// mirror runs from output `CARDCAST_MIRROR_FROM`, showing `CARDCAST_EXPECT_COLOUR` (`#rrggbb`),
+/// to output `CARDCAST_MIRROR_TO`, which must then show that colour where it showed another, and
+/// count its presents; with `CARDCAST_EXPECT_HZ`, no more than one per refresh at that rate.
+/// Skips when unset.
+#[test]
+fn desktop_mirrors_the_source_monitor_on_the_card_display() {
+    use crate::mirror::Mirror;
+    use std::time::{Duration, Instant};
+    let (Ok(from), Ok(to), Ok(colour)) = (
+        std::env::var("CARDCAST_MIRROR_FROM"),
+        std::env::var("CARDCAST_MIRROR_TO"),
+        std::env::var("CARDCAST_EXPECT_COLOUR"),
+    ) else {
+        return;
+    };
+    let expected: [u8; 3] =
+        [1, 3, 5].map(|at| u8::from_str_radix(&colour[at..at + 2], 16).unwrap());
+    let monitors = crate::guard::monitors().unwrap();
+    let named = |name: &str| {
+        monitors
+            .iter()
+            .find(|monitor| monitor.gdi_name == name)
+            .unwrap_or_else(|| panic!("no output {name} in {monitors:#?}"))
+            .clone()
+    };
+    let (source, card) = (named(&from), named(&to));
+    let _painted = (std::env::var_os("WAYLAND_DISPLAY").is_none())
+        .then(|| paint_x11_source_monitor(&source, expected));
+    // A quarter in from the top-left: the pointer starts in the middle.
+    let (x, y) = (card.width / 4, card.height / 4);
+    let before = shown_on_output(&card, x, y);
+    eprintln!("{to} shows {before:02x?} before the mirror");
+    assert_ne!(before, expected, "{to} already shows {colour}");
+
+    let mut mirror = LinuxMirror::new(|| {}, None);
+    mirror.start(&source, &card).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !mirror.shows_picture() {
+        assert!(
+            mirror.is_running(),
+            "the mirror ended: {:?}",
+            mirror.take_end()
+        );
+        assert!(Instant::now() < deadline, "the mirror never showed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Settled, then counted over two seconds.
+    std::thread::sleep(Duration::from_secs(1));
+    let first = mirror.presents().unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let rate = (mirror.presents().unwrap() - first) as f64 / 2.0;
+    let shown = shown_on_output(&card, x, y);
+    eprintln!(
+        "{to} ({} Hz) shows {shown:02x?} with the mirror; {rate:.1} presents a second; restore token saved: {:?}",
+        card.refresh_hz,
+        mirror.take_restore_token()
+    );
+    assert!(
+        mirror.is_running(),
+        "the mirror ended: {:?}",
+        mirror.take_end()
+    );
+    assert_eq!(shown, expected, "{to} does not show {from}'s {colour}");
+    assert!(rate >= 10.0, "{rate:.1} presents a second");
+    // Fifo: one present per refresh of the card display, never more.
+    if let Ok(refresh) = std::env::var("CARDCAST_EXPECT_HZ") {
+        let refresh: f64 = refresh.parse().unwrap();
+        assert!(
+            rate <= refresh * 1.1,
+            "{rate:.1} presents a second on a {refresh} Hz card display"
+        );
+    }
+    mirror.stop();
+    assert!(!mirror.is_running());
+}
+
+#[test]
+fn the_mirror_shader_is_valid_wgsl() {
+    let module = wgpu::naga::front::wgsl::parse_str(super::gpu::SHADER).unwrap();
+    wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
 }
