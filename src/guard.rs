@@ -112,17 +112,19 @@ impl Guard for StandInGuard {
 /// Stand-in monitors so the settings window can be laid out on Linux.
 #[cfg(not(windows))]
 pub fn monitors() -> Result<Vec<Monitor>, String> {
-    let monitor = |device_path: &str, name: &str, width, height, refresh_hz, primary| Monitor {
-        device_path: device_path.into(),
-        gdi_name: String::new(),
-        name: name.into(),
-        width,
-        height,
-        refresh_hz,
-        primary,
-        left: 0,
-        top: 0,
-    };
+    let monitor =
+        |device_path: &str, name: &str, width, height, refresh_hz, primary, left| Monitor {
+            device_path: device_path.into(),
+            gdi_name: String::new(),
+            name: name.into(),
+            width,
+            height,
+            refresh_hz,
+            primary,
+            left,
+            top: 0,
+        };
+    // Arranged as on the sender: the source monitor left of the primary monitor, the card display right of it.
     Ok(vec![
         monitor(
             "stand-in-source",
@@ -131,6 +133,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             1440,
             500,
             false,
+            -2560,
         ),
         monitor(
             "stand-in-primary",
@@ -139,6 +142,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             1080,
             144,
             true,
+            0,
         ),
         monitor(
             "stand-in-card",
@@ -147,6 +151,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             1080,
             60,
             false,
+            1920,
         ),
     ])
 }

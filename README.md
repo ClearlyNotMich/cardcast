@@ -37,6 +37,7 @@ The settings window has these controls. Each monitor dropdown shows the monitor'
 - **Audio source**: the playback device whose sound goes to the capture card.
 - **Start / Stop**: starts or stops the mirror. Audio starts and stops with it.
 - **Guard**: turns the window guard and the pointer guard on and off together. On by default; it does nothing until the card display is chosen. The guard works whether or not the mirror is running.
+- **Live layout**: your monitors as Windows arranges them, to scale, each marked with what it is chosen as. Click a monitor to make it the source monitor, the card display or the "send windows to" monitor. While the mirror runs, the header says LIVE with the frame rate the card display gets.
 - **Status line**: shows "Running", "Waiting for card display", "Waiting for source monitor", "Stopped", or the last error in plain words, followed by any audio or guard problem. While the button shows Stop, the mirror runs or starts again by itself; a mirror stopped by an error stays stopped until you press Start.
 
 Choices are saved when you change them. Changing the source monitor, card display or audio source while the mirror runs or waits restarts it on the new choice at once. On launch the mirror starts by itself, and the window starts minimised if it does. Closing the window quits cardcast.
