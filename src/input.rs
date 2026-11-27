@@ -334,11 +334,16 @@ pub fn new_input_thread(wake: impl Fn() + Send + 'static) -> Result<InputThread,
     }
 }
 
-/// The settings window's DDC/CI calls, one at a time on their own thread, never the settings window's, guard's or mirror's. Dropping it stops the thread after the monitor it is reading.
+/// The settings window's DDC/CI calls, one at a time on their own thread, never the settings
+/// window's, guard's or mirror's. The window keeps one for its lifetime, so two threads never talk
+/// to one monitor; switching input switching off cancels its jobs instead. Dropped, it ends after
+/// the monitor it is reading.
 pub struct InputThread {
-    jobs: mpsc::Sender<Job>,
+    /// Each job goes with the flag that cancels it.
+    jobs: mpsc::Sender<(Arc<AtomicBool>, Job)>,
     reports: mpsc::Receiver<Report>,
-    stop: Arc<AtomicBool>,
+    /// Cancels the jobs sent since the last [`Self::cancel`].
+    cancelled: Arc<AtomicBool>,
 }
 
 impl InputThread {
@@ -348,27 +353,41 @@ impl InputThread {
         open: impl Fn(&Monitor) -> Option<Box<dyn Ddc>> + Send + 'static,
         wake: impl Fn() + Send + 'static,
     ) -> Result<Self, String> {
-        let (jobs, waiting) = mpsc::channel::<Job>();
+        let (jobs, waiting) = mpsc::channel::<(Arc<AtomicBool>, Job)>();
         let (reports_to, reports) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("input".into())
             .spawn(move || {
-                for job in waiting {
-                    if stopped.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let switches = matches!(job, Job::Switch(..));
-                    if let Some(report) = run_job(job, &serial, &open, &stopped) {
-                        if reports_to.send(report).is_err() {
-                            break;
+                // The input lists read since the last cancel, so a monitor's are read once.
+                let mut known = Vec::new();
+                let mut since: Option<Arc<AtomicBool>> = None;
+                while let Ok(first) = waiting.recv() {
+                    let jobs: Vec<_> = std::iter::once(first).chain(waiting.try_iter()).collect();
+                    for (cancelled, job) in newest_probe_only(jobs) {
+                        if cancelled.load(Ordering::Relaxed) {
+                            continue;
                         }
-                        wake();
-                    }
-                    // DDC/CI 1.1: 50 ms after a Set before the next call (docs/win32-ddc.md).
-                    if switches {
-                        std::thread::sleep(Duration::from_millis(50));
+                        if !since
+                            .as_ref()
+                            .is_some_and(|since| Arc::ptr_eq(since, &cancelled))
+                        {
+                            known.clear();
+                            since = Some(Arc::clone(&cancelled));
+                        }
+                        let switches = matches!(job, Job::Switch(..));
+                        if let Some(report) = run_job(job, &known, &serial, &open, &cancelled) {
+                            if let Report::Probed(probes) = &report {
+                                known.clone_from(probes);
+                            }
+                            if reports_to.send(report).is_err() {
+                                return;
+                            }
+                            wake();
+                        }
+                        // DDC/CI 1.1: 50 ms after a Set before the next call (docs/win32-ddc.md).
+                        if switches {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
                     }
                 }
             })
@@ -376,24 +395,45 @@ impl InputThread {
         Ok(Self {
             jobs,
             reports,
-            stop,
+            cancelled: Arc::default(),
         })
     }
 
     pub fn send(&self, job: Job) {
         // Fails only once the thread ended, which it does only when dropped.
-        let _ = self.jobs.send(job);
+        let _ = self.jobs.send((Arc::clone(&self.cancelled), job));
     }
 
     pub fn take_report(&self) -> Option<Report> {
         self.reports.try_recv().ok()
     }
+
+    /// Input switching was switched off: the jobs sent so far are dropped, a probe stops after the
+    /// monitor it is reading, its reports are dropped, and the next probe reads every monitor again.
+    pub fn cancel(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancelled = Arc::default();
+        while self.reports.try_recv().is_ok() {}
+    }
 }
 
 impl Drop for InputThread {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::Relaxed);
     }
+}
+
+/// The jobs waiting for the input thread, with only the newest probe kept: each reads every
+/// monitor, so the older ones are out of date.
+pub fn newest_probe_only<T>(jobs: Vec<(T, Job)>) -> Vec<(T, Job)> {
+    let newest = jobs
+        .iter()
+        .rposition(|(_, job)| matches!(job, Job::Probe(_)));
+    jobs.into_iter()
+        .enumerate()
+        .filter(|(index, (_, job))| !matches!(job, Job::Probe(_)) || Some(*index) == newest)
+        .map(|(_, job)| job)
+        .collect()
 }
 
 /// What the settings window asks of the input thread.
@@ -429,9 +469,10 @@ pub enum Report {
     Switched(Result<(String, u8), String>),
 }
 
-/// Does `job` with the platform's calls passed in: `serial` reads a monitor's EDID serial and `open` reaches it over DDC/CI. A probe that `stop` ends before its last monitor reports nothing.
+/// Does `job` with the platform's calls passed in: `serial` reads a monitor's EDID serial and `open` reaches it over DDC/CI. A probe takes a monitor in `known` (read before) from there, and reads only the others; one that `stop` ends before its last monitor reports nothing.
 pub fn run_job(
     job: Job,
+    known: &[Probe],
     serial: &dyn Fn(&Monitor) -> Option<String>,
     open: &dyn Fn(&Monitor) -> Option<Box<dyn Ddc>>,
     stop: &AtomicBool,
@@ -440,6 +481,13 @@ pub fn run_job(
         Job::Probe(monitors) => {
             let mut probes = Vec::new();
             for monitor in monitors {
+                if let Some(probe) = known
+                    .iter()
+                    .find(|probe| probe.device_path == monitor.device_path)
+                {
+                    probes.push(probe.clone());
+                    continue;
+                }
                 if stop.load(Ordering::Relaxed) {
                     return None;
                 }
@@ -1151,6 +1199,7 @@ mod tests {
         let serial = |monitor: &Monitor| (monitor.device_path == "aw").then(|| "4GZY5P3".into());
         let probes = run_job(
             Job::Probe(monitors.to_vec()),
+            &[],
             &serial,
             &sender_ddc,
             &AtomicBool::new(false),
@@ -1178,7 +1227,7 @@ mod tests {
     #[test]
     fn read_and_switch_say_when_the_monitor_does_not_answer() {
         let no_serial = |_: &Monitor| None;
-        let run = |job| run_job(job, &no_serial, &sender_ddc, &AtomicBool::new(false));
+        let run = |job| run_job(job, &[], &no_serial, &sender_ddc, &AtomicBool::new(false));
         let (aw, card) = (screen("aw", "AW2523HF"), screen("card", "Elgato 1080p"));
         assert_eq!(
             run(Job::Read(aw.clone())),
@@ -1271,6 +1320,115 @@ mod tests {
     }
 
     #[test]
+    fn probe_reads_only_monitors_not_seen_before() {
+        let opened = std::sync::Mutex::new(Vec::new());
+        let open = |monitor: &Monitor| {
+            opened.lock().unwrap().push(monitor.device_path.clone());
+            sender_ddc(monitor)
+        };
+        let known = [
+            Probe {
+                device_path: "aw".into(),
+                id: monitor(Some("4GZY5P3"), "AW2523HF"),
+                inputs: Some(vec![0x0F, 0x11]),
+            },
+            Probe {
+                device_path: "gone".into(),
+                id: monitor(None, "Gone"),
+                inputs: Some(vec![0x0F, 0x11]),
+            },
+            Probe {
+                device_path: "card".into(),
+                id: monitor(None, "Elgato 1080p"),
+                inputs: None,
+            },
+        ];
+        let monitors = vec![
+            screen("aw", "AW2523HF"),
+            screen("card", "Elgato 1080p"),
+            screen("one", "DELL P2210"),
+        ];
+        let probes = run_job(
+            Job::Probe(monitors),
+            &known,
+            &|_: &Monitor| None,
+            &open,
+            &AtomicBool::new(false),
+        );
+        assert_eq!(*opened.lock().unwrap(), ["one"]);
+        assert_eq!(
+            probes,
+            Some(Report::Probed(vec![
+                known[0].clone(),
+                known[2].clone(),
+                Probe {
+                    device_path: "one".into(),
+                    id: monitor(None, "DELL P2210"),
+                    inputs: None,
+                },
+            ]))
+        );
+    }
+
+    #[test]
+    fn only_the_newest_waiting_probe_runs() {
+        let (aw, card) = (screen("aw", "AW2523HF"), screen("card", "Elgato 1080p"));
+        let waiting = vec![
+            ((), Job::Probe(vec![aw.clone()])),
+            ((), Job::Read(aw.clone())),
+            ((), Job::Probe(vec![aw.clone(), card.clone()])),
+            ((), Job::Switch(card.clone(), 0x11)),
+        ];
+        assert_eq!(
+            newest_probe_only(waiting),
+            [
+                ((), Job::Read(aw.clone())),
+                ((), Job::Probe(vec![aw, card.clone()])),
+                ((), Job::Switch(card, 0x11)),
+            ]
+        );
+    }
+
+    #[test]
+    fn switching_off_and_on_keeps_one_thread_and_reads_every_monitor_again() {
+        let opened = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = std::sync::Arc::clone(&opened);
+        let mut thread = InputThread::spawn(
+            |_: &Monitor| None,
+            move |monitor: &Monitor| {
+                recording.lock().unwrap().push(monitor.device_path.clone());
+                sender_ddc(monitor)
+            },
+            || {},
+        )
+        .unwrap();
+        let wait_for_probe = |thread: &InputThread| {
+            let start = std::time::Instant::now();
+            loop {
+                if let Some(Report::Probed(_)) = thread.take_report() {
+                    return;
+                }
+                assert!(start.elapsed().as_secs() < 10, "no report");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let monitors = vec![screen("aw", "AW2523HF")];
+        thread.send(Job::Probe(monitors.clone()));
+        wait_for_probe(&thread);
+        thread.send(Job::Probe(monitors.clone()));
+        wait_for_probe(&thread);
+        assert_eq!(
+            *opened.lock().unwrap(),
+            ["aw"],
+            "read a known monitor again"
+        );
+        thread.cancel();
+        thread.send(Job::Probe(monitors));
+        wait_for_probe(&thread);
+        assert_eq!(*opened.lock().unwrap(), ["aw", "aw"]);
+    }
+
+    #[test]
     fn probe_stops_when_the_toggle_is_switched_off() {
         let opened = std::sync::Mutex::new(Vec::new());
         let stop = AtomicBool::new(false);
@@ -1281,7 +1439,7 @@ mod tests {
         };
         let monitors = vec![screen("aw", "AW2523HF"), screen("one", "DELL P2210")];
         assert_eq!(
-            run_job(Job::Probe(monitors), &|_: &Monitor| None, &open, &stop),
+            run_job(Job::Probe(monitors), &[], &|_: &Monitor| None, &open, &stop),
             None
         );
         assert_eq!(*opened.lock().unwrap(), ["aw"], "read the next monitor");

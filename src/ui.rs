@@ -59,7 +59,8 @@ struct SettingsWindow {
     frame_rate: FrameRate,
     /// Height the live layout takes beyond `look::LAYOUT_HEIGHT`, so the window has no empty band.
     layout_extra: f32,
-    /// Runs while input switching is on; `None` while off, so nothing is sent over DDC/CI.
+    /// Started when input switching is first switched on and kept, so two never talk to one
+    /// monitor; while off it gets no jobs, so nothing is sent over DDC/CI.
     input_thread: Option<InputThread>,
     start_input_thread: Box<dyn Fn() -> Result<InputThread, String>>,
     /// The input lists last read, in the monitor list's order.
@@ -286,6 +287,7 @@ impl SettingsWindow {
         while let Some(report) = self
             .input_thread
             .as_ref()
+            .filter(|_| self.settings.input_switching)
             .and_then(InputThread::take_report)
         {
             match report {
@@ -310,8 +312,9 @@ impl SettingsWindow {
     fn follow_input_switching(&mut self, was_on: Option<bool>, displays_changed: bool) {
         let on = self.settings.input_switching;
         if !on {
-            // Dropping the thread stops it after the monitor it is reading.
-            self.input_thread = None;
+            if let Some(thread) = &mut self.input_thread {
+                thread.cancel();
+            }
             self.input_lists.clear();
             self.current_input = None;
             self.status.input = None;
@@ -332,9 +335,13 @@ impl SettingsWindow {
         self.send_input_job(input::Job::Probe(self.monitors.clone()));
     }
 
-    /// Hands a job to the input thread; there is none while input switching is off.
+    /// Hands a job to the input thread; none while input switching is off.
     fn send_input_job(&mut self, job: input::Job) {
-        if let Some(thread) = &self.input_thread {
+        if let Some(thread) = self
+            .input_thread
+            .as_ref()
+            .filter(|_| self.settings.input_switching)
+        {
             if matches!(job, input::Job::Read(_)) {
                 self.current_input = None;
             }
@@ -1727,25 +1734,30 @@ mod tests {
         );
 
         switch_input_switching(&mut window, false);
-        assert!(window.input_thread.is_none());
         assert!(window.input_lists.is_empty());
         assert_eq!(window.status.text(), "Running");
         window.follow_monitors(monitors);
         window.follow(&context);
-        assert_eq!(
-            record.1.load(Ordering::Relaxed),
-            1,
-            "an input thread started"
-        );
+        // Give a wrongly sent job time to run.
+        std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
             record.0.lock().unwrap().len(),
             2,
             "read a monitor while off"
         );
+
+        // On again: the same input thread reads every monitor again.
+        switch_input_switching(&mut window, true);
+        follow_input_thread(&mut window, |window| !window.input_lists.is_empty());
+        assert_eq!(
+            *record.0.lock().unwrap(),
+            ["source", "card", "source", "card"]
+        );
+        assert_eq!(record.1.load(Ordering::Relaxed), 1, "a second input thread");
     }
 
     #[test]
-    fn input_lists_are_read_at_launch_and_after_a_display_change_while_on() {
+    fn input_lists_are_read_at_launch_and_for_new_monitors_after_a_display_change() {
         let (mut window, record) = with_input_thread(window("card"));
         window.settings.input_switching = true;
         window.launch(&egui::Context::default());
@@ -1757,8 +1769,10 @@ mod tests {
         follow_input_thread(&mut window, |window| !window.input_lists.is_empty());
         assert_eq!(
             *record.0.lock().unwrap(),
-            ["source", "card", "source", "card", "new"]
+            ["source", "card", "new"],
+            "read a known monitor again"
         );
+        assert_eq!(window.input_lists.len(), 3);
         assert_eq!(record.1.load(Ordering::Relaxed), 1, "one input thread");
     }
 
