@@ -55,6 +55,7 @@ function apply(window, reply) {
     const rect = { x: left, y: top, width: right - left, height: bottom - top };
     const remaximise = remaximising.delete(window);
     if (action === "move") {
+        window.frameGeometry = rect;
     } else if (action === "unmaximise") {
         remaximising.add(window);
         window.setMaximize(false, false);

@@ -249,7 +249,7 @@ fn check(x11: &X11, guarding: &mut Guarding, windows: &mut Windows, window: Wind
     }
     let remaximising = windows.remaximising.remove(&window);
     match guarding.check(id(window), &title, state, remaximising, now) {
-        Placement::MoveTo(_) => {}
+        Placement::MoveTo(target) => move_frame(x11, window, target, extents),
         Placement::Maximise { .. } if !remaximising => {
             // The restore rectangle is the window manager's own; unmaximising shows it.
             windows.remaximising.insert(window);
