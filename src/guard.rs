@@ -56,6 +56,8 @@ pub struct Monitor {
     /// Top-left corner on the desktop.
     pub left: i32,
     pub top: i32,
+    /// Name of the graphics card the monitor is plugged into, as DXGI lists it; empty if unknown.
+    pub graphics_card: String,
 }
 
 /// What the settings window needs from the window guard and pointer guard.
@@ -122,6 +124,11 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
         primary,
         left: 0,
         top: 0,
+        graphics_card: if device_path == "stand-in-card" {
+            "Stand-in integrated graphics".into()
+        } else {
+            "Stand-in graphics card".into()
+        },
     };
     Ok(vec![
         monitor(
@@ -266,6 +273,7 @@ pub fn monitors() -> Result<Vec<Monitor>, String> {
             primary: source_mode.position.x == 0 && source_mode.position.y == 0,
             left: source_mode.position.x,
             top: source_mode.position.y,
+            graphics_card: String::new(),
         });
     }
     Ok(monitors)

@@ -424,6 +424,7 @@ mod tests {
             primary,
             left: 0,
             top: 0,
+            graphics_card: String::new(),
         }
     }
 
