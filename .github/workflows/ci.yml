@@ -43,7 +43,8 @@ jobs:
           export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
           export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-? | head -n 1)")
           # A turned, scaled output: its resolution is 720x1280, its size on the desktop 480x853.
-          swaymsg output HEADLESS-1 scale 1.5 transform 90
+          # sway can be slow to answer while it starts, so the first command is retried.
+          for _ in $(seq 10); do swaymsg output HEADLESS-1 scale 1.5 transform 90 && break; sleep 1; done
           swaymsg -t get_outputs
           failed=0
           CARDCAST_EXPECT_MONITORS='HEADLESS-1 480x853 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary' \
