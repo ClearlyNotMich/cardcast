@@ -16,6 +16,8 @@
 pub mod desktop;
 #[cfg(windows)]
 mod displays;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg_attr(
     not(windows),
     allow(
@@ -40,23 +42,17 @@ pub use displays::DisplayWatcher;
 #[cfg(windows)]
 pub(crate) use displays::device_node;
 
-/// Linux lists no monitors yet (#36), so there are no display changes to follow; it never wakes.
-#[cfg(not(windows))]
-pub struct DisplayWatcher;
-
-#[cfg(not(windows))]
-impl DisplayWatcher {
-    pub fn new(_wake: impl Fn() + Send + 'static) -> Result<Self, String> {
-        Ok(Self)
-    }
-}
+#[cfg(target_os = "linux")]
+pub use linux::{DisplayWatcher, monitors};
 
 /// A monitor on the sender, as shown in the settings dropdowns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Monitor {
-    /// Display-configuration device path; the stable key saved in settings.
+    /// The stable key saved in settings: the display-configuration device path on Windows; on Linux
+    /// the EDID's product and serial (`DEL42B9 4GZY5P3`), else the connector.
     pub device_path: String,
-    /// GDI name of the source the monitor shows (`\\.\DISPLAYn`); changes between boots, so never saved.
+    /// GDI name of the source the monitor shows (`\\.\DISPLAYn`); on Linux the desktop's output
+    /// name (`HDMI-A-2`). Changes between boots, so never saved.
     pub gdi_name: String,
     pub name: String,
     pub width: u32,
@@ -66,13 +62,15 @@ pub struct Monitor {
     /// Top-left corner on the desktop.
     pub left: i32,
     pub top: i32,
-    /// Name of the graphics card the monitor is plugged into, as DXGI lists it; empty if unknown.
+    /// Name of the graphics card the monitor is plugged into, as DXGI (on Linux pci.ids) lists it;
+    /// empty if unknown.
     pub graphics_card: String,
     /// The physical device the monitor is part of (`DEVPKEY_Device_ContainerId`), shared with its
-    /// HDMI or DisplayPort sound output; empty if unknown.
+    /// HDMI or DisplayPort sound output; empty if unknown, and on Linux.
     pub container_id: String,
-    /// The graphics card's device path and the target id of the video output the monitor is on;
-    /// unlike `device_path` it stays when the monitor's EDID (its name) changes. Empty if unknown.
+    /// The graphics card's device path and the target id of the video output the monitor is on (on
+    /// Linux its PCI address and DRM connector, `0000:0c:00.0 HDMI-A-2`); unlike `device_path` it
+    /// stays when the monitor's EDID (its name) changes. Empty if unknown.
     pub connector: String,
 }
 
@@ -136,18 +134,6 @@ impl Guard for NotOnLinuxYet {
             self.update(true, None, None);
         }
     }
-}
-
-/// What the status line keeps saying while the monitor list is not built for this platform (#36).
-#[cfg(windows)]
-pub const NOT_BUILT: Option<&str> = None;
-#[cfg(not(windows))]
-pub const NOT_BUILT: Option<&str> = Some("The monitor list does not work on Linux yet.");
-
-/// Linux lists no monitors yet (#36); [`NOT_BUILT`] tells the user.
-#[cfg(not(windows))]
-pub fn monitors() -> Result<Vec<Monitor>, String> {
-    Ok(Vec::new())
 }
 
 /// Active display paths and modes from `QueryDisplayConfig`.
@@ -217,13 +203,6 @@ pub(crate) fn device_path(
 
 /// A monitor's size on the desktop. The display configuration gives the source mode before the
 /// monitor's rotation, so a monitor turned to portrait has its width and height swapped.
-#[cfg_attr(
-    not(windows),
-    allow(
-        dead_code,
-        reason = "only the Windows monitor list calls it; its tests run everywhere"
-    )
-)]
 fn desktop_size(width: u32, height: u32, sideways: bool) -> (u32, u32) {
     if sideways {
         (height, width)
@@ -737,15 +716,6 @@ mod tests {
 #[cfg(all(test, not(windows)))]
 mod linux_tests {
     use super::*;
-
-    #[test]
-    fn on_linux_the_monitor_list_is_empty_and_says_it_does_not_work_yet() {
-        assert_eq!(monitors(), Ok(Vec::new()));
-        assert_eq!(
-            NOT_BUILT,
-            Some("The monitor list does not work on Linux yet.")
-        );
-    }
 
     #[test]
     fn on_linux_the_guard_says_it_does_not_run_yet_while_it_is_on() {

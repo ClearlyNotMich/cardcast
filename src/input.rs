@@ -169,26 +169,59 @@ pub fn input_name(value: u8) -> String {
 
 /// The monitor's serial from its EDID: the serial descriptor's text, else the 32-bit serial number in decimal; `None` when it has neither or the EDID is broken.
 pub fn edid_serial(edid: &[u8]) -> Option<String> {
+    let block = edid_block(edid)?;
+    if let Some(text) = descriptor_text(block, 0xFF)? {
+        return Some(text);
+    }
+    let number = u32::from_le_bytes([block[12], block[13], block[14], block[15]]);
+    (number != 0).then(|| number.to_string())
+}
+
+/// The monitor's name from its EDID name descriptor, for example `DELL AW2523HF`; `None` when it has none or the EDID is broken.
+pub fn edid_name(edid: &[u8]) -> Option<String> {
+    descriptor_text(edid_block(edid)?, 0xFC)?
+}
+
+/// The EDID's maker and product code as Windows writes them in a monitor's device path, for example `DEL42B9`.
+pub fn edid_product(edid: &[u8]) -> Option<String> {
+    let block = edid_block(edid)?;
+    let maker = u16::from_be_bytes([block[8], block[9]]);
+    // Three letters of five bits each, 1 is 'A'.
+    let letter = |shift: u16| char::from(b'@' + ((maker >> shift) & 0x1F) as u8);
+    let product = u16::from_le_bytes([block[10], block[11]]);
+    Some(format!(
+        "{}{}{}{product:04X}",
+        letter(10),
+        letter(5),
+        letter(0)
+    ))
+}
+
+/// The EDID's 128-byte base block, or `None` when its header or checksum is wrong.
+fn edid_block(edid: &[u8]) -> Option<&[u8]> {
     let block = edid.get(..128)?;
     let checksum = block.iter().fold(0u8, |sum, b| sum.wrapping_add(*b));
-    if block[..8] != [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00] || checksum != 0 {
-        return None;
-    }
-    // Four 18-byte descriptors; a display descriptor starts 00 00 00 <tag>, and 0xFF is the serial.
+    (block[..8] == [0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00] && checksum == 0)
+        .then_some(block)
+}
+
+/// The first non-blank text of the base block's display descriptors with `tag`: `Some(None)` when
+/// there is none, `None` when it holds a control character (a broken EDID).
+fn descriptor_text(block: &[u8], tag: u8) -> Option<Option<String>> {
+    // Four 18-byte descriptors; a display descriptor starts 00 00 00 <tag>.
     for descriptor in block[54..126].chunks(18) {
-        if descriptor[..4] == [0x00, 0x00, 0x00, 0xFF] {
+        if descriptor[..4] == [0x00, 0x00, 0x00, tag] {
             let text = descriptor[5..].split(|b| *b == b'\n').next()?;
             if !text.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
                 return None;
             }
             let text = std::str::from_utf8(text).ok()?.trim();
             if !text.is_empty() {
-                return Some(text.to_owned());
+                return Some(Some(text.to_owned()));
             }
         }
     }
-    let number = u32::from_le_bytes([block[12], block[13], block[14], block[15]]);
-    (number != 0).then(|| number.to_string())
+    Some(None)
 }
 
 /// What a command's `<monitor>` is matched against.
@@ -473,6 +506,19 @@ mod tests {
             None,
             "a control character"
         );
+    }
+
+    #[test]
+    fn edid_name_and_product_read_the_name_descriptor_and_the_maker() {
+        let mut dell = edid(12345, None);
+        // "DEL" is 00100 00101 01100, product 0xA0FA little-endian.
+        dell[8..12].copy_from_slice(&[0x10, 0xAC, 0xFA, 0xA0]);
+        let sum = dell[..127].iter().fold(0u8, |sum, b| sum.wrapping_add(*b));
+        dell[127] = 0u8.wrapping_sub(sum);
+        assert_eq!(edid_name(&dell), Some("AW2523HF".to_owned()));
+        assert_eq!(edid_product(&dell), Some("DELA0FA".to_owned()));
+        dell[0] = 0x01;
+        assert_eq!((edid_name(&dell), edid_product(&dell)), (None, None));
     }
 
     fn monitor(serial: Option<&str>, name: &str) -> MonitorId {

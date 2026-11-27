@@ -21,6 +21,33 @@ jobs:
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
       - run: cargo test
+      # The Linux monitor list on a desktop (#41): X11 on Xvfb, Wayland on headless sway with a hotplug.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get install -y xvfb sway
+      - if: runner.os == 'Linux'
+        name: Monitor list on Xvfb
+        env:
+          CARDCAST_EXPECT_MONITORS: screen 1280x1024+0+0 primary
+        run: xvfb-run -s '-screen 0 1280x1024x24' cargo test guard::linux::tests::desktop_lists -- --nocapture
+      - if: runner.os == 'Linux'
+        name: Monitor list and hotplug on headless sway
+        env:
+          WLR_BACKENDS: headless
+          WLR_HEADLESS_OUTPUTS: 2
+          WLR_LIBINPUT_NO_DEVICES: 1
+          WLR_RENDERER: pixman
+        run: |
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          sway -c /dev/null &
+          for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.2; done
+          export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
+          export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-? | head -n 1)")
+          swaymsg -t get_outputs
+          CARDCAST_EXPECT_MONITORS='HEADLESS-1 1920x1080+0+0 primary; HEADLESS-2 1920x1080+1920+0' \
+            cargo test guard::linux::tests::desktop_lists -- --nocapture
+          CARDCAST_PLUG_COMMAND='swaymsg create_output' \
+          CARDCAST_EXPECT_PLUGGED='HEADLESS-1 1920x1080+0+0 primary; HEADLESS-2 1920x1080+1920+0; HEADLESS-3 1920x1080+3840+0' \
+            cargo test guard::linux::tests::desktop_hotplug -- --nocapture
       - run: cargo build --release
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7

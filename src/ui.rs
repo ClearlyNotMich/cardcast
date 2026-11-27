@@ -540,7 +540,7 @@ impl SettingsWindow {
 
 /// The parts not built for this platform yet (#36): a lasting notice that Start and Stop don't clear.
 fn not_built_yet() -> Option<String> {
-    let parts: Vec<&str> = [guard::NOT_BUILT, mirror::NOT_BUILT, audio::NOT_BUILT]
+    let parts: Vec<&str> = [mirror::NOT_BUILT, audio::NOT_BUILT]
         .into_iter()
         .flatten()
         .collect();
@@ -833,14 +833,13 @@ mod tests {
     #[test]
     fn on_linux_start_keeps_saying_what_does_not_work_yet() {
         let mut window = window("card");
-        window.monitors = guard::monitors().unwrap();
+        window.monitors = Vec::new();
         window.settings = Settings::default();
         window.status.displays = not_built_yet();
         window.start();
         assert_eq!(
             window.status.text(),
             "Choose a source monitor and a card display. \
-             | The monitor list does not work on Linux yet. \
              | The mirror does not work on Linux yet. \
              | The audio relay does not work on Linux yet."
         );

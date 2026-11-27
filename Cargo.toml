@@ -8,6 +8,12 @@ publish = false
 [dependencies]
 eframe = "0.37"
 
+# The Linux monitor list (docs/research/linux-support.md, sections 4 and 8): the versions eframe already pulls in.
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+x11rb = { version = "0.13", features = ["randr"] }
+
 # PNG snapshots of the settings window, rendered on Linux (AGENTS.md, Build and test).
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }
