@@ -499,4 +499,168 @@ mod tests {
             "the thread was left running or never asked to quit"
         );
     }
+
+    use super::second_monitor::wait_for;
+    use std::io::Write as _;
+    use windows::Win32::Devices::Display::{
+        DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_ROTATION_ROTATE90,
+        SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG, SetDisplayConfig,
+    };
+    use windows::Win32::Foundation::{ERROR_BAD_CONFIGURATION, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    };
+    use windows::core::BOOL;
+
+    /// A monitor turned to portrait; its rotation is put back on drop.
+    struct Rotated(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>);
+
+    impl Rotated {
+        fn portrait(device_path: &str) -> Self {
+            let (paths, modes) = super::display_config().unwrap_or_else(|error| panic!("{error}"));
+            let original = Self(paths.clone(), modes.clone());
+            let (mut paths, mut modes) = (paths, modes);
+            let path = paths
+                .iter_mut()
+                .find(|path| super::device_path(path).is_some_and(|(p, _)| p == device_path))
+                .unwrap_or_else(|| panic!("no display path for {device_path}"));
+            path.targetInfo.rotation = DISPLAYCONFIG_ROTATION_ROTATE90;
+            // SAFETY: without QDC_VIRTUAL_MODE_AWARE the union holds modeInfoIdx.
+            let mode = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
+            let mut result = apply(&paths, &modes);
+            log(&format!("rotate 90, source mode as before: {result}"));
+            if result == ERROR_BAD_CONFIGURATION.0 as i32 {
+                // SAFETY: the mode a path's source index points to is a source mode.
+                let mut source = unsafe { modes[mode].Anonymous.sourceMode };
+                (source.width, source.height) = (source.height, source.width);
+                modes[mode].Anonymous.sourceMode = source;
+                result = apply(&paths, &modes);
+                log(&format!("rotate 90, source mode swapped: {result}"));
+            }
+            assert_eq!(result, 0, "SetDisplayConfig could not rotate the monitor");
+            original
+        }
+    }
+
+    impl Drop for Rotated {
+        /// Never panics: it also runs while a failed test unwinds.
+        fn drop(&mut self) {
+            log(&format!("rotation put back: {}", apply(&self.0, &self.1)));
+        }
+    }
+
+    fn apply(paths: &[DISPLAYCONFIG_PATH_INFO], modes: &[DISPLAYCONFIG_MODE_INFO]) -> i32 {
+        // SAFETY: both slices come from QueryDisplayConfig and stay alive for the call.
+        unsafe {
+            SetDisplayConfig(
+                Some(paths),
+                Some(modes),
+                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+            )
+        }
+    }
+
+    /// Written to stderr directly: libtest captures only the print macros, and CI runs without --nocapture.
+    fn log(line: &str) {
+        let _ = writeln!(std::io::stderr(), "{line}");
+    }
+
+    /// Each monitor's GDI name and `rcMonitor`, the desktop rectangle Windows reports.
+    fn desktop_rects() -> Vec<(String, RECT)> {
+        extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, rects: LPARAM) -> BOOL {
+            let mut info = MONITORINFOEXW::default();
+            info.monitorInfo.cbSize = u32::try_from(size_of::<MONITORINFOEXW>()).unwrap_or(0);
+            // SAFETY: info is a MONITORINFOEXW with cbSize set, which GetMonitorInfoW accepts as a MONITORINFO.
+            if unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) }.as_bool()
+            {
+                // SAFETY: rects is the Vec passed to EnumDisplayMonitors below, alive for its call.
+                let rects = unsafe { &mut *(rects.0 as *mut Vec<(String, RECT)>) };
+                rects.push((
+                    super::wide_to_string(&info.szDevice),
+                    info.monitorInfo.rcMonitor,
+                ));
+            }
+            true.into()
+        }
+        let mut rects = Vec::new();
+        // SAFETY: the callback only runs during this call, while rects is alive.
+        let _ =
+            unsafe { EnumDisplayMonitors(None, None, Some(each), LPARAM(&raw mut rects as isize)) };
+        rects
+    }
+
+    #[test]
+    fn second_monitor_rotated_monitor_has_the_size_and_position_the_desktop_gives_it() {
+        let Some(monitors) = super::second_monitor::monitors(2) else {
+            return;
+        };
+        // The rightmost, so turning it leaves no gap between monitors.
+        let turned = monitors.iter().max_by_key(|monitor| monitor.left).unwrap();
+        let _rotated = Rotated::portrait(&turned.device_path);
+        let portrait = |rects: &[(String, RECT)]| {
+            rects.iter().any(|(name, rect)| {
+                *name == turned.gdi_name && rect.bottom - rect.top > rect.right - rect.left
+            })
+        };
+        wait_for(
+            "the desktop to show the monitor in portrait",
+            Duration::from_secs(10),
+            || portrait(&desktop_rects()),
+        );
+        let (paths, modes) = super::display_config().unwrap();
+        for path in &paths {
+            // SAFETY: as in `monitors`: the union holds modeInfoIdx, which points at a source mode.
+            let source = unsafe {
+                modes[path.sourceInfo.Anonymous.modeInfoIdx as usize]
+                    .Anonymous
+                    .sourceMode
+            };
+            log(&format!(
+                "rotation {:?}: source mode {}x{}",
+                path.targetInfo.rotation, source.width, source.height
+            ));
+        }
+        let rects = desktop_rects();
+        let monitors = super::monitors().unwrap();
+        assert_eq!(monitors.len(), rects.len());
+        for monitor in &monitors {
+            let (_, rect) = rects
+                .iter()
+                .find(|(name, _)| *name == monitor.gdi_name)
+                .unwrap();
+            log(&format!(
+                "{} {}: monitors() {}x{} at {},{}; rcMonitor {}x{} at {},{}",
+                monitor.gdi_name,
+                if monitor.gdi_name == turned.gdi_name {
+                    "rotated 90"
+                } else {
+                    "unrotated"
+                },
+                monitor.width,
+                monitor.height,
+                monitor.left,
+                monitor.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                rect.left,
+                rect.top
+            ));
+            assert_eq!(
+                (
+                    monitor.left,
+                    monitor.top,
+                    monitor.width as i32,
+                    monitor.height as i32
+                ),
+                (
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top
+                ),
+                "{}",
+                monitor.gdi_name
+            );
+        }
+    }
 }
