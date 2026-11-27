@@ -4,13 +4,6 @@
 
 mod audio;
 mod guard;
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "Linux DDC/CI (issue #46) calls the rest; its tests run everywhere"
-    )
-)]
 mod input;
 mod mirror;
 mod ui;

@@ -100,6 +100,7 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 
 - The audio source is one playback device on the sender, chosen in the dropdown. cardcast records what that device plays and plays it again on the sound output.
 - The sound output setting is Automatic (default), a chosen playback device, or No audio. Automatic picks the one playback device with the card display's container ID (Windows gives a monitor and its HDMI or DisplayPort sound output the same one), else the one playback device other than the audio source named after the card display; a name that fits several devices counts as not found. A chosen device that is not connected falls back to Automatic. The audio source can't be the sound output. No audio runs the mirror without the relay.
+- On Linux the playback devices are PipeWire's sinks, and the relay is a `pw-loopback` from the audio source's monitor to the sound output. The container ID there is the graphics card's PCI slot plus the monitor's EDID name, which its HDMI or DisplayPort sink carries from the ELD (`audio::container_id`), so a container match needs both.
 - Audio problems never stop or hold up the mirror; they show in the status line.
 - The sender keeps hearing the audio source normally.
 - Which programs play into the audio source is decided in Windows' own per-app sound settings, not in cardcast.

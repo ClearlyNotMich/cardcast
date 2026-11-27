@@ -95,6 +95,20 @@ jobs:
           cargo test mirror::linux::tests::desktop_captures -- --nocapture
           EOF
           dbus-run-session -- bash "$RUNNER_TEMP/capture.sh"
+      # The audio relay (#44): PipeWire and WirePlumber with two null sinks, a tone played into one.
+      - if: runner.os == 'Linux'
+        name: Audio relay between two null sinks
+        run: |
+          sudo apt-get install -y pipewire pipewire-bin wireplumber
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          dbus-run-session -- sh -ec '
+            pipewire & wireplumber &
+            for _ in $(seq 50); do wpctl status >/dev/null 2>&1 && break; sleep 0.2; done
+            for sink in source card; do
+              pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=cardcast-$sink node.nick=\"cardcast $sink\" media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"
+            done
+            CARDCAST_NULL_SINKS=1 cargo test audio::linux::tests::null_sinks -- --nocapture
+          '
       - run: cargo build --release
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v7
@@ -106,8 +120,11 @@ jobs:
         run: |
           mkdir cardcast-linux-x86_64
           cp target/release/cardcast LICENSE README.md cardcast-linux-x86_64/
+          mkdir cardcast-linux-x86_64/packaging && cp -r packaging/linux cardcast-linux-x86_64/packaging/
           tar -czf cardcast-linux-x86_64.tar.gz cardcast-linux-x86_64
           tar -tvzf cardcast-linux-x86_64.tar.gz | grep -q -- '-rwx.* cardcast-linux-x86_64/cardcast$'
+          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/udev/rules.d/60-cardcast-i2c.rules$'
+          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/modules-load.d/i2c-dev.conf$'
       - if: runner.os == 'Linux'
         uses: actions/upload-artifact@v7
         with:
