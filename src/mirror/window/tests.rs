@@ -295,7 +295,10 @@ fn second_monitor_card_display_on_another_graphics_card_is_mirrored() {
     else {
         panic!("no monitor on a graphics card other than the primary monitor's");
     };
-    println!(
+    // Written to stderr directly: libtest captures only the print macros, and CI runs without --nocapture.
+    use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
         "source monitor on adapter {} ({}), card display on adapter {} ({})",
         adapter(source_monitor),
         name(adapter(source_monitor)),
