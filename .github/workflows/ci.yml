@@ -75,7 +75,7 @@ jobs:
           WLR_RENDERER: pixman
           XDG_CURRENT_DESKTOP: sway
           CARDCAST_CAPTURE: HEADLESS-1
-          CARDCAST_EXPECT_COLOUR: '#3366cd'
+          CARDCAST_EXPECT_COLOUR: '#3366cc'
         run: |
           export XDG_RUNTIME_DIR=$(mktemp -d) XDG_CONFIG_HOME=$(mktemp -d)
           # xdg-desktop-portal-wlr shares HEADLESS-1 without asking.
