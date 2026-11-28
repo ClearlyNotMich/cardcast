@@ -26,6 +26,8 @@ serde_json = "1"
 # PNG snapshots of the settings window, rendered on Linux (AGENTS.md, Build and test).
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }
+# The README's animated hero (APNG), in `ui::snapshots`. MIT OR Apache-2.0, the version egui_kittest already pulls in.
+png = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
