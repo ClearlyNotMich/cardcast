@@ -13,16 +13,31 @@ setcap -r /usr/bin/kwin_wayland
 cargo test --no-run
 export XDG_RUNTIME_DIR="$(mktemp -d)" XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland
 [ -e /dev/udmabuf ] && export CARDCAST_KWIN_COMPOSITES=1
-log="$XDG_RUNTIME_DIR/test.log"
+failed=0
 
-# The guard's tests, run inside KWin so they get its Wayland and Xwayland displays.
-printf '#!/bin/sh\nCARDCAST_GUARD_DESKTOP=kwin cargo test guard_tests -- --nocapture --test-threads=1 > %s 2>&1\necho $? > %s\n' \
-  "$log" "$XDG_RUNTIME_DIR/status" > "$XDG_RUNTIME_DIR/session.sh"
-chmod +x "$XDG_RUNTIME_DIR/session.sh"
-dbus-run-session -- kwin_wayland --virtual --xwayland --output-count 2 --width 1280 --height 1024 \
-  --exit-with-session "$XDG_RUNTIME_DIR/session.sh" > /dev/null 2>&1 || true
-cat "$log"
-failed=$(cat "$XDG_RUNTIME_DIR/status" 2>/dev/null || echo 1)
+# Runs `cargo test <arguments>` inside KWin, so the guard's tests get its Wayland and Xwayland displays.
+in_kwin() {
+  session="$XDG_RUNTIME_DIR/session-$1"
+  shift
+  printf '#!/bin/sh\nCARDCAST_GUARD_DESKTOP=kwin cargo test %s > %s.log 2>&1\necho $? > %s.status\n' \
+    "$*" "$session" "$session" > "$session.sh"
+  chmod +x "$session.sh"
+  dbus-run-session -- kwin_wayland --virtual --xwayland --output-count 2 --width 1280 --height 1024 \
+    --exit-with-session "$session.sh" > /dev/null 2>&1 || true
+  cat "$session.log"
+  [ "$(cat "$session.status" 2>/dev/null)" = 0 ] || failed=1
+}
+
+in_kwin guard guard_tests -- --nocapture --test-threads=1
+
+# With KWin's "interactive window move" off (#61) the guard still returns windows and still leaves
+# cardcast's overlays on the card display.
+export XDG_CONFIG_HOME="$XDG_RUNTIME_DIR/move-off"
+mkdir -p "$XDG_CONFIG_HOME"
+printf '[Windows]\nInteractiveWindowMoveEnabled=false\n' > "$XDG_CONFIG_HOME/kwinrc"
+in_kwin move-off -- --nocapture --test-threads=1 desktop_window_guard_returns desktop_kwin_guard_returns \
+  desktop_kwin_guard_leaves
+unset XDG_CONFIG_HOME
 
 # KWin restarts under a running guard: the test is not KWin's child, so it outlives the kill. The
 # Wayland socket keeps its name, as a desktop's does, so the pointer guard finds the new KWin too.
