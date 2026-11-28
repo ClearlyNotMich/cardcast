@@ -8,6 +8,8 @@
 
 #[cfg(windows)]
 mod capture;
+#[cfg(all(test, windows))]
+pub(crate) use capture::duplicating;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg_attr(

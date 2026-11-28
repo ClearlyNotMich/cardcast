@@ -382,20 +382,21 @@ pub mod second_monitor {
             Self::device(instance.replace('#', r"\"))
         }
 
-        /// Waits for the device to be Started first: disabling one that is still starting (just
-        /// replugged) makes pnputil answer "System reboot is needed", and the device then refuses
-        /// every later disable until a reboot (issue #57).
+        /// Waits for the device and its monitors to be settled first: disabling the virtual
+        /// graphics card just after a replug, while it already reports Started, can make pnputil
+        /// answer "System reboot is needed", after which the device refuses every later disable
+        /// until a reboot (docs/research/ci-second-monitor.md, issue #57).
         fn device(id: String) -> Self {
-            assert!(
-                poll(STARTED_LIMIT, || started(&id)),
-                "{id} did not report Started within {STARTED_LIMIT:?}; status {:x?}",
-                status(&id)
-            );
-            let monitors = super::monitors()
+            let monitors: Vec<String> = super::monitors()
                 .unwrap_or_else(|error| panic!("{error}"))
                 .into_iter()
                 .map(|monitor| monitor.device_path)
                 .collect();
+            assert!(
+                poll(SETTLE_LIMIT, || settled(&id, &monitors)),
+                "{id} and its monitors did not settle within {SETTLE_LIMIT:?}; status {:x?}",
+                status(&id)
+            );
             log(&format!("disabling {id}, status {:x?}", status(&id)));
             assert!(
                 pnputil("/disable-device", &id),
@@ -404,16 +405,6 @@ pub mod second_monitor {
             );
             Self { id, monitors }
         }
-
-        /// The device is Started again and every monitor seen before the unplug is back.
-        fn plugged_back(&self) -> bool {
-            started(&self.id)
-                && super::monitors().is_ok_and(|now| {
-                    self.monitors
-                        .iter()
-                        .all(|path| now.iter().any(|monitor| monitor.device_path == *path))
-                })
-        }
     }
 
     impl Drop for Unplugged {
@@ -421,9 +412,9 @@ pub mod second_monitor {
         fn drop(&mut self) {
             if !pnputil("/enable-device", &self.id) {
                 log(&format!("pnputil /enable-device {} failed", self.id));
-            } else if !poll(STARTED_LIMIT, || self.plugged_back()) {
+            } else if !poll(SETTLE_LIMIT, || settled(&self.id, &self.monitors)) {
                 log(&format!(
-                    "{} was not Started with its monitors back within {STARTED_LIMIT:?}; status {:x?}",
+                    "{} and its monitors did not settle within {SETTLE_LIMIT:?}; status {:x?}",
                     self.id,
                     status(&self.id)
                 ));
@@ -431,7 +422,20 @@ pub mod second_monitor {
         }
     }
 
-    const STARTED_LIMIT: Duration = Duration::from_secs(30);
+    /// The device reports Started, every monitor in `monitors` (device paths) is connected, and
+    /// Desktop Duplication delivers a frame from each, so the desktop is presented to it.
+    fn settled(id: &str, monitors: &[String]) -> bool {
+        started(id)
+            && super::monitors().is_ok_and(|now| {
+                monitors.iter().all(|path| {
+                    now.iter()
+                        .find(|monitor| monitor.device_path == *path)
+                        .is_some_and(|monitor| presenting(&monitor.gdi_name))
+                })
+            })
+    }
+
+    const SETTLE_LIMIT: Duration = Duration::from_secs(30);
 
     /// The device's devnode status flags and problem code, read with `CM_Locate_DevNodeW` and
     /// `CM_Get_DevNode_Status` (learn.microsoft.com/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_devnode_status);
@@ -463,6 +467,71 @@ pub mod second_monitor {
         use windows::Win32::Devices::DeviceAndDriverInstallation::{DN_HAS_PROBLEM, DN_STARTED};
         status(id)
             .is_some_and(|(flags, _)| flags & DN_STARTED.0 != 0 && flags & DN_HAS_PROBLEM.0 == 0)
+    }
+
+    /// True once Desktop Duplication delivers a frame from the output showing `gdi_name`.
+    fn presenting(gdi_name: &str) -> bool {
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11CreateDevice,
+        };
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, DXGI_OUTDUPL_FRAME_INFO, IDXGIFactory1, IDXGIOutput1,
+        };
+        use windows::core::Interface as _;
+        let _duplicating = crate::mirror::duplicating();
+        // SAFETY: plain factory creation.
+        let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+            return false;
+        };
+        // SAFETY: enumeration ends at the first index that fails (DXGI_ERROR_NOT_FOUND).
+        for adapter in (0..).map_while(|index| unsafe { factory.EnumAdapters1(index) }.ok()) {
+            // SAFETY: as above, per output.
+            for output in (0..).map_while(|index| unsafe { adapter.EnumOutputs(index) }.ok()) {
+                // SAFETY: plain description read.
+                let named = unsafe { output.GetDesc() }.is_ok_and(|description| {
+                    super::wide_to_string(&description.DeviceName).eq_ignore_ascii_case(gdi_name)
+                });
+                if !named {
+                    continue;
+                }
+                let mut device = None;
+                // SAFETY: the out pointer is a valid local; an explicit adapter needs D3D_DRIVER_TYPE_UNKNOWN.
+                let created = unsafe {
+                    D3D11CreateDevice(
+                        &adapter,
+                        D3D_DRIVER_TYPE_UNKNOWN,
+                        Default::default(),
+                        D3D11_CREATE_DEVICE_FLAG(0),
+                        None,
+                        D3D11_SDK_VERSION,
+                        Some(&raw mut device),
+                        None,
+                        None,
+                    )
+                };
+                let (Ok(()), Some(device), Ok(output)) =
+                    (created, device, output.cast::<IDXGIOutput1>())
+                else {
+                    return false;
+                };
+                // SAFETY: the device is on the output's graphics card.
+                let Ok(duplication) = (unsafe { output.DuplicateOutput(&device) }) else {
+                    return false;
+                };
+                let (mut info, mut frame) = (DXGI_OUTDUPL_FRAME_INFO::default(), None);
+                // SAFETY: out pointers are valid locals; a frame acquired here is released once.
+                let acquired =
+                    unsafe { duplication.AcquireNextFrame(500, &raw mut info, &raw mut frame) }
+                        .is_ok();
+                if acquired {
+                    // SAFETY: as above.
+                    let _ = unsafe { duplication.ReleaseFrame() };
+                }
+                return acquired;
+            }
+        }
+        false
     }
 
     /// Polls until `done` holds; false after `limit`.

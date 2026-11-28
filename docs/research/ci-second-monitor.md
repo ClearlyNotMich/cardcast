@@ -50,6 +50,18 @@ The GDI device name changes on replug (`DISPLAY2` -> `DISPLAY3`), while the moni
 key on the `\\.\DISPLAYn` name. `pnputil /remove-device` removes the node outright [13][11].
 Resolution and count of virtual monitors come from `vdd_settings.xml` [3][2].
 
+Measured in CI (issue #57, run 46132735433 attempt 2): a disable of `ROOT\DISPLAY\0000` about
+150 ms after its re-enable hung 5 s and printed "System reboot is needed to complete configuration
+operations!", although `CM_Get_DevNode_Status` [16] read it as Started with no problem (status
+`0x180200b`) and all its monitors were back in the display configuration. Afterwards the status
+had `DN_NEED_RESTART` (`0x180210b`) and every later disable failed with "Device is pending system
+reboot". Disables at least 1 s after a replug never failed. Likely cause, not proved: the 24.10.27
+driver has one swap-chain worker for all monitors, which each new swap-chain assignment tears
+down (fixed upstream by PR #482 [17], in no release yet), or DWM is still attaching to the new
+outputs; no devnode status shows either. So `Unplugged` (`guard::second_monitor`) waits, before
+a disable and after a replug, until the device is Started, its monitors are back, and Desktop
+Duplication delivers a frame from each.
+
 ## 3. Desktop Duplication and D3D11 on that monitor
 
 - Measured since (CI job `second-monitor` in `ci.yml`, tests named `second_monitor_*`): DXGI lists
@@ -110,3 +122,5 @@ Desktop Duplication on the virtual monitor (section 3).
 13. <https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/pnputil-command-syntax>
 14. <https://learn.microsoft.com/en-us/windows/win32/direct3darticles/directx-warp>
 15. <https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/desktop-dup-api>
+16. <https://learn.microsoft.com/en-us/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_devnode_status>
+17. <https://github.com/VirtualDrivers/Virtual-Display-Driver/pull/482>
