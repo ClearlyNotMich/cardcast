@@ -140,8 +140,8 @@ fn run<C: Compositor>(
                 return;
             }
         }
-        // While it is away: said once, then tried again every second.
-        if !waiting {
+        // While it is away: said once, then tried again every second. A stopped guard says nothing.
+        if !waiting && !stopped.load(Ordering::Relaxed) {
             guarding.notice(&C::waiting());
             waiting = true;
         }
