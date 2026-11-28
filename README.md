@@ -23,6 +23,12 @@ flowchart LR
     capture -- USB --> receiver["Receiver (OBS)"]
 ```
 
+## Why cardcast
+
+- 🎮 **Full refresh rate**: the source monitor keeps it. Windows' Duplicate mode took it away and added input lag; cardcast uses Extend instead.
+- ⚡ **Built to keep the cost low**, whatever refresh rate you play at: cardcast draws only at the card display's own rate (usually 60 Hz), so its work doesn't grow with the source monitor's. It costs least when the card display is on the same graphics card; on another one, every frame is copied between the cards.
+- 📺 **Picture and sound over HDMI**: the capture card carries both to the receiver, your second PC or laptop. OBS there does the encoding, scenes and recording, so the sender does none of it, and you still hear the sound on the sender.
+
 ## Get started in 3 steps
 
 1. **Download** `cardcast-v0.1.0.exe` from the [latest release](https://github.com/ClearlyNotMich/cardcast/releases/latest). There is no installer. It is unsigned, so SmartScreen asks first: **More info → Run anyway**.
