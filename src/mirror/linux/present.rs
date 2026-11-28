@@ -1,6 +1,7 @@
 //! The Linux mirror (#43; docs/research/linux-support.md, section 2): the source monitor's frames
 //! full-screen on the card display, in a surface that never takes the keyboard focus (a
-//! layer-shell overlay on Plasma and wlroots, an override-redirect window on X11), drawn with wgpu
+//! layer-shell overlay on Plasma and wlroots, a fullscreen window that cardcast's Shell extension
+//! keeps from taking the focus on GNOME, an override-redirect window on X11), drawn with wgpu
 //! at the card display's refresh (Fifo), on its own thread like the Windows mirror window.
 
 use super::super::{Ended, Mirror, Picture};
@@ -15,10 +16,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-/// What the status line says on GNOME until cardcast's Shell extension exists (Linux 9): GNOME has
-/// no layer-shell, and a fullscreen window there takes the game's focus.
-pub const NEEDS_GNOME_EXTENSION: &str =
-    "On GNOME the mirror needs cardcast's GNOME Shell extension, which is not built yet (Linux 9).";
+/// What the status line says on GNOME without cardcast's Shell extension: GNOME has no
+/// layer-shell, and a fullscreen window there takes the game's focus unless the extension hands it back.
+pub fn needs_gnome_extension() -> String {
+    format!(
+        "On GNOME the mirror needs cardcast's GNOME Shell extension, which is not running, so it doesn't take the game's focus. {}",
+        crate::guard::gnome::INSTALL_EXTENSION
+    )
+}
 
 /// How the mirror's surface goes on the card display without taking the keyboard focus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,13 +32,16 @@ pub enum Shown {
     LayerShell,
     /// An override-redirect window over the card display's rectangle; no window manager sees it.
     OverrideRedirect,
+    /// A fullscreen `xdg_toplevel` on the card display's `wl_output` (GNOME), which cardcast's
+    /// Shell extension keeps from taking the focus.
+    Fullscreen,
 }
 
 /// How the mirror shows on `desktop`, or why it can't.
 pub fn shown_on(desktop: Option<Desktop>) -> Result<Shown, Ended> {
     match desktop {
         Some(Desktop::X11) => Ok(Shown::OverrideRedirect),
-        Some(Desktop::GnomeWayland) => Err(Ended::Stop(NEEDS_GNOME_EXTENSION.into())),
+        Some(Desktop::GnomeWayland) => Ok(Shown::Fullscreen),
         Some(_) => Ok(Shown::LayerShell),
         None => Err(Ended::Stop(
             "No desktop session to show the mirror on.".into(),
@@ -224,6 +232,13 @@ impl Thread {
             .find(|monitor| monitor.device_path == self.card_display.device_path)
             .ok_or_else(|| Ended::Restart("The card display is not connected.".into()))?
             .clone();
+        if shown == Shown::Fullscreen {
+            let running = zbus::blocking::Connection::session()
+                .is_ok_and(|bus| crate::guard::gnome::extension_running(&bus));
+            if !running {
+                return Err(Ended::Stop(needs_gnome_extension()));
+            }
+        }
         let mut screen = Screen::open(shown, &card_display)?;
         let mut gpu = Gpu::open(&screen)?;
         let modifiers = if self.no_dma_buf.load(Ordering::Relaxed) {

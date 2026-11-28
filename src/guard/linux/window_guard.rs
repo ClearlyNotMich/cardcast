@@ -1,11 +1,15 @@
-//! The Linux window guard behind [`Guard`]: EWMH on X11 (`ewmh.rs`) and a KWin script on Plasma
-//! (`kwin.rs`), both deciding with `placement.rs` (docs/research/linux-support.md, section 5). What
-//! they share lives here: the monitors, the return history and the status-line reports.
+//! The Linux window guard behind [`Guard`]: EWMH on X11 (`ewmh.rs`), a KWin script on Plasma
+//! (`kwin.rs`), and sway's and Hyprland's IPC and cardcast's GNOME Shell extension
+//! (`compositor.rs`), all deciding with `placement.rs` (docs/research/linux-support.md, section 5).
+//! What they share lives here: the monitors, the return history and the status-line reports.
 
 use super::super::desktop::Desktop;
 use super::super::placement::{self, Placement, Rect, ReturnHistory, WindowState};
 use super::super::{Guard, GuardReport, Monitor};
-use super::{ewmh, kwin};
+use super::gnome::Gnome;
+use super::hyprland::Hyprland;
+use super::sway::Sway;
+use super::{compositor, ewmh, kwin};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -88,7 +92,7 @@ impl Guarding {
 
     /// At start and after a display change: finds the monitors and reports. `work_area` gives a
     /// monitor's work area from the desktop, else the guard uses the whole monitor.
-    pub fn follow_displays(&mut self, work_area: impl Fn(&Monitor) -> Option<Rect>) {
+    pub fn follow_displays(&mut self, work_area: impl FnMut(&Monitor) -> Option<Rect>) {
         (self.monitors, self.send_to_output, self.problem) = match self.find_monitors(work_area) {
             Ok(Some((monitors, output))) => (Some(monitors), Some(output), None),
             Ok(None) => (None, None, None),
@@ -105,7 +109,7 @@ impl Guarding {
     /// The card display and "send windows to" rectangles, and the latter's output name.
     fn find_monitors(
         &self,
-        work_area: impl Fn(&Monitor) -> Option<Rect>,
+        mut work_area: impl FnMut(&Monitor) -> Option<Rect>,
     ) -> Result<Option<Found>, String> {
         let monitors = (self.list_monitors)()?;
         let Some((card_display, send_windows_to)) = placement::guarded_monitors(
@@ -196,6 +200,8 @@ impl Guarding {
 enum Helper {
     X11(ewmh::Running),
     Kwin(kwin::Running),
+    /// sway, Hyprland or GNOME.
+    Compositor(compositor::Running),
 }
 
 struct Running {
@@ -204,7 +210,7 @@ struct Running {
     helper: Helper,
 }
 
-/// The window guard on X11 or Plasma; on Linux the pointer guard is not built yet.
+/// The window guard on X11, Plasma, GNOME, sway and Hyprland; on Linux the pointer guard is not built yet.
 pub struct WindowGuard {
     desktop: Desktop,
     list_monitors: ListMonitors,
@@ -215,7 +221,7 @@ pub struct WindowGuard {
 }
 
 impl WindowGuard {
-    /// `desktop` is [`Desktop::X11`] or [`Desktop::PlasmaWayland`], the desktops with a helper.
+    /// `desktop` is one with a helper: not [`Desktop::OtherWayland`].
     pub fn new(
         desktop: Desktop,
         list_monitors: ListMonitors,
@@ -266,10 +272,14 @@ impl Guard for WindowGuard {
             self.report_sender.clone(),
             self.wake.clone(),
         );
-        // Both helpers start and stop on their own thread, so the settings window never waits.
+        // Every helper starts and stops on its own thread, so the settings window never waits.
         let helper = match self.desktop {
             Desktop::X11 => Helper::X11(ewmh::start(guarding)),
-            _ => Helper::Kwin(kwin::start(guarding)),
+            Desktop::Sway => Helper::Compositor(compositor::start::<Sway>(guarding)),
+            Desktop::Hyprland => Helper::Compositor(compositor::start::<Hyprland>(guarding)),
+            Desktop::GnomeWayland => Helper::Compositor(compositor::start::<Gnome>(guarding)),
+            // `new_guard` gives other Wayland compositors no window guard.
+            Desktop::PlasmaWayland | Desktop::OtherWayland => Helper::Kwin(kwin::start(guarding)),
         };
         self.running = Some(Running {
             card_display: card_display.to_owned(),
@@ -286,6 +296,7 @@ impl Guard for WindowGuard {
         match self.running.as_ref().map(|running| &running.helper) {
             Some(Helper::X11(helper)) => helper.follow_displays(),
             Some(Helper::Kwin(helper)) => helper.follow_displays(),
+            Some(Helper::Compositor(helper)) => helper.follow_displays(),
             None => {}
         }
     }

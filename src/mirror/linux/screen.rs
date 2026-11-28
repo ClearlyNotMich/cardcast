@@ -1,7 +1,9 @@
 //! The mirror's surface on the card display, which never takes the keyboard focus
 //! (docs/research/linux-support.md, section 2): a `zwlr_layer_shell_v1` overlay pinned to the
-//! card display's `wl_output` with `keyboard_interactivity` none, or on X11 an override-redirect
-//! window over its rectangle, which no window manager sees. wgpu draws into it through raw handles.
+//! card display's `wl_output` with `keyboard_interactivity` none; on GNOME, which has no
+//! layer-shell, a fullscreen `xdg_toplevel` on that output, which cardcast's Shell extension keeps
+//! from taking the focus; or on X11 an override-redirect window over its rectangle, which no window
+//! manager sees. wgpu draws into it through raw handles.
 
 use super::super::Ended;
 use super::present::Shown;
@@ -19,6 +21,9 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop};
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
+use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
+use wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
+use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::{
     Layer as Level, ZwlrLayerShellV1,
 };
@@ -35,7 +40,7 @@ use x11rb::protocol::xproto::{ClipOrdering, ConnectionExt as _, CreateWindowAux,
 use x11rb::xcb_ffi::XCBConnection;
 
 pub enum Screen {
-    Layer(Layer),
+    Wayland(Wayland),
     X11(X11Window),
 }
 
@@ -43,7 +48,9 @@ impl Screen {
     /// The hidden surface over `card_display`; [`Screen::show`] shows it.
     pub fn open(shown: Shown, card_display: &Monitor) -> Result<Self, Ended> {
         match shown {
-            Shown::LayerShell => Layer::open(card_display).map(Self::Layer),
+            Shown::LayerShell | Shown::Fullscreen => {
+                Wayland::open(shown, card_display).map(Self::Wayland)
+            }
             Shown::OverrideRedirect => {
                 X11Window::open(card_display)
                     .map(Self::X11)
@@ -59,7 +66,7 @@ impl Screen {
     /// The handles wgpu draws through; valid while `self` lives.
     pub fn handles(&self) -> (RawDisplayHandle, RawWindowHandle) {
         match self {
-            Self::Layer(layer) => (
+            Self::Wayland(layer) => (
                 WaylandDisplayHandle::new(layer.display).into(),
                 WaylandWindowHandle::new(layer.surface_pointer).into(),
             ),
@@ -73,7 +80,7 @@ impl Screen {
     /// The size of the picture to draw, in pixels: the card display's resolution.
     pub fn size(&self) -> (u32, u32) {
         match self {
-            Self::Layer(layer) => layer.size,
+            Self::Wayland(layer) => layer.size,
             Self::X11(window) => window.size,
         }
     }
@@ -81,7 +88,7 @@ impl Screen {
     /// Shows the surface. A layer surface shows with its first picture.
     pub fn show(&mut self) -> Result<(), Ended> {
         match self {
-            Self::Layer(_) => Ok(()),
+            Self::Wayland(_) => Ok(()),
             Self::X11(window) => window.show().map_err(|error| {
                 Ended::Restart(format!(
                     "Could not show the mirror window on the card display. ({error})"
@@ -93,7 +100,7 @@ impl Screen {
     /// Takes the desktop's news; an error once the surface is gone (the card display was unplugged).
     pub fn follow(&mut self) -> Result<(), Ended> {
         match self {
-            Self::Layer(layer) => layer.follow(),
+            Self::Wayland(layer) => layer.follow(),
             Self::X11(_) => Ok(()),
         }
     }
@@ -104,16 +111,24 @@ impl Screen {
 struct Events {
     /// The `wl_output` names, in the order bound.
     names: Vec<Option<String>>,
-    /// The size the compositor gave the layer surface, in its logical pixels.
+    /// The size the compositor gave the surface, in its logical pixels; 0 lets cardcast choose.
     configured: Option<(u32, u32)>,
+    /// The size in the toplevel's latest configure, which its surface's configure then applies.
+    toplevel_size: (u32, u32),
     /// The compositor took the surface away, for example with its output.
     closed: bool,
 }
 
-pub struct Layer {
-    // Dropped in this order: the layer surface before its wl_surface, then the connection.
+/// The surface's role.
+enum Role {
+    Layer(ZwlrLayerSurfaceV1),
+    Toplevel(XdgSurface, XdgToplevel),
+}
+
+pub struct Wayland {
+    // Dropped in this order: the role before its wl_surface, then the connection.
     viewport: Option<WpViewport>,
-    layer: ZwlrLayerSurfaceV1,
+    role: Role,
     surface: WlSurface,
     queue: EventQueue<Events>,
     events: Events,
@@ -125,10 +140,11 @@ pub struct Layer {
 
 // SAFETY: the raw pointers are libwayland's display and surface proxies, which libwayland lets any
 // thread use; the mirror thread alone uses them.
-unsafe impl Send for Layer {}
+unsafe impl Send for Wayland {}
 
-impl Layer {
-    fn open(card_display: &Monitor) -> Result<Self, Ended> {
+impl Wayland {
+    /// A layer surface, or for [`Shown::Fullscreen`] a fullscreen toplevel.
+    fn open(shown: Shown, card_display: &Monitor) -> Result<Self, Ended> {
         let failed = |error: &dyn std::fmt::Display| {
             Ended::Restart(format!(
                 "Could not open the mirror on the card display. ({error})"
@@ -141,12 +157,19 @@ impl Layer {
         let compositor: WlCompositor = globals
             .bind(&handle, 4..=6, ())
             .map_err(|error| failed(&error))?;
-        let shell: ZwlrLayerShellV1 = globals.bind(&handle, 1..=4, ()).map_err(|_| {
-            Ended::Stop(
-                "This desktop can't show the mirror: it has no layer-shell (zwlr_layer_shell_v1)."
-                    .into(),
-            )
-        })?;
+        let layer_shell = (shown == Shown::LayerShell)
+            .then(|| globals.bind::<ZwlrLayerShellV1, _, _>(&handle, 1..=4, ()))
+            .transpose()
+            .map_err(|_| {
+                Ended::Stop(
+                    "This desktop can't show the mirror: it has no layer-shell (zwlr_layer_shell_v1)."
+                        .into(),
+                )
+            })?;
+        let xdg_shell = (shown == Shown::Fullscreen)
+            .then(|| globals.bind::<XdgWmBase, _, _>(&handle, 1..=6, ()))
+            .transpose()
+            .map_err(|error| failed(&error))?;
         let viewporter = globals.bind::<WpViewporter, _, _>(&handle, 1..=1, ()).ok();
         let outputs: Vec<WlOutput> = globals.contents().with_list(|list| {
             list.iter()
@@ -169,19 +192,34 @@ impl Layer {
             .and_then(|index| outputs.get(index))
             .ok_or_else(|| Ended::Restart("The card display is not connected.".into()))?;
         let surface = compositor.create_surface(&handle, ());
-        let layer = shell.get_layer_surface(
-            &surface,
-            Some(output),
-            Level::Overlay,
-            "cardcast mirror".into(),
-            &handle,
-            (),
-        );
-        layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-        layer.set_size(0, 0);
-        // Over panels too, and never the keyboard focus.
-        layer.set_exclusive_zone(-1);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        let role = match (layer_shell, xdg_shell) {
+            (Some(shell), _) => {
+                let layer = shell.get_layer_surface(
+                    &surface,
+                    Some(output),
+                    Level::Overlay,
+                    "cardcast mirror".into(),
+                    &handle,
+                    (),
+                );
+                layer.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+                layer.set_size(0, 0);
+                // Over panels too, and never the keyboard focus.
+                layer.set_exclusive_zone(-1);
+                layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+                Role::Layer(layer)
+            }
+            (None, Some(shell)) => {
+                let xdg = shell.get_xdg_surface(&surface, &handle, ());
+                let toplevel = xdg.get_toplevel(&handle, ());
+                // The Shell extension knows the mirror by its app id.
+                toplevel.set_app_id(crate::guard::gnome::MIRROR_APP_ID.into());
+                toplevel.set_title("cardcast mirror".into());
+                toplevel.set_fullscreen(Some(output));
+                Role::Toplevel(xdg, toplevel)
+            }
+            (None, None) => return Err(failed(&"no shell to show the mirror with")),
+        };
         // Clicks go through to whatever is below; the card display takes no input.
         let region = compositor.create_region(&handle, ());
         surface.set_input_region(Some(&region));
@@ -218,6 +256,12 @@ impl Layer {
             .configured
             .filter(|_| !events.closed)
             .ok_or_else(|| Ended::Restart("The card display is not connected.".into()))?;
+        // A toplevel left to choose its size takes the card display's.
+        let configured = if configured.0 == 0 || configured.1 == 0 {
+            card_display.layout_size
+        } else {
+            configured
+        };
         // The picture is drawn at the card display's resolution and shown at its logical size;
         // without viewporter it is drawn at the logical size.
         let (viewport, size) = match viewporter {
@@ -237,7 +281,7 @@ impl Layer {
             .ok_or_else(|| failed(&"no Wayland surface"))?;
         Ok(Self {
             viewport,
-            layer,
+            role,
             surface,
             queue,
             events,
@@ -264,12 +308,18 @@ impl Layer {
     }
 }
 
-impl Drop for Layer {
+impl Drop for Wayland {
     fn drop(&mut self) {
         if let Some(viewport) = self.viewport.take() {
             viewport.destroy();
         }
-        self.layer.destroy();
+        match &self.role {
+            Role::Layer(layer) => layer.destroy(),
+            Role::Toplevel(xdg, toplevel) => {
+                toplevel.destroy();
+                xdg.destroy();
+            }
+        }
         self.surface.destroy();
         let _ = self.connection.flush();
     }
@@ -322,6 +372,60 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for Events {
                 events.configured = Some((width, height));
             }
             zwlr_layer_surface_v1::Event::Closed => events.closed = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<XdgWmBase, ()> for Events {
+    fn event(
+        _: &mut Self,
+        shell: &XdgWmBase,
+        event: xdg_wm_base::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // Unanswered pings would make the Shell call the mirror not responding.
+        if let xdg_wm_base::Event::Ping { serial } = event {
+            shell.pong(serial);
+        }
+    }
+}
+
+impl Dispatch<XdgSurface, ()> for Events {
+    fn event(
+        events: &mut Self,
+        xdg: &XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            xdg.ack_configure(serial);
+            events.configured = Some(events.toplevel_size);
+        }
+    }
+}
+
+impl Dispatch<XdgToplevel, ()> for Events {
+    fn event(
+        events: &mut Self,
+        _: &XdgToplevel,
+        event: xdg_toplevel::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            xdg_toplevel::Event::Configure { width, height, .. } => {
+                events.toplevel_size = (
+                    u32::try_from(width).unwrap_or(0),
+                    u32::try_from(height).unwrap_or(0),
+                );
+            }
+            xdg_toplevel::Event::Close => events.closed = true,
             _ => {}
         }
     }

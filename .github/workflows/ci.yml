@@ -79,6 +79,61 @@ jobs:
           # openbox names itself before it has finished starting (a window mapped then went unmanaged once).
           sleep 1
           cargo test guard_tests -- --nocapture --test-threads=1
+      # The window guard (#48) over sway's IPC: headless sway with two outputs and foot windows,
+      # then sway killed and started again under a running guard.
+      - if: runner.os == 'Linux'
+        name: Window guard on headless sway
+        env:
+          WLR_BACKENDS: headless
+          WLR_HEADLESS_OUTPUTS: 2
+          WLR_LIBINPUT_NO_DEVICES: 1
+          WLR_RENDERER: pixman
+          CARDCAST_GUARD_DESKTOP: sway
+        run: |
+          sudo apt-get install -y foot fonts-dejavu-core
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          sway -c /dev/null &
+          for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.2; done
+          export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
+          export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-? | head -n 1)")
+          for _ in $(seq 10); do swaymsg -t get_outputs >/dev/null && break; sleep 1; done
+          failed=0
+          cargo test desktop_sway_guard_returns -- --nocapture || failed=1
+          CARDCAST_SWAY_START='sway -c /dev/null > /dev/null 2>&1' cargo test desktop_sway_guard_follows -- --nocapture || failed=1
+          pkill -x sway || true
+          exit $failed
+      # The window guard and the mirror's window on GNOME (#48): headless GNOME Shell with two
+      # virtual monitors and cardcast's extension (packaging/gnome-extension), then the extension
+      # turned off and on under a running guard.
+      - if: runner.os == 'Linux'
+        name: Window guard and mirror window on headless GNOME Shell
+        env:
+          CARDCAST_GUARD_DESKTOP: gnome
+        run: |
+          sudo apt-get install -y gnome-shell foot fonts-dejavu-core
+          export XDG_RUNTIME_DIR=$(mktemp -d) XDG_DATA_HOME=$(mktemp -d) XDG_CONFIG_HOME=$(mktemp -d)
+          mkdir -p "$XDG_DATA_HOME/gnome-shell/extensions"
+          cp -r packaging/gnome-extension/cardcast@clearlynotmich.github.io "$XDG_DATA_HOME/gnome-shell/extensions/"
+          cat > "$RUNNER_TEMP/gnome.sh" <<'EOF'
+          gsettings set org.gnome.shell enabled-extensions "['cardcast@clearlynotmich.github.io']"
+          gnome-shell --headless --wayland --no-x11 --virtual-monitor 1280x720 --virtual-monitor 1280x720 > "$RUNNER_TEMP/gnome-shell.log" 2>&1 &
+          shell=$!
+          for _ in $(seq 100); do [ -S "$XDG_RUNTIME_DIR/wayland-0" ] && break; sleep 0.2; done
+          export WAYLAND_DISPLAY=wayland-0 XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland
+          for _ in $(seq 100); do busctl --user status io.github.ClearlyNotMich.cardcast.Shell >/dev/null 2>&1 && break; sleep 0.2; done
+          # GNOME starts in the overview, where new windows don't take the focus.
+          for _ in $(seq 50); do
+            busctl --user set-property org.gnome.Shell /org/gnome/Shell org.gnome.Shell OverviewActive b false
+            sleep 0.5
+            busctl --user get-property org.gnome.Shell /org/gnome/Shell org.gnome.Shell OverviewActive | grep -q false && break
+          done
+          failed=0
+          cargo test desktop_gnome -- --nocapture --test-threads=1 || failed=1
+          kill $shell
+          [ $failed = 0 ] || grep -E 'cardcast|JS ERROR' "$RUNNER_TEMP/gnome-shell.log"
+          exit $failed
+          EOF
+          dbus-run-session -- bash "$RUNNER_TEMP/gnome.sh"
       # The mirror capture (#42): a frame of a known colour through MIT-SHM on Xvfb, and through
       # xdg-desktop-portal-wlr and PipeWire on headless sway. -noreset keeps xsetroot's colour.
       - if: runner.os == 'Linux'
@@ -181,11 +236,12 @@ jobs:
         run: |
           mkdir cardcast-linux-x86_64
           cp target/release/cardcast LICENSE README.md cardcast-linux-x86_64/
-          mkdir cardcast-linux-x86_64/packaging && cp -r packaging/linux cardcast-linux-x86_64/packaging/
+          mkdir cardcast-linux-x86_64/packaging && cp -r packaging/linux packaging/gnome-extension cardcast-linux-x86_64/packaging/
           tar -czf cardcast-linux-x86_64.tar.gz cardcast-linux-x86_64
           tar -tvzf cardcast-linux-x86_64.tar.gz | grep -q -- '-rwx.* cardcast-linux-x86_64/cardcast$'
           tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/udev/rules.d/60-cardcast-i2c.rules$'
           tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/modules-load.d/i2c-dev.conf$'
+          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/gnome-extension/cardcast@clearlynotmich.github.io/extension.js$'
       - if: runner.os == 'Linux'
         uses: actions/upload-artifact@v7
         with:

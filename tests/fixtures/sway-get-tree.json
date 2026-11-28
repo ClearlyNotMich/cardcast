@@ -1,0 +1,201 @@
+{
+ "id": 1,
+ "type": "root",
+ "name": "root",
+ "rect": {
+  "x": 0,
+  "y": 0,
+  "width": 2560,
+  "height": 720
+ },
+ "deco_rect": {
+  "x": 0,
+  "y": 0,
+  "width": 0,
+  "height": 0
+ },
+ "fullscreen_mode": 0,
+ "focused": false,
+ "nodes": [
+  {
+   "id": 2147483647,
+   "type": "output",
+   "name": "__i3",
+   "rect": {
+    "x": 0,
+    "y": 0,
+    "width": 2560,
+    "height": 720
+   },
+   "deco_rect": {
+    "x": 0,
+    "y": 0,
+    "width": 0,
+    "height": 0
+   },
+   "fullscreen_mode": 0,
+   "focused": false,
+   "nodes": [
+    {
+     "id": 2147483646,
+     "type": "workspace",
+     "name": "__i3_scratch",
+     "rect": {
+      "x": 0,
+      "y": 0,
+      "width": 2560,
+      "height": 720
+     },
+     "deco_rect": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+     },
+     "fullscreen_mode": 1,
+     "focused": false,
+     "nodes": [],
+     "floating_nodes": []
+    }
+   ],
+   "floating_nodes": []
+  },
+  {
+   "id": 4,
+   "type": "output",
+   "name": "HEADLESS-2",
+   "rect": {
+    "x": 0,
+    "y": 0,
+    "width": 1280,
+    "height": 720
+   },
+   "deco_rect": {
+    "x": 0,
+    "y": 0,
+    "width": 0,
+    "height": 0
+   },
+   "fullscreen_mode": 0,
+   "focused": false,
+   "nodes": [
+    {
+     "id": 5,
+     "type": "workspace",
+     "name": "1",
+     "rect": {
+      "x": 0,
+      "y": 0,
+      "width": 1280,
+      "height": 720
+     },
+     "deco_rect": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+     },
+     "fullscreen_mode": 1,
+     "focused": false,
+     "nodes": [
+      {
+       "id": 7,
+       "type": "con",
+       "name": "foot",
+       "rect": {
+        "x": 0,
+        "y": 25,
+        "width": 1280,
+        "height": 695
+       },
+       "deco_rect": {
+        "x": 0,
+        "y": 0,
+        "width": 1280,
+        "height": 25
+       },
+       "pid": 24,
+       "app_id": "focus-test",
+       "visible": true,
+       "fullscreen_mode": 0,
+       "focused": false,
+       "nodes": [],
+       "floating_nodes": []
+      }
+     ],
+     "floating_nodes": [
+      {
+       "id": 8,
+       "type": "floating_con",
+       "name": "foot",
+       "rect": {
+        "x": 290,
+        "y": 113,
+        "width": 700,
+        "height": 496
+       },
+       "deco_rect": {
+        "x": 290,
+        "y": 88,
+        "width": 700,
+        "height": 25
+       },
+       "pid": 23,
+       "app_id": "guard-test",
+       "visible": true,
+       "fullscreen_mode": 0,
+       "focused": true,
+       "nodes": [],
+       "floating_nodes": []
+      }
+     ]
+    }
+   ],
+   "floating_nodes": []
+  },
+  {
+   "id": 3,
+   "type": "output",
+   "name": "HEADLESS-1",
+   "rect": {
+    "x": 1280,
+    "y": 0,
+    "width": 1280,
+    "height": 720
+   },
+   "deco_rect": {
+    "x": 0,
+    "y": 0,
+    "width": 0,
+    "height": 0
+   },
+   "fullscreen_mode": 0,
+   "focused": false,
+   "nodes": [
+    {
+     "id": 6,
+     "type": "workspace",
+     "name": "2",
+     "rect": {
+      "x": 1280,
+      "y": 0,
+      "width": 1280,
+      "height": 720
+     },
+     "deco_rect": {
+      "x": 0,
+      "y": 0,
+      "width": 0,
+      "height": 0
+     },
+     "fullscreen_mode": 1,
+     "focused": false,
+     "nodes": [],
+     "floating_nodes": []
+    }
+   ],
+   "floating_nodes": []
+  }
+ ],
+ "floating_nodes": []
+}
