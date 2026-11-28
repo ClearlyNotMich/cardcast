@@ -372,6 +372,43 @@ fn the_guard_switch_is_read_once_and_its_text_toggles_it() {
     assert!(!*harness.state());
 }
 
+/// The Linux icon (`packaging/linux/.../cardcast.png`, 256 by 256): the header's logo, centred
+/// on the panel colour it is drawn for. The render is premultiplied, so a see-through fill on a
+/// transparent background would come out darker.
+#[test]
+fn snapshot_icon() {
+    let _device = one_device_at_a_time();
+    let mut harness = Harness::builder()
+        .with_size([32.0, 32.0])
+        .with_pixels_per_point(8.0)
+        .build_ui(|ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(32.0, 32.0)),
+                6,
+                look::PANEL,
+            );
+            // The logo spans 29 by 20 points from 2 points below its rectangle's top.
+            live::logo(
+                &painter,
+                egui::Rect::from_min_size(egui::pos2(1.5, 4.0), egui::vec2(30.0, 24.0)),
+            );
+        });
+    // No panel behind the backdrop, so the icon's rounded corners are transparent.
+    harness
+        .ctx
+        .all_styles_mut(|style| style.visuals.panel_fill = egui::Color32::TRANSPARENT);
+    harness.run();
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/packaging/linux/usr/share/icons/hicolor/256x256/apps"
+    );
+    harness.snapshot_options(
+        "cardcast",
+        &egui_kittest::SnapshotOptions::new().output_path(dir),
+    );
+}
+
 /// The README's media in `docs/media/`: an animated hero of the running settings window and three
 /// stills. Only `UPDATE_README_MEDIA=1 cargo test readme_media` writes them.
 #[test]

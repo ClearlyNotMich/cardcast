@@ -115,6 +115,46 @@ hotspot [5], blended into the frame by `linux::draw_pointer`.
 - Xvfb with `xsetroot -solid '#cc6633'`; `-noreset` stops the server resetting the root window when
   xsetroot disconnects.
 
+## The present (`mirror/linux/present.rs`, `screen.rs`, `gpu.rs`, #43)
+
+`LinuxMirror` is the Linux `Mirror`. Start returns at once; a thread opens the surface and a wgpu
+Vulkan device, then runs `capture` on a second thread that nothing joins, because `portal::share`
+blocks until the dialog is answered. Stop joins only the first thread. The capture thread always
+stores its `restore_token` and wakes the settings window, which saves it (`take_restore_token`),
+even after Stop; its picture then has no receiver and is dropped, ending the stream.
+
+- **Surface** (research section 2): a `zwlr_layer_shell_v1` overlay on the card display's
+  `wl_output` (matched by name), anchored to all edges, `exclusive_zone` -1, keyboard
+  interactivity none, an empty input region, drawn at the card display's resolution and scaled to
+  its logical size with `wp_viewporter`; on X11 an override-redirect window over its RandR
+  rectangle with an empty input shape (SHAPE). Clicks go through both. On GNOME the start stops
+  with "needs the GNOME extension (Linux 9)". The surface shows with the first picture.
+- **Drawing**: `PresentMode::Fifo`, frame latency 1, a black clear, then the picture aspect-fitted
+  with `mirror::fit`, each refresh; `presents()` counts the presents. On X11 the loop is also
+  capped at the card display's refresh (`present::next_present`), one period of its RandR mode
+  exactly (`screen::refresh_period`: dot clock / (htotal × vtotal), the lines halved for
+  `Interlace` and doubled for `DoubleScan` [9][10], so 59.94 Hz isn't taken as 59), since a driver without vsync
+  (lavapipe measured 200-1000 a second) would otherwise grab with MIT-SHM that often.
+- **Memory frames** are uploaded with `write_texture`.
+- **DMA-BUF frames** are read as wlroots reads a client's DMA-BUF [7]: the device is opened with
+  `VK_EXT_queue_family_foreign` added (wgpu-hal's `open_with_callback`), else no modifiers are
+  offered. Per frame, cardcast exports the plane's sync file (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`,
+  Linux 6.0 [8]; on older kernels it polls the DMA-BUF itself, whose `POLLIN` waits for its
+  writers [8]) and waits up to 100 ms for it on the CPU (wgpu's submit takes no wait semaphore);
+  then imports it with `texture_from_dmabuf_fd` (single plane, modifiers the device lists with
+  `TRANSFER_SRC` for BGRA and RGBA), records an acquire barrier from `VK_QUEUE_FAMILY_FOREIGN_EXT`
+  in `GENERAL` layout to `TRANSFER_SRC_OPTIMAL` on the raw command buffer (`as_hal_mut`), copies
+  into the kept texture, releases it back to the foreign family in `GENERAL`, waits for the copy
+  (bounded) and drops the frame. wgpu is told the texture starts in `COPY_SRC`, so it never
+  transitions it from `UNDEFINED`. Only a failed import restarts the mirror without modifiers;
+  other failures restart it as they are. Checked locally (headless sway on Vulkan, AMD RADV, an
+  AMD tiled modifier); CI has no graphics card, so it takes the shared-memory path.
+
+**Stop** waits at most a second for the mirror thread; one stuck in the compositor (a Fifo present
+while the card display sleeps) is left to end on its own; its overlay stays up, showing the last
+picture, until the display wakes, and a Start meanwhile adds a second overlay. Waiting for the layer surface's first
+configure is bounded to 5 seconds.
+
 ## Sources
 
 [1] xdg-desktop-portal, `org.freedesktop.portal.ScreenCast.xml`,
@@ -127,3 +167,12 @@ hotspot [5], blended into the frame by `linux::draw_pointer`.
 [5] XFixes protocol, <https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/blob/master/fixesproto.txt>
 [6] xdg-desktop-portal-wlr(5),
 <https://github.com/emersion/xdg-desktop-portal-wlr/blob/master/xdg-desktop-portal-wlr.5.scd>
+[7] wlroots, `render/vulkan/pass.c` (foreign acquire and release barriers),
+`render/vulkan/vulkan.c` (`VK_EXT_queue_family_foreign`), `render/dmabuf_linux.c`
+(`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`), <https://gitlab.freedesktop.org/wlroots/wlroots>
+[8] Linux, DMA-BUF sharing: "Implicit Fence Poll Support" and `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`,
+<https://docs.kernel.org/driver-api/dma-buf.html>, `include/uapi/linux/dma-buf.h`
+[9] RandR protocol, `MODEINFO` and `MODEFLAG` (`Interlace`, `DoubleScan`),
+<https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/blob/master/randrproto.txt>
+[10] xrandr, `mode_refresh` in `xrandr.c` (the refresh from a mode's timings and flags),
+<https://gitlab.freedesktop.org/xorg/app/xrandr/-/blob/master/xrandr.c>

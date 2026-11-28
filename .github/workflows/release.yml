@@ -1,0 +1,47 @@
+name: Release
+
+# A v* tag runs all of CI and, when it is green, attaches the Windows .exe and the Linux tarball,
+# each with a .sha256, to the tag's GitHub release, creating the release if it doesn't exist yet.
+# It never replaces a file the release already has, so a sum the AUR package pins can't change.
+# Anything but a tag push is a dry run: the same files go to a new draft release dry-run-<run id>,
+# which makes no tag; delete it after. Run it with gh workflow run release.yml --ref <branch> (once
+# this file is on the default branch) or by pushing to the release-dry-run branch.
+on:
+  push:
+    tags: ['v*']
+    branches: [release-dry-run]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ github.ref_type != 'tag' || github.event_name != 'push' }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then TAG="dry-run-$GITHUB_RUN_ID"; fi
+          mv cardcast-exe/cardcast.exe "cardcast-$TAG.exe"
+          mv cardcast-linux-x86_64.tar.gz/cardcast-linux-x86_64.tar.gz "cardcast-$TAG-linux-x86_64.tar.gz"
+          for file in "cardcast-$TAG.exe" "cardcast-$TAG-linux-x86_64.tar.gz"; do sha256sum "$file" > "$file.sha256"; done
+          # A tag like v0.2.0-alpha.1 is a pre-release.
+          case "$TAG" in *-*) pre=--prerelease ;; *) pre= ;; esac
+          if [ "$DRY_RUN" = true ]; then
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "cardcast $TAG" cardcast-"$TAG"*
+            exit
+          fi
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --verify-tag --title "cardcast $TAG" --generate-notes $pre
+          # Without --clobber, gh fails if the release already has a file of the same name.
+          gh release upload "$TAG" cardcast-"$TAG"*

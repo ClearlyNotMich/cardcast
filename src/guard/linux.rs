@@ -2,9 +2,19 @@
 //! give each monitor's EDID and graphics card; the desktop (Wayland outputs, or RandR on X11) gives
 //! its name, position, size and refresh rate. The display watcher follows the desktop's outputs.
 
+mod catcher;
+mod compositor;
+mod ewmh;
+pub mod gnome;
+mod hyprland;
+mod kwin;
 mod mutter;
+mod sway;
 mod wayland;
+mod window_guard;
 mod x11;
+
+pub use window_guard::WindowGuard;
 
 use super::Monitor;
 use super::desktop::{self, Desktop};
@@ -276,5 +286,9 @@ impl Drop for DisplayWatcher {
     }
 }
 
+#[cfg(test)]
+mod compositor_tests;
+#[cfg(test)]
+mod guard_tests;
 #[cfg(test)]
 mod tests;

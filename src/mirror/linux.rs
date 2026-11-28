@@ -2,11 +2,16 @@
 //! the xdg-desktop-portal ScreenCast hands over a PipeWire stream of the source monitor on Wayland,
 //! and MIT-SHM copies it on X11. Both hand frames to the present through [`Picture`].
 
+mod gpu;
 mod portal;
+mod present;
+mod screen;
 mod stream;
 #[cfg(test)]
 mod tests;
 mod x11;
+
+pub use present::LinuxMirror;
 
 use super::{Ended, Picture};
 use crate::guard::Monitor;

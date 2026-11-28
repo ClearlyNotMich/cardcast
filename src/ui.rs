@@ -73,7 +73,6 @@ struct SettingsWindow {
 impl SettingsWindow {
     fn new(context: &egui::Context) -> Self {
         let mut status = StatusLine::new(Status::Stopped);
-        status.displays = not_built_yet();
         let monitors = guard::monitors().unwrap_or_else(|error| {
             status.other = Some(error);
             Vec::new()
@@ -91,6 +90,7 @@ impl SettingsWindow {
         let relay_context = context.clone();
         let lister_context = context.clone();
         let mirror_context = context.clone();
+        let restore_token = settings.restore_token.clone();
         let guard_context = context.clone();
         let input_context = context.clone();
         let mut guard = guard::new_guard(move || guard_context.request_repaint());
@@ -119,7 +119,7 @@ impl SettingsWindow {
             restart_at: Instant::now(),
             attempts: 0,
             minimise_when_running: false,
-            mirror: mirror::new_mirror(move || mirror_context.request_repaint()),
+            mirror: mirror::new_mirror(move || mirror_context.request_repaint(), restore_token),
             relay: audio::new_relay(move || relay_context.request_repaint()),
             guard,
             displays_changed,
@@ -232,6 +232,13 @@ impl SettingsWindow {
     /// Follows the mirror starting, failing to start or ending on its own, and starts a
     /// restarting mirror again when its backoff timer is due.
     fn follow_mirror(&mut self, context: &egui::Context) {
+        // A capture's new restore token is saved even if it ended or was stopped meanwhile.
+        if let Some(restore_token) = self.mirror.take_restore_token() {
+            self.settings.restore_token = restore_token;
+            if let Err(error) = self.settings.save() {
+                self.status.other = Some(error);
+            }
+        }
         match self.mirror.take_end() {
             Some(Ended::Restart(reason)) => {
                 self.status.mirror = Status::Restarting(reason);
@@ -629,11 +636,6 @@ impl SettingsWindow {
     }
 }
 
-/// The parts not built for this platform yet (#36): a lasting notice that Start and Stop don't clear.
-fn not_built_yet() -> Option<String> {
-    mirror::NOT_BUILT.map(str::to_owned)
-}
-
 fn update_guard(guard: &mut dyn Guard, settings: &Settings) {
     guard.update(
         settings.guard_enabled,
@@ -937,21 +939,6 @@ mod tests {
         (window, relay)
     }
 
-    #[cfg(not(windows))]
-    #[test]
-    fn on_linux_start_keeps_saying_what_does_not_work_yet() {
-        let mut window = window("card");
-        window.monitors = Vec::new();
-        window.settings = Settings::default();
-        window.status.displays = not_built_yet();
-        window.start();
-        assert_eq!(
-            window.status.text(),
-            "Choose a source monitor and a card display. \
-             | The mirror does not work on Linux yet."
-        );
-    }
-
     #[test]
     fn audio_follows_start_and_stop() {
         let (mut window, relay) = with_relay(window("card"), Some("speakers"));
@@ -1009,7 +996,7 @@ mod tests {
             restart_at: Instant::now(),
             attempts: 0,
             minimise_when_running: false,
-            mirror: mirror::new_mirror(|| {}),
+            mirror: mirror::new_mirror(|| {}, None),
             relay: Box::new(RecordingRelay::default()),
             guard: Box::new(guard.clone()),
             displays_changed,
@@ -1347,11 +1334,31 @@ mod tests {
         assert_eq!(window.status.text(), "Running");
     }
 
+    #[test]
+    fn a_new_screen_sharing_token_is_saved_even_after_the_mirror_ended() {
+        let mut window = window("card");
+        window.settings.restore_token = Some("spent".into());
+        window.mirror = Box::new(StandInMirror {
+            end: Some(Ended::Stop("cancelled".into())),
+            restore_token: Some(Some("new".into())),
+            ..StandInMirror::default()
+        });
+        window.follow_mirror(&egui::Context::default());
+        assert_eq!(window.settings.restore_token.as_deref(), Some("new"));
+        // A refused stream clears it, so the next Start asks again.
+        window.mirror = Box::new(StandInMirror {
+            restore_token: Some(None),
+            ..StandInMirror::default()
+        });
+        window.follow_mirror(&egui::Context::default());
+        assert_eq!(window.settings.restore_token, None);
+    }
+
     fn mirror_ends(window: &mut SettingsWindow, end: Ended) {
         window.mirror = Box::new(StandInMirror {
             running: true,
             end: Some(end),
-            fail_start: None,
+            ..StandInMirror::default()
         });
     }
 

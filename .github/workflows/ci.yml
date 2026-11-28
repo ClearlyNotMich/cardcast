@@ -1,6 +1,11 @@
 name: CI
 
-on: [push, pull_request]
+# Tags run it through release.yml instead, which then publishes the release.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
 
 jobs:
   check:
@@ -56,18 +61,127 @@ jobs:
           CARDCAST_EXPECT_PLUGGED='HEADLESS-1 720x1280 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary; HEADLESS-3 1920x1080 1920x1080+1760+0' \
             cargo test guard::linux::tests::desktop_hotplug -- --nocapture || failed=1
           exit $failed
+      # The window guard (#47) through EWMH: Xvfb split into two RandR monitors, with openbox; and
+      # the pointer guard (#49): a warp, a mouse (xdotool) against the barrier, and a grab.
+      - if: runner.os == 'Linux'
+        name: Window guard and pointer guard on Xvfb with openbox
+        env:
+          CARDCAST_GUARD_DESKTOP: openbox
+        run: |
+          sudo apt-get install -y openbox x11-xserver-utils x11-utils xdotool
+          export DISPLAY=:99
+          # -noreset: the X server would drop the monitors once the last client leaves.
+          Xvfb :99 -screen 0 2560x1024x24 -noreset &
+          xvfb=$!
+          # Later steps' xvfb-run takes :99 too, so this X server and its window manager end with the step.
+          trap 'kill $openbox $xvfb 2>/dev/null; wait $xvfb 2>/dev/null' EXIT
+          for _ in $(seq 50); do xprop -root >/dev/null 2>&1 && break; sleep 0.2; done
+          xrandr --setmonitor left 1280/338x1024/270+0+0 screen
+          xrandr --setmonitor right 1280/338x1024/270+1280+0 none
+          xrandr --listmonitors
+          openbox &
+          openbox=$!
+          for _ in $(seq 50); do xprop -root _NET_SUPPORTING_WM_CHECK | grep -q window && break; sleep 0.2; done
+          # openbox names itself before it has finished starting (a window mapped then went unmanaged once).
+          sleep 1
+          cargo test guard_tests -- --nocapture --test-threads=1
+      # The window guard (#48) over sway's IPC: headless sway with two outputs and foot windows,
+      # the pointer guard (#49) against a virtual mouse, then sway killed and started again under a
+      # running guard.
+      - if: runner.os == 'Linux'
+        name: Window guard and pointer guard on headless sway
+        env:
+          WLR_BACKENDS: headless
+          WLR_HEADLESS_OUTPUTS: 2
+          WLR_LIBINPUT_NO_DEVICES: 1
+          WLR_RENDERER: pixman
+          CARDCAST_GUARD_DESKTOP: sway
+        run: |
+          sudo apt-get install -y foot fonts-dejavu-core
+          export XDG_RUNTIME_DIR=$(mktemp -d)
+          sway -c /dev/null &
+          for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.2; done
+          export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
+          export WAYLAND_DISPLAY=$(basename "$(ls "$XDG_RUNTIME_DIR"/wayland-? | head -n 1)")
+          for _ in $(seq 10); do swaymsg -t get_outputs >/dev/null && break; sleep 1; done
+          failed=0
+          cargo test desktop_sway_guard_returns -- --nocapture || failed=1
+          cargo test desktop_sway_pointer -- --nocapture || failed=1
+          CARDCAST_SWAY_START='sway -c /dev/null > /dev/null 2>&1' cargo test desktop_sway_guard_follows -- --nocapture || failed=1
+          pkill -x sway || true
+          exit $failed
+      # The window guard, the pointer guard (#49) and the mirror's window on GNOME (#48): headless
+      # GNOME Shell with two virtual monitors and cardcast's extension
+      # (packaging/linux/usr/share/gnome-shell/extensions/), then the extension turned off and on
+      # under a running guard.
+      - if: runner.os == 'Linux'
+        name: Window guard, pointer guard and mirror window on headless GNOME Shell
+        env:
+          CARDCAST_GUARD_DESKTOP: gnome
+        run: |
+          sudo apt-get install -y gnome-shell foot fonts-dejavu-core
+          export XDG_RUNTIME_DIR=$(mktemp -d) XDG_DATA_HOME=$(mktemp -d) XDG_CONFIG_HOME=$(mktemp -d)
+          mkdir -p "$XDG_DATA_HOME/gnome-shell/extensions"
+          cp -r packaging/linux/usr/share/gnome-shell/extensions/cardcast@clearlynotmich.github.io "$XDG_DATA_HOME/gnome-shell/extensions/"
+          cat > "$RUNNER_TEMP/gnome.sh" <<'EOF'
+          gsettings set org.gnome.shell enabled-extensions "['cardcast@clearlynotmich.github.io']"
+          # Headless GNOME Shell starts the pointer at 0,0, in the hot corner: the first warp out of
+          # it presses the corner's barrier and opens the overview, where new windows don't take the
+          # focus, so the tests after the pointer guard's would fail.
+          gsettings set org.gnome.desktop.interface enable-hot-corners false
+          gnome-shell --headless --wayland --no-x11 --virtual-monitor 1280x720 --virtual-monitor 1280x720 > "$RUNNER_TEMP/gnome-shell.log" 2>&1 &
+          shell=$!
+          for _ in $(seq 100); do [ -S "$XDG_RUNTIME_DIR/wayland-0" ] && break; sleep 0.2; done
+          export WAYLAND_DISPLAY=wayland-0 XDG_CURRENT_DESKTOP=GNOME XDG_SESSION_TYPE=wayland
+          for _ in $(seq 100); do busctl --user status io.github.ClearlyNotMich.cardcast.Shell >/dev/null 2>&1 && break; sleep 0.2; done
+          # GNOME starts in the overview, where new windows don't take the focus.
+          for _ in $(seq 50); do
+            busctl --user set-property org.gnome.Shell /org/gnome/Shell org.gnome.Shell OverviewActive b false
+            sleep 0.5
+            busctl --user get-property org.gnome.Shell /org/gnome/Shell org.gnome.Shell OverviewActive | grep -q false && break
+          done
+          failed=0
+          cargo test desktop_gnome -- --nocapture --test-threads=1 || failed=1
+          kill $shell
+          [ $failed = 0 ] || grep -E 'cardcast|JS ERROR' "$RUNNER_TEMP/gnome-shell.log"
+          exit $failed
+          EOF
+          dbus-run-session -- bash "$RUNNER_TEMP/gnome.sh"
       # The mirror capture (#42): a frame of a known colour through MIT-SHM on Xvfb, and through
       # xdg-desktop-portal-wlr and PipeWire on headless sway. -noreset keeps xsetroot's colour.
       - if: runner.os == 'Linux'
-        run: sudo apt-get install -y swaybg x11-xserver-utils xdg-desktop-portal xdg-desktop-portal-wlr pipewire wireplumber
+        run: sudo apt-get install -y swaybg x11-xserver-utils xdg-desktop-portal xdg-desktop-portal-wlr pipewire wireplumber grim
       - if: runner.os == 'Linux'
         name: Mirror capture on Xvfb
         env:
           CARDCAST_CAPTURE: screen
           CARDCAST_EXPECT_COLOUR: '#cc6633'
         run: xvfb-run -s '-screen 0 1280x1024x24 -noreset' sh -c 'xsetroot -solid "#cc6633" && cargo test mirror::linux::tests::desktop_captures -- --nocapture'
+      # The mirror present (#43) from one output to another on X11, read back with GetImage. Xvfb
+      # has one output, so this is X.Org with two of the dummy driver's; the test paints the
+      # source monitor. lavapipe's X11 present doesn't wait for a vertical blank, so this checks
+      # cardcast's own cap at the card display's refresh.
       - if: runner.os == 'Linux'
-        name: Mirror capture through the portal on headless sway
+        name: Mirror on X.Org with two dummy outputs
+        env:
+          CARDCAST_MIRROR_FROM: DUMMY0
+          CARDCAST_MIRROR_TO: DUMMY1
+          CARDCAST_PAINT_SOURCE: '#cc6633'
+          CARDCAST_EXPECT_COLOUR: '#cc6633'
+          CARDCAST_EXPECT_HZ: 60
+        run: |
+          sudo apt-get install -y xserver-xorg-core xserver-xorg-video-dummy
+          printf 'Section "Device"\n Identifier "dummy"\n Driver "dummy"\n VideoRam 256000\nEndSection\nSection "Screen"\n Identifier "screen"\n Device "dummy"\n DefaultDepth 24\n SubSection "Display"\n  Depth 24\n  Virtual 2048 768\n EndSubSection\nEndSection\n' > "$RUNNER_TEMP/dummy.conf"
+          sudo Xorg :5 -config "$RUNNER_TEMP/dummy.conf" -noreset -logfile "$RUNNER_TEMP/xorg.log" &
+          export DISPLAY=:5
+          for _ in $(seq 50); do xrandr >/dev/null 2>&1 && break; sleep 0.2; done
+          xrandr --addmode DUMMY1 1024x768
+          xrandr --output DUMMY1 --mode 1024x768 --right-of DUMMY0
+          xrandr | grep ' connected'
+          cargo test mirror::linux::tests::desktop_mirrors -- --nocapture
+      # Then the mirror present (#43) from HEADLESS-1 to HEADLESS-2, read back with grim.
+      - if: runner.os == 'Linux'
+        name: Mirror capture and present through the portal on headless sway
         env:
           WLR_BACKENDS: headless
           WLR_HEADLESS_OUTPUTS: 2
@@ -82,9 +196,13 @@ jobs:
           mkdir -p "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr" "$XDG_CONFIG_HOME/xdg-desktop-portal"
           printf '[screencast]\noutput_name=HEADLESS-1\nchooser_type=none\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal-wlr/config"
           printf '[preferred]\ndefault=wlr\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
-          printf 'output * bg #3366cc solid_color\n' > "$XDG_CONFIG_HOME/sway.conf"
+          printf 'output HEADLESS-1 bg #3366cc solid_color\noutput HEADLESS-2 bg #222222 solid_color\n' > "$XDG_CONFIG_HOME/sway.conf"
           cat > "$RUNNER_TEMP/capture.sh" <<'EOF'
-          pipewire & wireplumber &
+          # WirePlumber started before PipeWire answers exits ("Failed to connect to PipeWire"), and
+          # without it nothing links the stream, so no frame comes (#58).
+          pipewire &
+          for _ in $(seq 50); do wpctl status >/dev/null 2>&1 && break; sleep 0.2; done
+          wireplumber &
           sway -c "$XDG_CONFIG_HOME/sway.conf" &
           for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.2; done
           export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
@@ -92,7 +210,12 @@ jobs:
           # The portals start on the session bus, so they need the desktop's variables.
           dbus-update-activation-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_CONFIG_HOME XDG_RUNTIME_DIR
           for _ in $(seq 10); do swaymsg -t get_outputs >/dev/null && break; sleep 1; done
-          cargo test mirror::linux::tests::desktop_captures -- --nocapture
+          failed=0
+          cargo test mirror::linux::tests::desktop_captures -- --nocapture || failed=1
+          # wlroots' headless outputs refresh at 60 Hz.
+          CARDCAST_MIRROR_FROM=HEADLESS-1 CARDCAST_MIRROR_TO=HEADLESS-2 CARDCAST_EXPECT_HZ=60 \
+            cargo test mirror::linux::tests::desktop_mirrors -- --nocapture || failed=1
+          exit $failed
           EOF
           dbus-run-session -- bash "$RUNNER_TEMP/capture.sh"
       # The audio relay (#44): PipeWire and WirePlumber with two null sinks, a tone played into one.
@@ -103,8 +226,9 @@ jobs:
           export XDG_RUNTIME_DIR=$(mktemp -d)
           dbus-run-session -- sh -ec '
             pipewire & pipewire=$!
-            wireplumber & wireplumber=$!
+            # WirePlumber exits if PipeWire does not answer yet (#58).
             for _ in $(seq 50); do wpctl status >/dev/null 2>&1 && break; sleep 0.2; done
+            wireplumber & wireplumber=$!
             for sink in source card; do
               pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=cardcast-$sink node.nick=\"cardcast $sink\" media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"
             done
@@ -125,16 +249,20 @@ jobs:
         with:
           name: cardcast-exe
           path: target/release/cardcast.exe
-      # A tarball keeps cardcast's executable bit, which the artifact zip would drop.
+      # A tarball keeps cardcast's executable bit, which the artifact zip would drop. Beside
+      # cardcast, LICENSE and README.md, its usr/ holds the other files at their install paths.
       - if: runner.os == 'Linux'
         run: |
           mkdir cardcast-linux-x86_64
-          cp target/release/cardcast LICENSE README.md cardcast-linux-x86_64/
-          mkdir cardcast-linux-x86_64/packaging && cp -r packaging/linux cardcast-linux-x86_64/packaging/
+          cp -r target/release/cardcast LICENSE README.md packaging/linux/usr cardcast-linux-x86_64/
           tar -czf cardcast-linux-x86_64.tar.gz cardcast-linux-x86_64
           tar -tvzf cardcast-linux-x86_64.tar.gz | grep -q -- '-rwx.* cardcast-linux-x86_64/cardcast$'
-          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/udev/rules.d/60-cardcast-i2c.rules$'
-          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/modules-load.d/i2c-dev.conf$'
+          for file in usr/lib/udev/rules.d/60-cardcast-i2c.rules usr/lib/modules-load.d/cardcast-i2c.conf \
+              usr/share/applications/cardcast.desktop usr/share/icons/hicolor/256x256/apps/cardcast.png \
+              usr/share/gnome-shell/extensions/cardcast@clearlynotmich.github.io/extension.js \
+              usr/share/gnome-shell/extensions/cardcast@clearlynotmich.github.io/metadata.json; do
+            tar -tzf cardcast-linux-x86_64.tar.gz | grep -qx "cardcast-linux-x86_64/$file"
+          done
       - if: runner.os == 'Linux'
         uses: actions/upload-artifact@v7
         with:
@@ -155,6 +283,27 @@ jobs:
           $b = [IO.File]::ReadAllBytes("target\release\cardcast.exe")
           $subsystem = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3c) + 24 + 68)
           if ($subsystem -ne 2) { throw "cardcast.exe subsystem is $subsystem, expected 2 (Windows GUI)" }
+
+  # The window guard's KWin script (#47) and the pointer guard (#49) on kwin_wayland --virtual in an
+  # Arch container; see the script.
+  kwin:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: .github/ci/kwin-guard.sh
+
+  # packaging/aur/cardcast-bin against the tarball the check job built: makepkg and namcap (#45).
+  aur:
+    needs: check
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cardcast-linux-x86_64.tar.gz
+      - run: .github/ci/aur.sh cardcast-linux-x86_64.tar.gz
 
   # Adds two virtual monitors (docs/research/ci-second-monitor.md) and runs the second_monitor tests.
   # The driver is third-party and its certificate becomes a trusted root, so this job gets no secrets and read-only access.

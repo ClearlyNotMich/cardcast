@@ -1,0 +1,38 @@
+# Maintainer: ClearlyNotMich <ClearlyNotMich at users dot noreply dot github dot com>
+pkgname=cardcast-bin
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Mirror a monitor onto a capture card's display for two-PC streaming, and keep windows off it"
+arch=('x86_64')
+url="https://github.com/ClearlyNotMich/cardcast"
+license=('GPL-3.0-or-later')
+# ldd: glibc, libgcc, libpipewire. The rest are run (pw-dump, pw-loopback, wireplumber, timeout),
+# loaded at run time (Vulkan, xkbcommon, fontconfig) or hold the icon (hicolor-icon-theme).
+depends=('glibc' 'libgcc' 'libpipewire' 'pipewire' 'pipewire-audio' 'wireplumber' 'coreutils'
+         'vulkan-icd-loader' 'vulkan-driver' 'libxkbcommon' 'fontconfig' 'hicolor-icon-theme')
+optdepends=('wayland: run on a Wayland desktop'
+            'xdg-desktop-portal: mirror capture on Wayland, with your desktop backend (such as xdg-desktop-portal-kde)'
+            'libx11: run on an X11 desktop'
+            'libxcursor: run on an X11 desktop'
+            'libxi: run on an X11 desktop'
+            'libxkbcommon-x11: run on an X11 desktop')
+provides=('cardcast')
+conflicts=('cardcast')
+# A prebuilt binary: no debug package to split off.
+options=('!debug')
+source_x86_64=("cardcast-v$pkgver-linux-$CARCH.tar.gz::$url/releases/download/v$pkgver/cardcast-v$pkgver-linux-$CARCH.tar.gz")
+# Set by updpkgsums once the release has the tarball (packaging/aur/README.md).
+sha256sums_x86_64=('SKIP')
+
+package() {
+  cd "cardcast-linux-$CARCH"
+  install -Dm755 cardcast "$pkgdir/usr/bin/cardcast"
+  install -Dm644 usr/lib/udev/rules.d/60-cardcast-i2c.rules -t "$pkgdir/usr/lib/udev/rules.d/"
+  install -Dm644 usr/lib/modules-load.d/cardcast-i2c.conf -t "$pkgdir/usr/lib/modules-load.d/"
+  install -Dm644 usr/share/applications/cardcast.desktop -t "$pkgdir/usr/share/applications/"
+  install -Dm644 usr/share/icons/hicolor/256x256/apps/cardcast.png -t "$pkgdir/usr/share/icons/hicolor/256x256/apps/"
+  install -Dm644 usr/share/gnome-shell/extensions/cardcast@clearlynotmich.github.io/{extension.js,metadata.json} \
+    -t "$pkgdir/usr/share/gnome-shell/extensions/cardcast@clearlynotmich.github.io/"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+}

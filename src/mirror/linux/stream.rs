@@ -23,14 +23,12 @@ use std::thread::JoinHandle;
 #[derive(Debug, Default)]
 pub struct Latest {
     pub frame: Option<Frame>,
-    size: (u32, u32),
     ended: Option<Ended>,
 }
 
 impl Latest {
     /// Puts `frame` up for the present; one it never took is dropped, giving its buffer back.
     pub fn put(&mut self, frame: Frame) {
-        self.size = (frame.width, frame.height);
         self.frame = Some(frame);
     }
 }
@@ -108,13 +106,6 @@ impl Drop for Stream {
 }
 
 impl Picture for Stream {
-    fn size(&self) -> (u32, u32) {
-        self.latest
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .size
-    }
-
     fn take_frame(&mut self) -> Result<Option<Frame>, Ended> {
         let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
         match latest.ended.clone() {

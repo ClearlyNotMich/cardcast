@@ -8,14 +8,9 @@
 
 #[cfg(windows)]
 mod capture;
+#[cfg(all(test, windows))]
+pub(crate) use capture::duplicating;
 #[cfg(target_os = "linux")]
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the Linux mirror present (#43) draws its pictures"
-    )
-)]
 pub mod linux;
 #[cfg_attr(
     not(windows),
@@ -49,16 +44,18 @@ pub trait Mirror {
     fn presents(&self) -> Option<u64> {
         None
     }
+    /// The Linux screen-sharing portal's new restore token, once a capture gave one, for the
+    /// settings window to save (`None` inside clears the saved one); always `None` on Windows.
+    fn take_restore_token(&mut self) -> Option<Option<String>> {
+        None
+    }
 }
 
 /// What the mirror window draws once per refresh: the captured source monitor (`capture::Desktop`
 /// on Windows; on Linux the portal's PipeWire stream, or MIT-SHM on X11, from `linux::capture`).
-#[cfg_attr(
-    all(target_os = "linux", not(test)),
-    allow(dead_code, reason = "the Linux mirror present (#43) takes the frames")
-)]
 pub trait Picture {
-    /// Size of the newest picture in pixels, for the aspect fit.
+    /// Size of the newest picture in pixels, for the aspect fit; a Linux [`Frame`] has its own.
+    #[cfg(windows)]
     fn size(&self) -> (u32, u32);
     /// Draws the newest picture into `fit` on `target`, the swap chain's back buffer;
     /// the rest of the back buffer is already black.
@@ -77,10 +74,6 @@ pub trait Picture {
 
 /// One captured picture of the source monitor, as the Linux capture hands it to the present.
 #[cfg(target_os = "linux")]
-#[cfg_attr(
-    all(target_os = "linux", not(test)),
-    allow(dead_code, reason = "the Linux mirror present (#43) takes the frames")
-)]
 #[derive(Debug)]
 pub struct Frame {
     pub width: u32,
@@ -128,10 +121,6 @@ impl std::fmt::Debug for Release {
 
 /// Where a [`Frame`]'s pixels are.
 #[cfg(target_os = "linux")]
-#[allow(
-    dead_code,
-    reason = "the Linux mirror present (#43) reads them; the tests read only memory frames"
-)]
 #[derive(Debug)]
 pub enum Pixels {
     /// A copy in memory, `stride` bytes per row: PipeWire's shared-memory fallback, or MIT-SHM on X11.
@@ -216,48 +205,30 @@ pub fn recreate_capture_in_place(code: i32) -> bool {
     [0x887A_0026_u32, 0x8007_0005, 0x887A_0004].contains(&code.cast_unsigned())
 }
 
-/// The mirror window on the card display; `wake` asks the settings window to repaint when it ends on its own.
+/// The mirror window on the card display; `wake` asks the settings window to repaint when it
+/// ends on its own. `restore_token` is the one saved in settings (Linux only).
 #[cfg(windows)]
-pub fn new_mirror(wake: impl Fn() + Send + Sync + 'static) -> Box<dyn Mirror> {
+pub fn new_mirror(
+    wake: impl Fn() + Send + Sync + 'static,
+    _restore_token: Option<String>,
+) -> Box<dyn Mirror> {
     Box::new(window::MirrorWindow::new(wake))
+}
+
+/// The mirror on the card display (`linux::LinuxMirror`); as on Windows, plus the saved
+/// `restore_token` for the screen-sharing portal.
+#[cfg(target_os = "linux")]
+pub fn new_mirror(
+    wake: impl Fn() + Send + Sync + 'static,
+    restore_token: Option<String>,
+) -> Box<dyn Mirror> {
+    Box::new(linux::LinuxMirror::new(wake, restore_token))
 }
 
 /// Top-left corner of the mirror window, if one is open; for the settings window's Windows tests.
 #[cfg(all(test, windows))]
 pub fn shown_at() -> Option<(i32, i32)> {
     window::shown_at()
-}
-
-/// What the status line keeps saying while the mirror is not built for this platform (#36).
-#[cfg(windows)]
-pub const NOT_BUILT: Option<&str> = None;
-#[cfg(not(windows))]
-pub const NOT_BUILT: Option<&str> = Some("The mirror does not work on Linux yet.");
-
-/// The Linux mirror is not built yet (#36), so every start fails and says so.
-#[cfg(not(windows))]
-pub fn new_mirror(_wake: impl Fn() + Send + Sync + 'static) -> Box<dyn Mirror> {
-    Box::new(NotOnLinuxYet)
-}
-
-#[cfg(not(windows))]
-struct NotOnLinuxYet;
-
-#[cfg(not(windows))]
-impl Mirror for NotOnLinuxYet {
-    fn start(&mut self, _source_monitor: &Monitor, _card_display: &Monitor) -> Result<(), Ended> {
-        Err(Ended::Stop(NOT_BUILT.unwrap_or_default().into()))
-    }
-    fn stop(&mut self) {}
-    fn is_running(&self) -> bool {
-        false
-    }
-    fn shows_picture(&self) -> bool {
-        false
-    }
-    fn take_end(&mut self) -> Option<Ended> {
-        None
-    }
 }
 
 /// Stand-in for the tests and snapshots; it remembers whether it was started, `end` ends it on its
@@ -268,6 +239,8 @@ pub struct StandInMirror {
     pub running: bool,
     pub end: Option<Ended>,
     pub fail_start: Option<Ended>,
+    /// What `take_restore_token` hands out once.
+    pub restore_token: Option<Option<String>>,
 }
 
 #[cfg(test)]
@@ -296,6 +269,10 @@ impl Mirror for StandInMirror {
         let end = self.end.take()?;
         self.running = false;
         Some(end)
+    }
+
+    fn take_restore_token(&mut self) -> Option<Option<String>> {
+        self.restore_token.take()
     }
 }
 
@@ -327,10 +304,6 @@ pub struct Fit {
 }
 
 /// Scales `picture` to the largest size that fits in `screen` with its aspect ratio kept, centred.
-#[cfg_attr(
-    not(windows),
-    allow(dead_code, reason = "only the Windows mirror window calls it")
-)]
 pub fn fit(picture: (u32, u32), screen: (u32, u32)) -> Fit {
     let (picture_width, picture_height) = (u64::from(picture.0), u64::from(picture.1));
     let (screen_width, screen_height) = (u64::from(screen.0), u64::from(screen.1));
@@ -465,33 +438,6 @@ pub fn sdr_from_hdr(linear: f32, white_scale: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(not(windows))]
-    #[test]
-    fn on_linux_the_mirror_says_it_does_not_run_yet() {
-        let monitor = Monitor {
-            device_path: "card".into(),
-            gdi_name: String::new(),
-            name: "card".into(),
-            width: 1920,
-            height: 1080,
-            layout_size: (1920, 1080),
-            refresh_hz: 60,
-            primary: false,
-            left: 0,
-            top: 0,
-            graphics_card: String::new(),
-            container_id: String::new(),
-            connector: String::new(),
-        };
-        assert_eq!(NOT_BUILT, Some("The mirror does not work on Linux yet."));
-        let mut mirror = new_mirror(|| {});
-        assert_eq!(
-            mirror.start(&monitor, &monitor),
-            Err(Ended::Stop("The mirror does not work on Linux yet.".into()))
-        );
-        assert!(!mirror.is_running());
-    }
 
     #[test]
     fn a_lost_monitor_graphics_card_or_desktop_restarts_the_mirror() {

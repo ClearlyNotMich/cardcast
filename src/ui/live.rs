@@ -151,7 +151,7 @@ fn cog(painter: &egui::Painter, centre: Pos2, colour: Color32) {
 }
 
 /// Two overlapping screens, the source monitor's and the card display's colours.
-fn logo(painter: &egui::Painter, rect: Rect) {
+pub fn logo(painter: &egui::Painter, rect: Rect) {
     let screen = |min: Pos2, colour: Color32| {
         let screen = Rect::from_min_size(min, vec2(20.0, 14.0));
         painter.rect_filled(screen, 3, colour.gamma_multiply(0.25));

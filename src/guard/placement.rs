@@ -112,6 +112,20 @@ impl ReturnHistory {
         placement
     }
 
+    /// Gives up on window `id` at once, for example one the window manager won't unmaximise.
+    #[cfg_attr(
+        windows,
+        allow(
+            dead_code,
+            reason = "only the Linux window guard gives up at once; its test runs everywhere"
+        )
+    )]
+    pub fn give_up(&mut self, id: isize) {
+        self.returns.remove(&id);
+        self.given_up.retain(|&given_up| given_up != id);
+        self.given_up.push(id);
+    }
+
     /// Forgets window `id`, which was closed; true if it had been given up.
     pub fn forget(&mut self, id: isize) -> bool {
         self.returns.remove(&id);
@@ -401,6 +415,20 @@ mod tests {
             land_on_card(&mut history, now),
             Placement::MoveTo(_)
         ));
+    }
+
+    #[test]
+    fn window_given_up_at_once_is_left_alone_until_it_is_off_the_card_display() {
+        let mut history = ReturnHistory::default();
+        let now = Instant::now();
+        history.give_up(ID);
+        assert_eq!(history.latest_given_up(), Some(ID));
+        assert_eq!(land_on_card(&mut history, now), Placement::Stay);
+        let off_card = window(rect(100, 100, 900, 700));
+        assert_eq!(
+            history.place(ID, &off_card, CARD, PRIMARY_WORK, now),
+            Placement::Handled
+        );
     }
 
     #[test]

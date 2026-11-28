@@ -1,6 +1,6 @@
 [package]
 name = "cardcast"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false
@@ -10,10 +10,10 @@ eframe = "0.37"
 
 # The Linux monitor list (docs/research/linux-support.md, sections 4 and 8): the versions eframe already pulls in.
 [target.'cfg(target_os = "linux")'.dependencies]
-wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
-x11rb = { version = "0.13", features = ["randr", "shm", "xfixes"] }
+x11rb = { version = "0.13", features = ["allow-unsafe-code", "dl-libxcb", "randr", "shape", "shm", "xfixes"] }
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 # Mirror capture (#42): PipeWire streams from the ScreenCast portal. MIT.
 pipewire = { version = "0.10", features = ["v0_3_65"] }
@@ -22,6 +22,13 @@ pipewire = { version = "0.10", features = ["v0_3_65"] }
 # list from `pw-dump`.
 libc = "0.2"
 serde_json = "1"
+# The mirror present (#43, section 2), all already in the tree through eframe: wgpu (MIT OR
+# Apache-2.0) draws on Vulkan, ash (MIT OR Apache-2.0) asks it which DMA-BUF modifiers it imports,
+# wayland-protocols-wlr (MIT) has layer-shell. wayland-client's `system` and x11rb's
+# `allow-unsafe-code` hand libwayland's and libxcb's connections to Vulkan.
+wgpu = { version = "30", default-features = false, features = ["vulkan", "wgsl"] }
+ash = "0.38"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 # PNG snapshots of the settings window, rendered on Linux (AGENTS.md, Build and test).
 [target.'cfg(target_os = "linux")'.dev-dependencies]

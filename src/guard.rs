@@ -22,17 +22,10 @@ mod linux;
     not(windows),
     allow(
         dead_code,
-        reason = "only the Windows window guard calls it; its tests run everywhere"
+        reason = "the mirror check is Windows-only (the Linux mirror is no client window); its tests run everywhere"
     )
 )]
 mod placement;
-#[cfg_attr(
-    not(windows),
-    allow(
-        dead_code,
-        reason = "only the Windows pointer guard calls it; its tests run everywhere"
-    )
-)]
 mod pointer;
 #[cfg(windows)]
 mod window_guard;
@@ -43,7 +36,7 @@ pub use displays::DisplayWatcher;
 pub(crate) use displays::device_node;
 
 #[cfg(target_os = "linux")]
-pub use linux::{DisplayWatcher, monitors};
+pub use linux::{DisplayWatcher, gnome, monitors};
 
 /// A monitor on the sender, as shown in the settings dropdowns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,26 +97,30 @@ pub fn new_guard(wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
     Box::new(window_guard::WindowGuard::new(wake))
 }
 
-/// The Linux guards are not built yet (#36), so while the guard checkbox is on it says so.
+/// The window guard on X11, Plasma, GNOME, sway and Hyprland; on other Wayland compositors (#36)
+/// it says while it is on that it does not work there.
 #[cfg(not(windows))]
-pub fn new_guard(_wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
-    Box::new(NotOnLinuxYet::default())
+pub fn new_guard(wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
+    match desktop::detect(|name| std::env::var(name).ok()) {
+        Some(desktop::Desktop::OtherWayland) | None => Box::new(NotOnThisDesktopYet::default()),
+        Some(found) => Box::new(linux::WindowGuard::new(found, monitors, wake)),
+    }
 }
 
 #[cfg(not(windows))]
 #[derive(Default)]
-struct NotOnLinuxYet {
+struct NotOnThisDesktopYet {
     enabled: bool,
     report: Option<GuardReport>,
 }
 
 #[cfg(not(windows))]
-impl Guard for NotOnLinuxYet {
+impl Guard for NotOnThisDesktopYet {
     fn update(&mut self, enabled: bool, _card: Option<&str>, _send_windows_to: Option<&str>) {
         self.enabled = enabled;
         self.report = Some(if enabled {
             GuardReport::Notice(
-                "The window guard and pointer guard do not work on Linux yet.".into(),
+                "The window guard and pointer guard do not work on this desktop yet.".into(),
             )
         } else {
             GuardReport::Clear
@@ -362,7 +359,11 @@ pub mod second_monitor {
     }
 
     /// A device disabled with `pnputil`, as if unplugged; it is plugged back in on drop.
-    pub struct Unplugged(String);
+    pub struct Unplugged {
+        id: String,
+        /// The monitors' device paths before the unplug, waited for on drop.
+        monitors: Vec<String>,
+    }
 
     impl Unplugged {
         /// Unplugs both virtual monitors by disabling their graphics card.
@@ -381,28 +382,172 @@ pub mod second_monitor {
             Self::device(instance.replace('#', r"\"))
         }
 
+        /// Waits for the device to be Started first. Drop waits for more (see `settled`), so a
+        /// disable never comes while a replug is still settling: disabling the virtual graphics
+        /// card then, even while it reports Started, can make pnputil answer "System reboot is
+        /// needed", and the device refuses every later disable until a reboot
+        /// (docs/research/ci-second-monitor.md, issue #57). Duplication is not checked here: a
+        /// running mirror in this process may already duplicate the monitor, and one output allows
+        /// one duplication per process.
         fn device(id: String) -> Self {
             assert!(
-                pnputil("/disable-device", &id),
-                "pnputil /disable-device {id} failed"
+                poll(SETTLE_LIMIT, || started(&id)),
+                "{id} did not report Started within {SETTLE_LIMIT:?}; status {:x?}",
+                status(&id)
             );
-            Self(id)
+            let monitors = super::monitors()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .into_iter()
+                .map(|monitor| monitor.device_path)
+                .collect();
+            log(&format!("disabling {id}, status {:x?}", status(&id)));
+            assert!(
+                pnputil("/disable-device", &id),
+                "pnputil /disable-device {id} failed; status {:x?}",
+                status(&id)
+            );
+            Self { id, monitors }
         }
     }
 
     impl Drop for Unplugged {
         /// Never panics: it also runs while a failed test unwinds, and leaves the monitor connected for the next test.
         fn drop(&mut self) {
-            if !pnputil("/enable-device", &self.0) {
-                return;
-            }
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < deadline
-                && !super::monitors().is_ok_and(|monitors| monitors.len() > 2)
-            {
-                std::thread::sleep(Duration::from_millis(50));
+            if !pnputil("/enable-device", &self.id) {
+                log(&format!("pnputil /enable-device {} failed", self.id));
+            } else if !poll(SETTLE_LIMIT, || settled(&self.id, &self.monitors)) {
+                log(&format!(
+                    "{} and its monitors did not settle within {SETTLE_LIMIT:?}; status {:x?}",
+                    self.id,
+                    status(&self.id)
+                ));
             }
         }
+    }
+
+    /// After a replug: the device reports Started, every monitor in `monitors` (device paths) is
+    /// connected, and Desktop Duplication delivers a frame from each, so the desktop is presented
+    /// to it. The tests stop their mirror before they replug, so nothing else duplicates these.
+    fn settled(id: &str, monitors: &[String]) -> bool {
+        started(id)
+            && super::monitors().is_ok_and(|now| {
+                monitors.iter().all(|path| {
+                    now.iter()
+                        .find(|monitor| monitor.device_path == *path)
+                        .is_some_and(|monitor| presenting(&monitor.gdi_name))
+                })
+            })
+    }
+
+    const SETTLE_LIMIT: Duration = Duration::from_secs(30);
+
+    /// The device's devnode status flags and problem code, read with `CM_Locate_DevNodeW` and
+    /// `CM_Get_DevNode_Status` (learn.microsoft.com/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_devnode_status);
+    /// `None` while the device is not present.
+    fn status(id: &str) -> Option<(u32, u32)> {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::{
+            CM_DEVNODE_STATUS_FLAGS, CM_Get_DevNode_Status, CM_LOCATE_DEVNODE_NORMAL,
+            CM_Locate_DevNodeW, CM_PROB, CR_SUCCESS,
+        };
+        let id: Vec<u16> = id.encode_utf16().chain([0]).collect();
+        let mut node = 0;
+        // SAFETY: id is NUL-terminated and outlives the call.
+        let located = unsafe {
+            CM_Locate_DevNodeW(
+                &mut node,
+                windows::core::PCWSTR(id.as_ptr()),
+                CM_LOCATE_DEVNODE_NORMAL,
+            )
+        };
+        let (mut flags, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
+        // SAFETY: both outputs are plain integers owned here; node was just located.
+        let read = located == CR_SUCCESS
+            && unsafe { CM_Get_DevNode_Status(&mut flags, &mut problem, node, 0) } == CR_SUCCESS;
+        read.then_some((flags.0, problem.0))
+    }
+
+    /// Started: `DN_STARTED` set and no problem code (`DN_HAS_PROBLEM`, as after a disable).
+    fn started(id: &str) -> bool {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::{DN_HAS_PROBLEM, DN_STARTED};
+        status(id)
+            .is_some_and(|(flags, _)| flags & DN_STARTED.0 != 0 && flags & DN_HAS_PROBLEM.0 == 0)
+    }
+
+    /// True once Desktop Duplication delivers a frame from the output showing `gdi_name`.
+    fn presenting(gdi_name: &str) -> bool {
+        use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
+        use windows::Win32::Graphics::Direct3D11::{
+            D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION, D3D11CreateDevice,
+        };
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, DXGI_OUTDUPL_FRAME_INFO, IDXGIFactory1, IDXGIOutput1,
+        };
+        use windows::core::Interface as _;
+        let _duplicating = crate::mirror::duplicating();
+        // SAFETY: plain factory creation.
+        let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
+            return false;
+        };
+        // SAFETY: enumeration ends at the first index that fails (DXGI_ERROR_NOT_FOUND).
+        for adapter in (0..).map_while(|index| unsafe { factory.EnumAdapters1(index) }.ok()) {
+            // SAFETY: as above, per output.
+            for output in (0..).map_while(|index| unsafe { adapter.EnumOutputs(index) }.ok()) {
+                // SAFETY: plain description read.
+                let named = unsafe { output.GetDesc() }.is_ok_and(|description| {
+                    super::wide_to_string(&description.DeviceName).eq_ignore_ascii_case(gdi_name)
+                });
+                if !named {
+                    continue;
+                }
+                let mut device = None;
+                // SAFETY: the out pointer is a valid local; an explicit adapter needs D3D_DRIVER_TYPE_UNKNOWN.
+                let created = unsafe {
+                    D3D11CreateDevice(
+                        &adapter,
+                        D3D_DRIVER_TYPE_UNKNOWN,
+                        Default::default(),
+                        D3D11_CREATE_DEVICE_FLAG(0),
+                        None,
+                        D3D11_SDK_VERSION,
+                        Some(&raw mut device),
+                        None,
+                        None,
+                    )
+                };
+                let (Ok(()), Some(device), Ok(output)) =
+                    (created, device, output.cast::<IDXGIOutput1>())
+                else {
+                    return false;
+                };
+                // SAFETY: the device is on the output's graphics card.
+                let Ok(duplication) = (unsafe { output.DuplicateOutput(&device) }) else {
+                    return false;
+                };
+                let (mut info, mut frame) = (DXGI_OUTDUPL_FRAME_INFO::default(), None);
+                // SAFETY: out pointers are valid locals; a frame acquired here is released once.
+                let acquired =
+                    unsafe { duplication.AcquireNextFrame(500, &raw mut info, &raw mut frame) }
+                        .is_ok();
+                if acquired {
+                    // SAFETY: as above.
+                    let _ = unsafe { duplication.ReleaseFrame() };
+                }
+                return acquired;
+            }
+        }
+        false
+    }
+
+    /// Polls until `done` holds; false after `limit`.
+    fn poll(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !done() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
     }
 
     /// A monitor set to another refresh rate at its resolution, as a user does in Windows' advanced
@@ -724,11 +869,12 @@ mod linux_tests {
     use super::*;
 
     #[test]
-    fn on_linux_the_guard_says_it_does_not_run_yet_while_it_is_on() {
+    fn on_a_desktop_without_a_helper_the_guard_says_it_does_not_run_yet_while_it_is_on() {
         let not_yet = GuardReport::Notice(
-            "The window guard and pointer guard do not work on Linux yet.".into(),
+            "The window guard and pointer guard do not work on this desktop yet.".into(),
         );
-        let mut guard = new_guard(|| {});
+        // Not `new_guard`: on a Plasma or X11 desktop that would guard the developer's windows.
+        let mut guard = NotOnThisDesktopYet::default();
         assert_eq!(guard.take_report(), None);
         guard.update(true, Some("card"), None);
         assert_eq!(guard.take_report(), Some(not_yet.clone()));

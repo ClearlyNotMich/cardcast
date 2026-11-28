@@ -1,0 +1,7 @@
+{
+  "uuid": "cardcast@clearlynotmich.github.io",
+  "name": "cardcast",
+  "description": "Lets cardcast keep windows and the pointer off the card display, and keeps cardcast's mirror from taking the focus.",
+  "url": "https://github.com/ClearlyNotMich/cardcast",
+  "shell-version": ["45", "46", "47", "48", "49", "50"]
+}
