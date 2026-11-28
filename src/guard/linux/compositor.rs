@@ -54,6 +54,10 @@ pub trait Compositor: Sized {
     /// Keeps the pointer off the card display in `area`, replacing the pointer guard before; `None`
     /// stops it. Errors say in plain words why it can't.
     fn guard_pointer(&mut self, area: Option<&PointerArea>) -> Result<(), String>;
+    /// Whether the pointer guard's own connection to the desktop broke.
+    fn pointer_lost(&self) -> bool {
+        false
+    }
 }
 
 pub(super) enum Message {
@@ -210,6 +214,11 @@ impl<C: Compositor> Serving<'_, C> {
                     if self.check_all().is_err() {
                         return true;
                     }
+                    let area = self.guarding.pointer_area().cloned();
+                    let compositor = &mut *self.compositor;
+                    self.guarding.follow_pointer(compositor.pointer_lost(), || {
+                        compositor.guard_pointer(area.as_ref())
+                    });
                 }
             }
         }

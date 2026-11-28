@@ -146,7 +146,10 @@ The existing seams (`Mirror`, `Guard`, `Relay`, `monitors()`, `playback_devices(
   `Clutter.Seat.warp_pointer`. X11: barriers plus the SPEC's 16 ms check with `PointerHistory`, and
   no warp while another client holds a pointer grab (probed with `GrabPointer`). Gaps: on Wayland
   the pointer can stay on the card display during a button-held drag that started off it (the drag
-  keeps the pointer focus), and on X11 during any active grab.
+  keeps the pointer focus), and on X11 during any active grab. The overlay sits above the mirror on
+  the card display, so the compositor may no longer scan the mirror out directly (unmeasured; an
+  owner check); the cheaper way, for later, is the mirror surface's own pointer events while the
+  mirror is up, with the overlay only while it is off.
 
 ## 7. Input switching (#35)
 

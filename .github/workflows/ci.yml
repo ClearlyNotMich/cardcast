@@ -125,6 +125,10 @@ jobs:
           cp -r packaging/linux/usr/share/gnome-shell/extensions/cardcast@clearlynotmich.github.io "$XDG_DATA_HOME/gnome-shell/extensions/"
           cat > "$RUNNER_TEMP/gnome.sh" <<'EOF'
           gsettings set org.gnome.shell enabled-extensions "['cardcast@clearlynotmich.github.io']"
+          # Headless GNOME Shell starts the pointer at 0,0, in the hot corner: the first warp out of
+          # it presses the corner's barrier and opens the overview, where new windows don't take the
+          # focus, so the tests after the pointer guard's would fail.
+          gsettings set org.gnome.desktop.interface enable-hot-corners false
           gnome-shell --headless --wayland --no-x11 --virtual-monitor 1280x720 --virtual-monitor 1280x720 > "$RUNNER_TEMP/gnome-shell.log" 2>&1 &
           shell=$!
           for _ in $(seq 100); do [ -S "$XDG_RUNTIME_DIR/wayland-0" ] && break; sleep 0.2; done

@@ -35,6 +35,14 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::{
 /// Calls its `seen` while it lives; dropping it takes the overlay away within a quarter second.
 pub struct Catcher {
     stopped: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
+}
+
+impl Catcher {
+    /// Whether its connection to the desktop broke, so it no longer sees the pointer.
+    pub fn lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for Catcher {
@@ -148,8 +156,10 @@ impl Catcher {
         state.viewport = Some(viewport);
         state.surface = Some(surface);
         let stopped = Arc::new(AtomicBool::new(false));
+        let lost = Arc::new(AtomicBool::new(false));
         let catcher = Self {
             stopped: stopped.clone(),
+            lost: lost.clone(),
         };
         std::thread::spawn(move || {
             while !stopped.load(Ordering::Relaxed) && !state.closed {
@@ -170,6 +180,10 @@ impl Catcher {
                 if stopped.load(Ordering::Relaxed) || queue.dispatch_pending(&mut state).is_err() {
                     break;
                 }
+            }
+            // The output going away (closed) is a display change, which starts a new overlay.
+            if !stopped.load(Ordering::Relaxed) && !state.closed {
+                lost.store(true, Ordering::Relaxed);
             }
             layer.destroy();
             if let Some(viewport) = state.viewport.take() {

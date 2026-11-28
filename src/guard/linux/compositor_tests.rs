@@ -503,7 +503,6 @@ fn desktop_gnome_pointer_guard_puts_the_pointer_back() {
         "the card display is not right of the primary monitor"
     );
     let gnome = Gnome::connect(Events::unheard()).unwrap();
-    let start: (i32, i32) = gnome.call("Pointer", &()).unwrap();
     let mut guard = WindowGuard::new(Desktop::GnomeWayland, super::monitors, || {});
     guard.update(true, Some(&card.device_path), None);
 
@@ -524,7 +523,4 @@ fn desktop_gnome_pointer_guard_puts_the_pointer_back() {
     });
     eprintln!("pushed to {pushed:?}, put back at {back:?}");
     assert_eq!(status, Some(GuardReport::Clear));
-    // Where it was, for the next tests: GNOME opens new windows on the pointer's monitor.
-    drop(guard);
-    gnome.call::<_, ()>("WarpPointer", &start).unwrap();
 }

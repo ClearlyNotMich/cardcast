@@ -91,6 +91,10 @@ impl Compositor for Hyprland {
         })
     }
 
+    fn pointer_lost(&self) -> bool {
+        self.pointer.as_ref().is_some_and(Catcher::lost)
+    }
+
     fn guard_pointer(&mut self, area: Option<&PointerArea>) -> Result<(), String> {
         self.pointer = None;
         let Some(area) = area else {

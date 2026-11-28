@@ -62,6 +62,10 @@ const isMaximised = window => window.is_maximized
 const seat = () => (global.stage.get_context?.()?.get_backend() ?? Clutter.get_default_backend())
     .get_default_seat();
 
+// The cursor tracker: GNOME 48 moved it to the backend; GNOME 45 to 47 only have it by display.
+const cursorTracker = () => global.backend.get_cursor_tracker?.() ??
+    Meta.CursorTracker.get_for_display(global.display);
+
 const monitorIndex = connector => {
     const index = global.backend.get_monitor_manager().get_monitor_for_connector(connector);
     if (index < 0)
@@ -90,7 +94,7 @@ export default class CardcastExtension extends Extension {
         global.backend.get_monitor_manager().connectObject(
             'monitors-changed', () => this._changed(), this);
         // Mutter emits this on every pointer motion, warps included: no timer needed.
-        global.backend.get_cursor_tracker().connectObject(
+        cursorTracker().connectObject(
             'position-invalidated', () => this._checkPointer(), this);
         for (const window of this._all())
             this._watch(window);
@@ -102,7 +106,7 @@ export default class CardcastExtension extends Extension {
         this._object = null;
         global.display.disconnectObject(this);
         global.backend.get_monitor_manager().disconnectObject(this);
-        global.backend.get_cursor_tracker().disconnectObject(this);
+        cursorTracker().disconnectObject(this);
         this._pointerGuards = null;
         for (const window of this._all())
             window.disconnectObject(this);

@@ -299,20 +299,21 @@ impl Service {
             state
                 .guarding
                 .follow_displays(|monitor| areas.get(&monitor.gdi_name).copied());
-            state.pointer = None;
-            let started = match state.guarding.pointer_area() {
-                Some(area) => FakeInput::connect()
-                    .and_then(|fake| catcher::guard(area, move |to| fake.warp(to))),
-                None => Ok(None),
-            };
-            let problem = started
-                .as_ref()
-                .err()
-                .map(|error| pointer_could_not_start(error));
-            state.pointer = started.ok().flatten();
-            state.guarding.pointer_problem(problem);
+            let problem = start_pointer(state).err();
+            state
+                .guarding
+                .pointer_problem(problem.as_deref().map(pointer_could_not_start));
             state.seen = Some(seen);
             state.sweep = state.sweep.wrapping_add(1);
+        } else if !self.stopped.load(Ordering::Relaxed) {
+            let lost = state.pointer.as_ref().is_some_and(Catcher::lost);
+            let state_pointer = &mut state.pointer;
+            let area = state.guarding.pointer_area().cloned();
+            state.guarding.follow_pointer(lost, || {
+                *state_pointer = None;
+                *state_pointer = pointer_guard(area.as_ref())?;
+                Ok(())
+            });
         }
         state.sweep
     }
@@ -345,6 +346,25 @@ impl Service {
         if let Some(id) = state.ids.remove(&id) {
             state.guarding.forget(id);
         }
+    }
+}
+
+/// Starts the pointer guard again on the monitors the guard last found.
+fn start_pointer(state: &mut State) -> Result<(), String> {
+    state.pointer = None;
+    state.pointer = pointer_guard(state.guarding.pointer_area())?;
+    Ok(())
+}
+
+/// The pointer guard on `area`: the overlay, and KWin's fake input to move the pointer.
+fn pointer_guard(
+    area: Option<&super::window_guard::PointerArea>,
+) -> Result<Option<Catcher>, String> {
+    match area {
+        Some(area) => {
+            FakeInput::connect().and_then(|fake| catcher::guard(area, move |to| fake.warp(to)))
+        }
+        None => Ok(None),
     }
 }
 

@@ -22,6 +22,10 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 /// Lists the monitors; [`super::monitors`] outside tests.
 pub type ListMonitors = fn() -> Result<Vec<Monitor>, String>;
 
+/// The status line while the pointer guard's connection to the desktop is broken.
+pub const POINTER_LOST: &str =
+    "The pointer guard lost its connection to the desktop, so it tries again every second.";
+
 /// The status line when the pointer guard can't start.
 pub fn pointer_could_not_start(error: &str) -> String {
     format!("The pointer guard could not start ({error}). Untick and tick Guard to try again.")
@@ -154,6 +158,19 @@ impl Guarding {
             send_windows_to.top + (send_windows_to.bottom - send_windows_to.top) / 2,
         );
         self.pointer.place(pointer, card_display, fallback)
+    }
+
+    /// Follows a pointer guard whose connection to the desktop may break, about once a second:
+    /// once `lost` says it broke, the status line says so, and each call has `restart` start it
+    /// again until that works.
+    pub fn follow_pointer(&mut self, lost: bool, restart: impl FnOnce() -> Result<(), String>) {
+        if self.pointer_problem.as_deref() == Some(POINTER_LOST) {
+            if restart().is_ok() {
+                self.pointer_problem(None);
+            }
+        } else if lost {
+            self.pointer_problem(Some(POINTER_LOST.into()));
+        }
     }
 
     /// Why the pointer guard can't work here (plain words), or `None` once it can.
@@ -488,6 +505,38 @@ mod tests {
             Some(GuardReport::Notice("no warp".into()))
         );
         guarding.pointer_problem(None);
+        assert_eq!(reports.try_iter().last(), Some(GuardReport::Clear));
+    }
+
+    #[test]
+    fn a_pointer_guard_that_lost_its_connection_is_said_and_started_again_until_it_works() {
+        let (mut guarding, reports) = guarding(None);
+        guarding.follow_displays(work_area);
+        let restarts = std::cell::Cell::new(0);
+        let restart = |works: bool| {
+            let restarts = &restarts;
+            move || {
+                restarts.set(restarts.get() + 1);
+                if works {
+                    Ok(())
+                } else {
+                    Err("no desktop".to_owned())
+                }
+            }
+        };
+        guarding.follow_pointer(false, restart(true));
+        assert_eq!(restarts.get(), 0, "restarted a working pointer guard");
+        assert_eq!(reports.try_iter().last(), Some(GuardReport::Clear));
+        guarding.follow_pointer(true, restart(true));
+        assert_eq!(
+            reports.try_iter().last(),
+            Some(GuardReport::Notice(POINTER_LOST.into()))
+        );
+        guarding.follow_pointer(true, restart(false));
+        assert_eq!(restarts.get(), 1);
+        assert_eq!(reports.try_iter().last(), None, "the notice changed");
+        guarding.follow_pointer(true, restart(true));
+        assert_eq!(restarts.get(), 2);
         assert_eq!(reports.try_iter().last(), Some(GuardReport::Clear));
     }
 
