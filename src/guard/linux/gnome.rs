@@ -204,7 +204,7 @@ impl Compositor for Gnome {
     }
 }
 
-/// The extension's windows: id, state as the KWin script writes it ([`window_state`]), title, and
+/// The extension's windows: id, state as [`window_state`] reads it, title, and
 /// whether it is the mirror.
 pub fn windows(listed: Vec<(String, String, String, bool)>) -> Vec<Window> {
     listed

@@ -34,24 +34,26 @@ function id(window) {
 
 function check(window) {
     if (stopped || window.deleted) return;
-    // Layer-shell surfaces, cardcast's mirror and pointer catcher among them, are pinned to their
-    // output and KWin calls them normal windows; it can't move them to another output, so the guard
-    // leaves them be (#60). KWin 6.8's moveableAcrossScreens is false for every layer-shell window
-    // (LayerShellV1Window::isMovableAcrossScreens) and, unlike isMovable, has no fullscreen check,
-    // so a fullscreen toplevel is still guarded (XdgToplevelWindow::isMovableAcrossScreens):
-    // https://invent.kde.org/plasma/kwin/-/blob/6dd0b8b840864ae393e5c5f25c472e5e798eec99/src/layershellv1window.cpp#L123-126
-    // https://invent.kde.org/plasma/kwin/-/blob/6dd0b8b840864ae393e5c5f25c472e5e798eec99/src/xdgshellwindow.cpp#L424-453
-    if (!window.moveableAcrossScreens) return;
     // A window being dragged or resized is checked when that ends (moveResizedChanged).
     if (window.move || window.resize) return;
     const g = window.frameGeometry;
     const state = [g.x, g.y, g.x + g.width, g.y + g.height]
         .map(Math.round)
         .concat([window.maximizeMode === 3, window.minimized,
-            !(window.normalWindow || window.dialog)].map(Number))
+            !(window.normalWindow || window.dialog), layerShell(window)].map(Number))
         .join(" ");
     callDBus(service, path, guard, "Check", id(window), window.caption, state,
         reply => apply(window, reply));
+}
+
+// Layer-shell surfaces, cardcast's mirror and pointer catcher among them, are pinned to their output
+// but KWin calls them normal windows, so cardcast leaves them be (#60). No window property tells them
+// apart (moveableAcrossScreens is false for every window when interactive window move is off, #61),
+// so this reads the class name Qt gives a KWin object as text: KWin 6.8's LayerShellV1Window. A KWin
+// rename breaks it, which the KWin CI job catches:
+// https://invent.kde.org/plasma/kwin/-/blob/6dd0b8b840864ae393e5c5f25c472e5e798eec99/src/layershellv1window.h#L25-L27
+function layerShell(window) {
+    return String(window).startsWith("KWin::LayerShellV1Window(");
 }
 
 // The reply is "stay", "move <left> <top> <right> <bottom>" or "send <output>"; KWin's own move

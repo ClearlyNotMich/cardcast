@@ -25,7 +25,8 @@ pub struct WindowState {
     pub hidden: bool,
     pub cloaked: bool,
     pub tool: bool,
-    /// Cardcast's mirror window, the only window allowed on the card display.
+    /// Cardcast's mirror window, the only window allowed on the card display; on Plasma any
+    /// layer-shell surface, which is pinned to its output (`linux/kwin.rs`).
     pub mirror: bool,
 }
 
