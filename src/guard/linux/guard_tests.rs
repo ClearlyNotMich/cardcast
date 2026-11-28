@@ -8,7 +8,7 @@ use super::super::placement::Rect;
 use super::super::{Guard, GuardReport, Monitor};
 use super::ewmh::{self, Atoms};
 use super::kwin;
-use super::window_guard::{Guarding, ListMonitors, NO_POINTER_GUARD, WindowGuard, monitor_rect};
+use super::window_guard::{Guarding, ListMonitors, WindowGuard, monitor_rect};
 use std::io::BufRead as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -293,10 +293,7 @@ fn desktop_window_guard_returns_windows_and_keeps_maximised_ones_maximised() {
         window.logged_frame() == returned
     });
     assert_eq!(window.active(), active, "the guard changed the focus");
-    assert_eq!(
-        guard.take_report(),
-        Some(GuardReport::Notice(NO_POINTER_GUARD.into()))
-    );
+    assert_eq!(guard.take_report(), Some(GuardReport::Clear));
 }
 
 /// Whether KWin has the script; false while KWin doesn't answer.
@@ -402,7 +399,7 @@ fn desktop_kwin_guard_follows_a_kwin_restart() {
         }
         status.clone()
     };
-    let guarding = Some(GuardReport::Notice(NO_POINTER_GUARD.into()));
+    let guarding = Some(GuardReport::Clear);
     let waiting = Some(GuardReport::Notice(kwin::WAITING_FOR_KWIN.into()));
     wait_for("the guard to start", || {
         kwin_script_loaded(&plugin) && latest() == guarding
@@ -625,4 +622,131 @@ fn desktop_kwin_guard_returns_a_wayland_window() {
         },
     );
     assert!(!unmaximised, "KWin unmaximised the window on its way");
+}
+
+/// Where the X pointer is.
+fn x_pointer(connection: &RustConnection, root: Window) -> (i32, i32) {
+    let pointer = connection.query_pointer(root).unwrap().reply().unwrap();
+    (pointer.root_x.into(), pointer.root_y.into())
+}
+
+fn x_warp(connection: &RustConnection, root: Window, (x, y): (i32, i32)) {
+    let (x, y) = (i16::try_from(x).unwrap(), i16::try_from(y).unwrap());
+    connection
+        .warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, x, y)
+        .unwrap();
+    connection.flush().unwrap();
+}
+
+/// `CARDCAST_GUARD_DESKTOP=openbox` (CI, with `xdotool`): the pointer pushed onto the card display
+/// goes back where it was last seen off it; a mouse moving onto it stops at its edge (the barrier);
+/// a pointer another program has grabbed, as a game confining it, is left alone until let go.
+#[test]
+fn desktop_x11_pointer_guard_puts_the_pointer_back_and_leaves_a_grabbed_one() {
+    use x11rb::protocol::xproto::{GrabMode, GrabStatus};
+    if std::env::var("CARDCAST_GUARD_DESKTOP").as_deref() != Ok("openbox") {
+        return;
+    }
+    let monitors = xvfb_halves().unwrap();
+    let card = monitor_rect(&monitors[1]);
+    let (connection, screen) = x11rb::connect(None).unwrap();
+    let root = connection.setup().roots[screen].root;
+    let pointer = || x_pointer(&connection, root);
+    let off_card = (card.left - 280, 500);
+    x_warp(&connection, root, off_card);
+    let mut guard = WindowGuard::new(Desktop::X11, xvfb_halves, || {});
+    guard.update(true, Some("right"), None);
+    wait_for("the guard to start", || {
+        guard.take_report() == Some(GuardReport::Clear)
+    });
+    // Let the pointer guard see the off-card position.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let pushed = (card.left + 720, 500);
+    x_warp(&connection, root, pushed);
+    wait_for("the pointer to go back to where it was", || {
+        pointer() == off_card
+    });
+    eprintln!("pushed to {pushed:?}, put back at {:?}", pointer());
+
+    // A mouse moving right, 100 pixels, from 30 pixels before the card display.
+    x_warp(&connection, root, (card.left - 30, 500));
+    std::thread::sleep(Duration::from_millis(200));
+    let moved = std::process::Command::new("xdotool")
+        .args(["mousemove_relative", "--", "100", "0"])
+        .status()
+        .unwrap();
+    assert!(moved.success(), "xdotool failed");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        pointer(),
+        (card.left - 1, 500),
+        "the mouse did not stop at the card display's edge"
+    );
+
+    // Grabbed by another program: the guard leaves it on the card display.
+    let (game, _) = x11rb::connect(None).unwrap();
+    let grab = game
+        .grab_pointer(
+            false,
+            root,
+            EventMask::NO_EVENT,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        )
+        .unwrap()
+        .reply()
+        .unwrap();
+    assert_eq!(grab.status, GrabStatus::SUCCESS);
+    x_warp(&connection, root, pushed);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(pointer(), pushed, "the guard moved a grabbed pointer");
+    game.ungrab_pointer(x11rb::CURRENT_TIME).unwrap();
+    game.flush().unwrap();
+    wait_for("the let-go pointer to go back", || {
+        pointer() == (card.left - 1, 500)
+    });
+    eprintln!("let go, put back at {:?}", pointer());
+}
+
+/// `CARDCAST_GUARD_DESKTOP=kwin` (CI): the pointer pushed onto the card display with KWin's fake
+/// input comes back just across its edge, on the primary monitor, as a probe overlay there sees.
+#[test]
+fn desktop_kwin_pointer_guard_puts_the_pointer_back() {
+    if std::env::var("CARDCAST_GUARD_DESKTOP").as_deref() != Ok("kwin") {
+        return;
+    }
+    let monitors = super::monitors().unwrap();
+    let card = monitors.iter().find(|m| !m.primary).unwrap();
+    let primary = monitors.iter().find(|m| m.primary).unwrap();
+    let (card_rect, primary_rect) = (monitor_rect(card), monitor_rect(primary));
+    assert_eq!(
+        card_rect.left, primary_rect.right,
+        "the card display is not right of the primary monitor"
+    );
+    let (_probe, probed) = super::catcher::probe(primary);
+    let mouse = super::catcher::FakeInput::connect().unwrap();
+    let mut guard = WindowGuard::new(Desktop::PlasmaWayland, super::monitors, || {});
+    guard.update(true, Some(&card.device_path), None);
+
+    let pushed = (card_rect.left + 100, card_rect.top + 100);
+    let back = (primary_rect.right - 1, pushed.1);
+    // Pushed again until the guard has started, every half second.
+    let (mut pushes, mut status) = (0, None);
+    wait_for("the pointer to come back from the card display", || {
+        if pushes % 25 == 0 {
+            mouse.warp(pushed);
+        }
+        pushes += 1;
+        if let Some(report) = guard.take_report() {
+            eprintln!("status: {report:?}");
+            status = Some(report);
+        }
+        *probed.lock().unwrap() == Some(back)
+    });
+    eprintln!("pushed to {pushed:?}, put back at {back:?}");
+    assert_eq!(status, Some(GuardReport::Clear));
 }

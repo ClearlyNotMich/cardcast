@@ -9,9 +9,16 @@
 //!
 //! All of it runs on the guard's own thread, which also watches KWin's name on the bus: when KWin
 //! goes away the status line says so, and when it is back the thread loads the script again.
+//!
+//! The pointer guard watches the card display with its overlay (`catcher.rs`) and moves the pointer
+//! with KWin's fake input ([`FakeInput`]), which a later KWin may close (docs/adr/0004). KWin's
+//! scripts can read the pointer's position but not move it (`workspace.cursorPos` is read-only,
+//! <https://develop.kde.org/docs/plasma/kwin/api/>). Both start again with the script's next
+//! display check, so after KWin restarts too.
 
 use super::super::placement::{Placement, Rect, WindowState};
-use super::window_guard::{Guarding, could_not_start};
+use super::catcher::{self, Catcher, FakeInput};
+use super::window_guard::{Guarding, could_not_start, pointer_could_not_start};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -76,6 +83,7 @@ pub fn start(guarding: Guarding) -> Running {
             ids: HashMap::new(),
             next_id: 0,
             polled: None,
+            pointer: None,
         })),
         generation: Arc::new(AtomicU32::new(0)),
         stopped: Arc::new(AtomicBool::new(false)),
@@ -265,6 +273,7 @@ struct State {
     next_id: isize,
     /// Told on the next poll, while the guard thread waits for a newly loaded script.
     polled: Option<Sender<()>>,
+    pointer: Option<Catcher>,
 }
 
 /// What the script asks cardcast; zbus calls it on its own thread.
@@ -290,6 +299,18 @@ impl Service {
             state
                 .guarding
                 .follow_displays(|monitor| areas.get(&monitor.gdi_name).copied());
+            state.pointer = None;
+            let started = match state.guarding.pointer_area() {
+                Some(area) => FakeInput::connect()
+                    .and_then(|fake| catcher::guard(area, move |to| fake.warp(to))),
+                None => Ok(None),
+            };
+            let problem = started
+                .as_ref()
+                .err()
+                .map(|error| pointer_could_not_start(error));
+            state.pointer = started.ok().flatten();
+            state.guarding.pointer_problem(problem);
             state.seen = Some(seen);
             state.sweep = state.sweep.wrapping_add(1);
         }

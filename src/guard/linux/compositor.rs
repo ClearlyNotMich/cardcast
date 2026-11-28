@@ -4,11 +4,14 @@
 //! on Windows, and once a second in case a move came without an event. The decisions stay in
 //! `placement.rs`.
 //!
+//! The pointer guard goes with each connection ([`Compositor::guard_pointer`]): started with it
+//! and after every display change, and gone with it.
+//!
 //! When the compositor goes away (a crash, or on GNOME the extension turned off) the status line
 //! says so, and the thread connects again every second until it is back.
 
 use super::super::placement::{Placement, Rect, WindowState};
-use super::window_guard::Guarding;
+use super::window_guard::{Guarding, PointerArea, pointer_could_not_start};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +51,9 @@ pub trait Compositor: Sized {
     }
     /// Carries out `placement` for `window`; `send_windows_to` names the output to send it to.
     fn apply(&mut self, window: &Window, placement: Placement, send_windows_to: &str);
+    /// Keeps the pointer off the card display in `area`, replacing the pointer guard before; `None`
+    /// stops it. Errors say in plain words why it can't.
+    fn guard_pointer(&mut self, area: Option<&PointerArea>) -> Result<(), String>;
 }
 
 pub(super) enum Message {
@@ -213,6 +219,10 @@ impl<C: Compositor> Serving<'_, C> {
         let compositor = &mut *self.compositor;
         self.guarding
             .follow_displays(|monitor| compositor.work_area(&monitor.gdi_name));
+        let area = self.guarding.pointer_area().cloned();
+        let problem = self.compositor.guard_pointer(area.as_ref()).err();
+        self.guarding
+            .pointer_problem(problem.as_deref().map(pointer_could_not_start));
     }
 
     fn check_all(&mut self) -> Result<(), String> {
@@ -382,6 +392,9 @@ mod tests {
         }
         fn work_area(&mut self, output: &str) -> Option<Rect> {
             (output == "DP-1").then(|| rect(0, 30, 1920, 1080))
+        }
+        fn guard_pointer(&mut self, _: Option<&PointerArea>) -> Result<(), String> {
+            Ok(())
         }
         fn apply(&mut self, window: &Window, placement: Placement, send_windows_to: &str) {
             shared(|shared| {

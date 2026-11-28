@@ -1,8 +1,8 @@
 #!/bin/sh
-# The window guard on kwin_wayland --virtual (#47), run by CI in an Arch container, which has
-# KWin 6 like the sender. KWin composites only with a render device; without one (the CI runner has
-# no /dev/dri and no udmabuf module) windows still move, but a native Wayland window never redraws,
-# so it can't be maximised. Given /dev/udmabuf (docker run --device /dev/udmabuf) KWin composites
+# The window guard (#47) and pointer guard (#49) on kwin_wayland --virtual, run by CI in an Arch
+# container, which has KWin 6 like the sender. KWin composites only with a render device; without
+# one (the CI runner has no /dev/dri and no udmabuf module) windows still move, but a native Wayland
+# window never redraws, so it can't be maximised. Given /dev/udmabuf (docker run --device /dev/udmabuf) KWin composites
 # with llvmpipe and the tests maximise the Wayland window too.
 set -e
 cd "$(dirname "$0")/../.."

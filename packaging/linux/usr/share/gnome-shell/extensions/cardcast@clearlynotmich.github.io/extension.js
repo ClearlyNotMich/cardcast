@@ -1,7 +1,9 @@
 // cardcast's GNOME Shell extension (docs/research/linux-support.md, sections 2 and 5). On GNOME only
 // the Shell can move other programs' windows, so this lists and moves them for cardcast's window
 // guard, which decides where each goes. It also keeps cardcast's mirror, a fullscreen window on the
-// card display, from taking the focus: whenever the mirror gets it, it goes straight back.
+// card display, from taking the focus: whenever the mirror gets it, it goes straight back. And it is
+// cardcast's pointer guard: it tells cardcast when the pointer is on the card display and moves it
+// where cardcast says, since only the Shell can move the pointer on GNOME.
 //
 // cardcast talks to it on the session bus, as io.github.ClearlyNotMich.cardcast.Shell. Only
 // connections that called Connect get the window list and the Changed signal, sent to each alone,
@@ -28,7 +30,14 @@ const INTERFACE = `<node><interface name="${NAME}">
   </method>
   <method name="SendToMonitor"><arg type="s" direction="in"/><arg type="s" direction="in"/></method>
   <method name="Focus"><arg type="s" direction="out"/></method>
+  <method name="GuardPointer">
+    <arg type="i" direction="in"/><arg type="i" direction="in"/>
+    <arg type="i" direction="in"/><arg type="i" direction="in"/>
+  </method>
+  <method name="WarpPointer"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+  <method name="Pointer"><arg type="(ii)" direction="out"/></method>
   <signal name="Changed"/>
+  <signal name="PointerOnCard"><arg type="i"/><arg type="i"/></signal>
 </interface></node>`;
 
 // The window types the guard looks at; the others are panels, menus, tooltips and the like.
@@ -60,6 +69,8 @@ export default class CardcastExtension extends Extension {
         this._lastFocus = null;
         // Connected bus names, each with its watch that forgets it when it leaves the bus.
         this._clients = new Map();
+        // Connected bus names guarding the pointer, each with the card display's [left, top, right, bottom].
+        this._pointerGuards = new Map();
         this._object = Gio.DBusExportedObject.wrapJSObject(INTERFACE, this);
         this._object.export(Gio.DBus.session, PATH);
         this._name = Gio.bus_own_name_on_connection(Gio.DBus.session, NAME,
@@ -73,6 +84,9 @@ export default class CardcastExtension extends Extension {
             this);
         global.backend.get_monitor_manager().connectObject(
             'monitors-changed', () => this._changed(), this);
+        // Mutter emits this on every pointer motion, warps included: no timer needed.
+        global.backend.get_cursor_tracker().connectObject(
+            'position-invalidated', () => this._checkPointer(), this);
         for (const window of this._all())
             this._watch(window);
     }
@@ -83,6 +97,8 @@ export default class CardcastExtension extends Extension {
         this._object = null;
         global.display.disconnectObject(this);
         global.backend.get_monitor_manager().disconnectObject(this);
+        global.backend.get_cursor_tracker().disconnectObject(this);
+        this._pointerGuards = null;
         for (const window of this._all())
             window.disconnectObject(this);
         for (const watch of this._clients.values())
@@ -117,9 +133,61 @@ export default class CardcastExtension extends Extension {
                 Gio.BusNameWatcherFlags.NONE, null, () => {
                     Gio.bus_unwatch_name(this._clients.get(client));
                     this._clients.delete(client);
+                    this._pointerGuards.delete(client);
                 }));
         }
         invocation.return_value(null);
+    }
+
+    // Tells each guarding caller when the pointer is on its card display.
+    _checkPointer() {
+        if (!this._pointerGuards?.size)
+            return;
+        const [x, y] = global.get_pointer();
+        for (const [client, [left, top, right, bottom]] of this._pointerGuards) {
+            if (x >= left && x < right && y >= top && y < bottom) {
+                Gio.DBus.session.emit_signal(client, PATH, NAME, 'PointerOnCard',
+                    new GLib.Variant('(ii)', [x, y]));
+            }
+        }
+    }
+
+    // Connected callers only; false after answering the others.
+    _connected(invocation) {
+        if (this._clients.has(invocation.get_sender()))
+            return true;
+        invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
+            'Call Connect first.');
+        return false;
+    }
+
+    // The caller hears PointerOnCard while the pointer is in the rectangle; an empty one stops it.
+    GuardPointerAsync([left, top, right, bottom], invocation) {
+        if (!this._connected(invocation))
+            return;
+        const client = invocation.get_sender();
+        if (left < right && top < bottom)
+            this._pointerGuards.set(client, [left, top, right, bottom]);
+        else
+            this._pointerGuards.delete(client);
+        invocation.return_value(null);
+        // The pointer may be there already.
+        this._checkPointer();
+    }
+
+    WarpPointerAsync([x, y], invocation) {
+        if (!this._connected(invocation))
+            return;
+        global.backend.get_default_seat().warp_pointer(x, y);
+        invocation.return_value(null);
+    }
+
+    // Where the pointer is (for cardcast's tests).
+    PointerAsync(_parameters, invocation) {
+        if (!this._connected(invocation))
+            return;
+        const [x, y] = global.get_pointer();
+        invocation.return_value(new GLib.Variant('((ii))', [[x, y]]));
     }
 
     _keepFocusOffMirror() {
@@ -151,11 +219,8 @@ export default class CardcastExtension extends Extension {
     // and whether it is cardcast's mirror, which the guard never moves. Utility windows, toolbars
     // and windows kept off the taskbar (dialogs, desktop icons) count as tools. Connected callers only.
     WindowsAsync(_parameters, invocation) {
-        if (!this._clients.has(invocation.get_sender())) {
-            invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
-                'Call Connect first.');
+        if (!this._connected(invocation))
             return;
-        }
         try {
             invocation.return_value(new GLib.Variant('(a(sssb))', [this._windows()]));
         } catch (error) {

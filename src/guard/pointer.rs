@@ -27,6 +27,27 @@ impl PointerHistory {
     }
 }
 
+/// Where a pointer seen at `pointer` on the card display goes when only that position is known (on
+/// Wayland, which shows cardcast the pointer only over its own surface): the nearest point on any of
+/// the `others` monitors, which is just across the edge it came over. `None` without another monitor.
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "Windows sees the pointer everywhere, so it uses PointerHistory"
+    )
+)]
+pub fn nearest_off_card(pointer: (i32, i32), others: &[Rect]) -> Option<(i32, i32)> {
+    let (x, y) = pointer;
+    others
+        .iter()
+        .filter(|r| r.left < r.right && r.top < r.bottom)
+        .map(|r| (x.clamp(r.left, r.right - 1), y.clamp(r.top, r.bottom - 1)))
+        .min_by_key(|&(nx, ny)| {
+            (i64::from(nx) - i64::from(x)).pow(2) + (i64::from(ny) - i64::from(y)).pow(2)
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,6 +83,32 @@ mod tests {
         assert_eq!(history.place((100, 100), CARD, FALLBACK), None);
         assert_eq!(history.place((3840, 500), CARD, FALLBACK), None);
         assert_eq!(history.place((2000, 1080), CARD, FALLBACK), None);
+    }
+
+    #[test]
+    fn a_pointer_seen_only_on_the_card_display_goes_just_across_the_nearest_edge() {
+        let primary = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        // A third monitor below the card display.
+        let below = Rect {
+            left: 1920,
+            top: 1080,
+            right: 3840,
+            bottom: 2160,
+        };
+        let others = [primary, below];
+        assert_eq!(nearest_off_card((1920, 500), &others), Some((1919, 500)));
+        assert_eq!(nearest_off_card((3000, 1079), &others), Some((3000, 1080)));
+        // Below the primary monitor's bottom: its corner pixel.
+        assert_eq!(
+            nearest_off_card((1925, 1085), &[primary]),
+            Some((1919, 1079))
+        );
+        assert_eq!(nearest_off_card((2500, 300), &[]), None);
     }
 
     #[test]

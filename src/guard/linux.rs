@@ -2,6 +2,7 @@
 //! give each monitor's EDID and graphics card; the desktop (Wayland outputs, or RandR on X11) gives
 //! its name, position, size and refresh rate. The display watcher follows the desktop's outputs.
 
+mod catcher;
 mod compositor;
 mod ewmh;
 pub mod gnome;

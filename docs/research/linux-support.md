@@ -136,6 +136,17 @@ The existing seams (`Mirror`, `Guard`, `Relay`, `monitors()`, `playback_devices(
   - **sway:** `seat <seat> cursor set <x> <y>` [29]. **Hyprland:** `cursorpos` and a cursor
     `move({ x, y })` dispatcher [30].
   - Other wlroots: no.
+- **Built (#49):** the mirror may be off, and sway's IPC has no pointer position, so on Plasma, sway
+  and Hyprland the pointer guard has its own transparent layer-shell overlay on the card display
+  (input on, keyboard off; the mirror's overlay takes no input, so the pointer reaches it) and warps
+  from its `wl_pointer.enter`/`motion` to the nearest point on another monitor; no timer. A pointer
+  a game locks or confines (pointer-constraints) never reaches the overlay; KWin also applies them to
+  fake input (`pointer_input.cpp`, `updatePosition`). GNOME: the extension hears Mutter's cursor
+  tracker `position-invalidated` (every motion, warps included) and warps with
+  `Clutter.Seat.warp_pointer`. X11: barriers plus the SPEC's 16 ms check with `PointerHistory`, and
+  no warp while another client holds a pointer grab (probed with `GrabPointer`). Gaps: on Wayland
+  the pointer can stay on the card display during a button-held drag that started off it (the drag
+  keeps the pointer focus), and on X11 during any active grab.
 
 ## 7. Input switching (#35)
 

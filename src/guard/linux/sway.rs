@@ -1,10 +1,14 @@
 //! The window guard on sway, over its IPC socket (`SWAYSOCK`, the i3 protocol,
 //! <https://man.archlinux.org/man/sway-ipc.7>): `window`, `workspace` and `output` events say when
 //! to look, `get_tree` lists the windows, and commands with `[con_id=N]` criteria move them without
-//! focusing them (docs/research/linux-support.md, section 5).
+//! focusing them (docs/research/linux-support.md, section 5). The pointer guard moves the pointer
+//! with `seat - cursor set` (sway-input(5)), from its own socket on the overlay's thread
+//! (`catcher.rs`).
 
 use super::super::placement::{Placement, Rect, WindowState};
+use super::catcher::{self, Catcher};
 use super::compositor::{Compositor, Events, Window, candidates};
+use super::window_guard::PointerArea;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -24,6 +28,7 @@ pub struct Sway {
     commands: UnixStream,
     /// The subscribed connection, shut down to end its reader.
     events: UnixStream,
+    pointer: Option<Catcher>,
 }
 
 impl Drop for Sway {
@@ -118,7 +123,21 @@ impl Compositor for Sway {
         Ok(Self {
             commands,
             events: subscribed,
+            pointer: None,
         })
+    }
+
+    fn guard_pointer(&mut self, area: Option<&PointerArea>) -> Result<(), String> {
+        self.pointer = None;
+        let Some(area) = area else {
+            return Ok(());
+        };
+        let mut commands = Self::commands()?;
+        let origin = area.origin();
+        self.pointer = catcher::guard(area, move |to| {
+            let _ = request(&mut commands, RUN_COMMAND, &cursor_set(to, origin));
+        })?;
+        Ok(())
     }
 
     fn windows(&mut self) -> Result<Vec<Window>, String> {
@@ -222,6 +241,16 @@ pub fn command(window: &Window, placement: Placement, send_windows_to: &str) -> 
     }
 }
 
+/// The sway command that puts the pointer at `to` on the desktop: `cursor set` counts from the
+/// desktop's top-left corner, `origin`, not from sway's 0, 0.
+pub fn cursor_set(to: (i32, i32), origin: (i32, i32)) -> String {
+    format!(
+        "seat - cursor set {} {}",
+        to.0.saturating_sub(origin.0),
+        to.1.saturating_sub(origin.1)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +343,18 @@ mod tests {
         assert_eq!(
             command(&window(true, true), maximise, "DP-1"),
             "[con_id=7] fullscreen disable, move container to output \"DP-1\""
+        );
+    }
+
+    #[test]
+    fn the_pointer_is_set_from_the_desktops_corner() {
+        assert_eq!(
+            cursor_set((1919, 500), (0, 0)),
+            "seat - cursor set 1919 500"
+        );
+        assert_eq!(
+            cursor_set((-1, 500), (-1920, -100)),
+            "seat - cursor set 1919 600"
         );
     }
 

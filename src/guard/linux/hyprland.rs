@@ -4,10 +4,13 @@
 //! dispatchers, which leave the focus alone (docs/research/linux-support.md, section 5). Hyprland's
 //! fullscreen dispatchers act on the focused window only, so a fullscreen window on the card display
 //! is left there and named in the status line. Hyprland freezes while a request socket stays open,
-//! so each request has a timeout and is closed at once.
+//! so each request has a timeout and is closed at once. The pointer guard moves the pointer with the
+//! `movecursor` dispatcher, from the overlay's thread (`catcher.rs`).
 
 use super::super::placement::{Placement, Rect, WindowState};
+use super::catcher::{self, Catcher};
 use super::compositor::{Compositor, Events, Window};
+use super::window_guard::PointerArea;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -23,6 +26,7 @@ pub struct Hyprland {
     directory: PathBuf,
     /// The event socket, shut down to end its reader.
     events: UnixStream,
+    pointer: Option<Catcher>,
 }
 
 impl Drop for Hyprland {
@@ -83,7 +87,20 @@ impl Compositor for Hyprland {
         Ok(Self {
             directory,
             events: stream,
+            pointer: None,
         })
+    }
+
+    fn guard_pointer(&mut self, area: Option<&PointerArea>) -> Result<(), String> {
+        self.pointer = None;
+        let Some(area) = area else {
+            return Ok(());
+        };
+        let directory = self.directory.clone();
+        self.pointer = catcher::guard(area, move |(x, y)| {
+            let _ = request(&directory, &format!("dispatch movecursor {x} {y}"));
+        })?;
+        Ok(())
     }
 
     fn windows(&mut self) -> Result<Vec<Window>, String> {

@@ -61,13 +61,14 @@ jobs:
           CARDCAST_EXPECT_PLUGGED='HEADLESS-1 720x1280 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary; HEADLESS-3 1920x1080 1920x1080+1760+0' \
             cargo test guard::linux::tests::desktop_hotplug -- --nocapture || failed=1
           exit $failed
-      # The window guard (#47) through EWMH: Xvfb split into two RandR monitors, with openbox.
+      # The window guard (#47) through EWMH: Xvfb split into two RandR monitors, with openbox; and
+      # the pointer guard (#49): a warp, a mouse (xdotool) against the barrier, and a grab.
       - if: runner.os == 'Linux'
-        name: Window guard on Xvfb with openbox
+        name: Window guard and pointer guard on Xvfb with openbox
         env:
           CARDCAST_GUARD_DESKTOP: openbox
         run: |
-          sudo apt-get install -y openbox x11-xserver-utils x11-utils
+          sudo apt-get install -y openbox x11-xserver-utils x11-utils xdotool
           export DISPLAY=:99
           # -noreset: the X server would drop the monitors once the last client leaves.
           Xvfb :99 -screen 0 2560x1024x24 -noreset &
@@ -85,9 +86,10 @@ jobs:
           sleep 1
           cargo test guard_tests -- --nocapture --test-threads=1
       # The window guard (#48) over sway's IPC: headless sway with two outputs and foot windows,
-      # then sway killed and started again under a running guard.
+      # the pointer guard (#49) against a virtual mouse, then sway killed and started again under a
+      # running guard.
       - if: runner.os == 'Linux'
-        name: Window guard on headless sway
+        name: Window guard and pointer guard on headless sway
         env:
           WLR_BACKENDS: headless
           WLR_HEADLESS_OUTPUTS: 2
@@ -104,14 +106,16 @@ jobs:
           for _ in $(seq 10); do swaymsg -t get_outputs >/dev/null && break; sleep 1; done
           failed=0
           cargo test desktop_sway_guard_returns -- --nocapture || failed=1
+          cargo test desktop_sway_pointer -- --nocapture || failed=1
           CARDCAST_SWAY_START='sway -c /dev/null > /dev/null 2>&1' cargo test desktop_sway_guard_follows -- --nocapture || failed=1
           pkill -x sway || true
           exit $failed
-      # The window guard and the mirror's window on GNOME (#48): headless GNOME Shell with two
-      # virtual monitors and cardcast's extension (packaging/linux/usr/share/gnome-shell/extensions/), then the extension
-      # turned off and on under a running guard.
+      # The window guard, the pointer guard (#49) and the mirror's window on GNOME (#48): headless
+      # GNOME Shell with two virtual monitors and cardcast's extension
+      # (packaging/linux/usr/share/gnome-shell/extensions/), then the extension turned off and on
+      # under a running guard.
       - if: runner.os == 'Linux'
-        name: Window guard and mirror window on headless GNOME Shell
+        name: Window guard, pointer guard and mirror window on headless GNOME Shell
         env:
           CARDCAST_GUARD_DESKTOP: gnome
         run: |
@@ -271,7 +275,8 @@ jobs:
           $subsystem = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3c) + 24 + 68)
           if ($subsystem -ne 2) { throw "cardcast.exe subsystem is $subsystem, expected 2 (Windows GUI)" }
 
-  # The window guard's KWin script (#47) on kwin_wayland --virtual in an Arch container; see the script.
+  # The window guard's KWin script (#47) and the pointer guard (#49) on kwin_wayland --virtual in an
+  # Arch container; see the script.
   kwin:
     runs-on: ubuntu-latest
     container: archlinux:latest

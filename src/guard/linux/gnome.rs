@@ -4,10 +4,18 @@
 //! bus and signals each change to the connections that called its `Connect`; the decisions stay
 //! here. The same extension keeps the mirror from
 //! taking the focus, so the mirror needs it too.
+//!
+//! It is the pointer guard on GNOME too: told the card display's rectangle (`GuardPointer`), it
+//! watches Mutter's cursor tracker and signals `PointerOnCard` when the pointer is there, and
+//! cardcast has it moved off with `Clutter.Seat.warp_pointer` (`WarpPointer`). No timer: Mutter says
+//! when the pointer moves. Mutter applies a game's pointer lock and confinement to the warp too
+//! (`meta-seat-impl.c`, `constrain_coordinates`).
 
 use super::super::placement::{Placement, Rect, WindowState};
 use super::compositor::{Compositor, Events, Window};
 use super::kwin::window_state;
+use super::window_guard::PointerArea;
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub const NAME: &str = "io.github.ClearlyNotMich.cardcast.Shell";
 pub const PATH: &str = "/io/github/ClearlyNotMich/cardcast/Shell";
@@ -40,8 +48,15 @@ pub fn extension_running(connection: &zbus::blocking::Connection) -> bool {
         .unwrap_or(false)
 }
 
+/// The pointer guard's problem when the extension is older than this cardcast.
+pub fn needs_newer_extension() -> String {
+    format!("it needs the GNOME Shell extension from this cardcast. {INSTALL_EXTENSION}")
+}
+
 pub struct Gnome {
     connection: zbus::blocking::Connection,
+    /// Where the pointer guard works, for the thread that hears `PointerOnCard`.
+    pointer: Arc<Mutex<Option<PointerArea>>>,
 }
 
 impl Drop for Gnome {
@@ -92,10 +107,38 @@ impl Compositor for Gnome {
             .build();
         let owner = zbus::blocking::MessageIterator::for_match_rule(owner, &connection, None)
             .map_err(|error| error.to_string())?;
+        let on_card = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender(NAME)
+            .and_then(|rule| rule.path(PATH))
+            .and_then(|rule| rule.member("PointerOnCard"))
+            .map_err(|error| error.to_string())?
+            .build();
+        let on_card = zbus::blocking::MessageIterator::for_match_rule(on_card, &connection, None)
+            .map_err(|error| error.to_string())?;
         if !extension_running(&connection) {
             return Err("the extension is not running".into());
         }
-        let gnome = Self { connection };
+        let gnome = Self {
+            connection,
+            pointer: Arc::default(),
+        };
+        let (pointer, warper) = (gnome.pointer.clone(), gnome.connection.clone());
+        std::thread::spawn(move || {
+            for message in on_card.flatten() {
+                let Ok(at) = message.body().deserialize::<(i32, i32)>() else {
+                    continue;
+                };
+                let to = pointer
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .and_then(|area| area.target(at));
+                if let Some(to) = to {
+                    let _ = warper.call_method(Some(NAME), PATH, Some(NAME), "WarpPointer", &to);
+                }
+            }
+        });
         gnome.call::<_, ()>("Connect", &())?;
         let events = std::sync::Arc::new(events);
         let changed = events.clone();
@@ -130,6 +173,23 @@ impl Compositor for Gnome {
             top,
             right,
             bottom,
+        })
+    }
+
+    fn guard_pointer(&mut self, area: Option<&PointerArea>) -> Result<(), String> {
+        *self.pointer.lock().unwrap_or_else(PoisonError::into_inner) = area.cloned();
+        // An empty rectangle stops it.
+        let card = area.map_or(Rect::default(), |area| area.card_display);
+        self.call::<_, ()>(
+            "GuardPointer",
+            &(card.left, card.top, card.right, card.bottom),
+        )
+        .map_err(|error| {
+            if error.contains("UnknownMethod") {
+                needs_newer_extension()
+            } else {
+                error
+            }
         })
     }
 

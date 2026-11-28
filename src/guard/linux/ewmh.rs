@@ -3,6 +3,12 @@
 //! windows, `_NET_MOVERESIZE_WINDOW` and `_NET_WM_STATE` move and maximise them without focusing
 //! them. A reader thread passes the X events to the guard thread, which checks a window once it
 //! has been still for a moment, as on Windows.
+//!
+//! The same thread is the pointer guard (docs/research/linux-support.md, section 6): XFixes pointer
+//! barriers along the card display's edges stop a mouse there, and since absolute devices and warps
+//! pass them (<https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/blob/master/fixesproto.txt>,
+//! section 12), the pointer is also checked about 60 times a second and put back, as on Windows. It
+//! is left alone while another program holds a pointer grab, as a game confining it does.
 
 use super::super::placement::{Placement, Rect, WindowState};
 use super::window_guard::{Guarding, could_not_start, monitor_rect};
@@ -14,9 +20,10 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
+use x11rb::protocol::xfixes::{BarrierDirections, ConnectionExt as _};
 use x11rb::protocol::xproto::{
     Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageEvent, ConnectionExt as _,
-    CreateWindowAux, EventMask, MapState, Window, WindowClass,
+    CreateWindowAux, EventMask, GrabMode, GrabStatus, MapState, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 
@@ -44,6 +51,9 @@ const SETTLE: Duration = Duration::from_millis(50);
 
 /// How long the window manager gets to unmaximise a window before the guard gives up on it.
 const UNMAXIMISE_LIMIT: Duration = Duration::from_secs(2);
+
+/// Pointer check interval: about 60 times a second, as on Windows.
+const POINTER_INTERVAL: Duration = Duration::from_millis(16);
 
 enum Message {
     Event(Event),
@@ -80,6 +90,8 @@ struct X11 {
     waker: Window,
     /// Set when the guard stops: from then on nothing moves.
     stopped: Arc<AtomicBool>,
+    /// The X server has pointer barriers (XFixes 5).
+    barriers: bool,
 }
 
 /// Starts the guard thread, which connects to the X server; its problems reach the status line
@@ -123,6 +135,11 @@ fn connect(stopped: Arc<AtomicBool>) -> Result<X11, Box<dyn Error>> {
         .ok_or("no X screen")?
         .root;
     let atoms = Atoms::new(&connection)?.reply()?;
+    let barriers = connection
+        .xfixes_query_version(5, 0)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some_and(|version| version.major_version >= 5);
     connection
         .change_window_attributes(
             root,
@@ -151,6 +168,7 @@ fn connect(stopped: Arc<AtomicBool>) -> Result<X11, Box<dyn Error>> {
         atoms,
         waker,
         stopped,
+        barriers,
     })
 }
 
@@ -161,11 +179,14 @@ struct Windows {
     pending: HashMap<Window, Instant>,
     /// With when they were unmaximised.
     remaximising: HashMap<Window, Instant>,
+    /// The pointer barriers around the card display.
+    barriers: Vec<u32>,
 }
 
 fn run(x11: &X11, mut guarding: Guarding, messages: &Receiver<Message>) {
     let mut windows = Windows::default();
     follow_displays(x11, &mut guarding, &mut windows);
+    let mut pointer_at = Instant::now();
     loop {
         let settled_at = windows.pending.values().min().map(|at| *at + SETTLE);
         let overdue_at = windows
@@ -173,7 +194,13 @@ fn run(x11: &X11, mut guarding: Guarding, messages: &Receiver<Message>) {
             .values()
             .min()
             .map(|at| *at + UNMAXIMISE_LIMIT);
-        let message = match settled_at.into_iter().chain(overdue_at).min() {
+        let pointer_due = guarding.pointer_area().is_some().then_some(pointer_at);
+        let message = match settled_at
+            .into_iter()
+            .chain(overdue_at)
+            .chain(pointer_due)
+            .min()
+        {
             Some(at) => messages.recv_timeout(at.saturating_duration_since(Instant::now())),
             None => messages.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
@@ -184,6 +211,10 @@ fn run(x11: &X11, mut guarding: Guarding, messages: &Receiver<Message>) {
             Err(RecvTimeoutError::Timeout) => {}
         }
         let now = Instant::now();
+        if pointer_due.is_some_and(|at| now >= at) {
+            check_pointer(x11, &mut guarding);
+            pointer_at = now + POINTER_INTERVAL;
+        }
         let overdue = windows
             .remaximising
             .iter()
@@ -201,6 +232,7 @@ fn run(x11: &X11, mut guarding: Guarding, messages: &Receiver<Message>) {
         }
     }
     x11.stopped.store(true, Ordering::Relaxed);
+    set_barriers(x11, &mut windows.barriers, None);
     let _ = x11.connection.destroy_window(x11.waker);
     let _ = x11.connection.flush();
 }
@@ -229,6 +261,8 @@ fn on_event(x11: &X11, guarding: &mut Guarding, windows: &mut Windows, event: &E
 fn follow_displays(x11: &X11, guarding: &mut Guarding, windows: &mut Windows) {
     let workarea = current_workarea(x11);
     guarding.follow_displays(|monitor| Some(work_area(monitor_rect(monitor), workarea)));
+    let card_display = guarding.pointer_area().map(|area| area.card_display);
+    set_barriers(x11, &mut windows.barriers, card_display);
     windows.clients.clear();
     update_clients(x11, guarding, windows);
 }
@@ -253,6 +287,115 @@ fn update_clients(x11: &X11, guarding: &mut Guarding, windows: &mut Windows) {
             .change_window_attributes(new, &ChangeWindowAttributesAux::new().event_mask(events));
         check(x11, guarding, windows, new, now);
     }
+}
+
+/// Puts the pointer back off the card display, unless another program holds a pointer grab.
+fn check_pointer(x11: &X11, guarding: &mut Guarding) {
+    if x11.stopped.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(pointer) = x11
+        .connection
+        .query_pointer(x11.root)
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .filter(|pointer| pointer.same_screen)
+    else {
+        return;
+    };
+    let Some((x, y)) = guarding.place_pointer((pointer.root_x.into(), pointer.root_y.into()))
+    else {
+        return;
+    };
+    let (Ok(x), Ok(y)) = (i16::try_from(x), i16::try_from(y)) else {
+        return;
+    };
+    // X has no way to ask whether the pointer is grabbed but to try; a grab that succeeds is
+    // nobody else's, and is let go at once.
+    let free = x11
+        .connection
+        .grab_pointer(
+            false,
+            x11.root,
+            EventMask::NO_EVENT,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        )
+        .ok()
+        .and_then(|cookie| cookie.reply().ok())
+        .is_some_and(|reply| reply.status == GrabStatus::SUCCESS);
+    if free {
+        let _ = x11.connection.ungrab_pointer(x11rb::CURRENT_TIME);
+        let _ = x11
+            .connection
+            .warp_pointer(x11rb::NONE, x11.root, 0, 0, 0, 0, x, y);
+    }
+    let _ = x11.connection.flush();
+}
+
+/// Replaces the pointer barriers with ones around `card_display`, or none.
+fn set_barriers(x11: &X11, barriers: &mut Vec<u32>, card_display: Option<Rect>) {
+    for barrier in barriers.drain(..) {
+        let _ = x11.connection.xfixes_delete_pointer_barrier(barrier);
+    }
+    for (x1, y1, x2, y2, leaving) in card_display
+        .filter(|_| x11.barriers)
+        .map(barrier_lines)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let Ok(barrier) = x11.connection.generate_id() else {
+            break;
+        };
+        let created = x11.connection.xfixes_create_pointer_barrier(
+            barrier,
+            x11.root,
+            x1,
+            y1,
+            x2,
+            y2,
+            leaving,
+            &[],
+        );
+        if created.is_ok() {
+            barriers.push(barrier);
+        }
+    }
+    let _ = x11.connection.flush();
+}
+
+/// A pointer barrier: `(x1, y1, x2, y2, directions)`.
+type BarrierLine = (u16, u16, u16, u16, BarrierDirections);
+
+/// The pointer barriers along the card display's four edges: `(x1, y1, x2, y2, directions)`, each
+/// letting the pointer through only on its way off the card display (XFixes' directions are the
+/// ones allowed). `None` for an edge outside X's 16-bit coordinates.
+pub fn barrier_lines(card: Rect) -> [Option<BarrierLine>; 4] {
+    let line = |x1: i32, y1: i32, x2: i32, y2: i32, leaving| {
+        Some((
+            u16::try_from(x1).ok()?,
+            u16::try_from(y1).ok()?,
+            u16::try_from(x2).ok()?,
+            u16::try_from(y2).ok()?,
+            leaving,
+        ))
+    };
+    let Rect {
+        left,
+        top,
+        right,
+        bottom,
+    } = card;
+    [
+        line(left, top, left, bottom, BarrierDirections::NEGATIVE_X),
+        line(right, top, right, bottom, BarrierDirections::POSITIVE_X),
+        line(left, top, right, top, BarrierDirections::NEGATIVE_Y),
+        line(left, bottom, right, bottom, BarrierDirections::POSITIVE_Y),
+    ]
 }
 
 fn id(window: Window) -> isize {
@@ -504,6 +647,21 @@ mod tests {
         // A monitor left of or above the primary one has negative coordinates.
         let [_, x, y, ..] = moveresize(rect(-1920, -5, 0, 400), EXTENTS);
         assert_eq!((x as i32, y as i32), (-1920, -5));
+    }
+
+    #[test]
+    fn barriers_line_the_card_display_and_let_the_pointer_only_leave() {
+        let lines = barrier_lines(rect(1280, 0, 2560, 1024));
+        assert_eq!(
+            lines,
+            [
+                Some((1280, 0, 1280, 1024, BarrierDirections::NEGATIVE_X)),
+                Some((2560, 0, 2560, 1024, BarrierDirections::POSITIVE_X)),
+                Some((1280, 0, 2560, 0, BarrierDirections::NEGATIVE_Y)),
+                Some((1280, 1024, 2560, 1024, BarrierDirections::POSITIVE_Y)),
+            ]
+        );
+        assert_eq!(barrier_lines(rect(-10, 0, 100, 100))[0], None);
     }
 
     #[test]

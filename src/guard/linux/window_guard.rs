@@ -1,10 +1,12 @@
 //! The Linux window guard behind [`Guard`]: EWMH on X11 (`ewmh.rs`), a KWin script on Plasma
 //! (`kwin.rs`), and sway's and Hyprland's IPC and cardcast's GNOME Shell extension
 //! (`compositor.rs`), all deciding with `placement.rs` (docs/research/linux-support.md, section 5).
-//! What they share lives here: the monitors, the return history and the status-line reports.
+//! What they share lives here: the monitors, the return history, the pointer guard's decisions
+//! (`pointer.rs`) and the status-line reports.
 
 use super::super::desktop::Desktop;
 use super::super::placement::{self, Placement, Rect, ReturnHistory, WindowState};
+use super::super::pointer::{PointerHistory, nearest_off_card};
 use super::super::{Guard, GuardReport, Monitor};
 use super::gnome::Gnome;
 use super::hyprland::Hyprland;
@@ -20,16 +22,9 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 /// Lists the monitors; [`super::monitors`] outside tests.
 pub type ListMonitors = fn() -> Result<Vec<Monitor>, String>;
 
-/// No pointer guard on Linux yet (#36), so the status line says so whenever the window guard has
-/// nothing else to say; it never pretends.
-pub const NO_POINTER_GUARD: &str = "The pointer guard does not work on Linux yet.";
-
-/// The report the status line gets on Linux: `report`, or the missing pointer guard instead of nothing.
-pub fn honest(report: GuardReport) -> GuardReport {
-    match report {
-        GuardReport::Clear => GuardReport::Notice(NO_POINTER_GUARD.into()),
-        notice @ GuardReport::Notice(_) => notice,
-    }
+/// The status line when the pointer guard can't start.
+pub fn pointer_could_not_start(error: &str) -> String {
+    format!("The pointer guard could not start ({error}). Untick and tick Guard to try again.")
 }
 
 /// The status line when a helper can't start.
@@ -48,8 +43,34 @@ pub fn monitor_rect(monitor: &Monitor) -> Rect {
     }
 }
 
-/// The card display and "send windows to" rectangles, and the latter's output name.
-type Found = ((Rect, Rect), String);
+/// The card display and "send windows to" rectangles, the latter's output name, and where the
+/// pointer guard works.
+type Found = ((Rect, Rect), String, PointerArea);
+
+/// What the pointer guard on Wayland needs: the card display's output and rectangle, and the other
+/// monitors' rectangles, all in the desktop's coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerArea {
+    pub output: String,
+    pub card_display: Rect,
+    pub others: Vec<Rect>,
+}
+
+impl PointerArea {
+    /// Where a pointer seen at `pointer` on the card display goes.
+    pub fn target(&self, pointer: (i32, i32)) -> Option<(i32, i32)> {
+        nearest_off_card(pointer, &self.others)
+    }
+
+    /// The desktop's top-left corner: the smallest left and top of all monitors.
+    pub fn origin(&self) -> (i32, i32) {
+        let all = || self.others.iter().chain([&self.card_display]);
+        (
+            all().map(|r| r.left).min().unwrap_or(0),
+            all().map(|r| r.top).min().unwrap_or(0),
+        )
+    }
+}
 
 /// What a guard helper knows on its own thread: the monitors, the return history, and each window's title for the give-up notice.
 pub struct Guarding {
@@ -60,6 +81,12 @@ pub struct Guarding {
     monitors: Option<(Rect, Rect)>,
     /// The desktop's name for the "send windows to" monitor's output, while there is something to guard.
     send_to_output: Option<String>,
+    /// Where the pointer guard works, while there is something to guard.
+    pointer_area: Option<PointerArea>,
+    /// The last pointer position seen off the card display (X11, which sees it everywhere).
+    pointer: PointerHistory,
+    /// Why the pointer guard can't work here, for the status line when nothing else is to say.
+    pointer_problem: Option<String>,
     /// Why there is nothing to guard, unless the card display is just unplugged.
     problem: Option<String>,
     history: ReturnHistory,
@@ -84,6 +111,9 @@ impl Guarding {
             list_monitors,
             monitors: None,
             send_to_output: None,
+            pointer_area: None,
+            pointer: PointerHistory::default(),
+            pointer_problem: None,
             problem: None,
             history: ReturnHistory::default(),
             titles: HashMap::new(),
@@ -96,12 +126,42 @@ impl Guarding {
     /// At start and after a display change: finds the monitors and reports. `work_area` gives a
     /// monitor's work area from the desktop, else the guard uses the whole monitor.
     pub fn follow_displays(&mut self, work_area: impl FnMut(&Monitor) -> Option<Rect>) {
-        (self.monitors, self.send_to_output, self.problem) = match self.find_monitors(work_area) {
-            Ok(Some((monitors, output))) => (Some(monitors), Some(output), None),
-            Ok(None) => (None, None, None),
-            Err(problem) => (None, None, Some(problem)),
+        (
+            self.monitors,
+            self.send_to_output,
+            self.pointer_area,
+            self.problem,
+        ) = match self.find_monitors(work_area) {
+            Ok(Some((monitors, output, area))) => (Some(monitors), Some(output), Some(area), None),
+            Ok(None) => (None, None, None, None),
+            Err(problem) => (None, None, None, Some(problem)),
         };
         self.report();
+    }
+
+    /// Where the pointer guard works; `None` while there is nothing to guard.
+    pub fn pointer_area(&self) -> Option<&PointerArea> {
+        self.pointer_area.as_ref()
+    }
+
+    /// Where to put the pointer, now at `pointer`, or `None` to leave it: the Windows decision, for
+    /// a desktop that shows the pointer everywhere (X11). Before any position off the card display
+    /// is seen, the middle of the "send windows to" monitor's work area.
+    pub fn place_pointer(&mut self, pointer: (i32, i32)) -> Option<(i32, i32)> {
+        let (card_display, send_windows_to) = self.monitors?;
+        let fallback = (
+            send_windows_to.left + (send_windows_to.right - send_windows_to.left) / 2,
+            send_windows_to.top + (send_windows_to.bottom - send_windows_to.top) / 2,
+        );
+        self.pointer.place(pointer, card_display, fallback)
+    }
+
+    /// Why the pointer guard can't work here (plain words), or `None` once it can.
+    pub fn pointer_problem(&mut self, problem: Option<String>) {
+        if self.pointer_problem != problem {
+            self.pointer_problem = problem;
+            self.report();
+        }
     }
 
     /// The desktop's name for the "send windows to" monitor's output (`DP-2`).
@@ -123,12 +183,22 @@ impl Guarding {
         else {
             return Ok(None);
         };
+        let area = PointerArea {
+            output: card_display.gdi_name.clone(),
+            card_display: monitor_rect(card_display),
+            others: monitors
+                .iter()
+                .filter(|monitor| monitor.device_path != card_display.device_path)
+                .map(monitor_rect)
+                .collect(),
+        };
         Ok(Some((
             (
                 monitor_rect(card_display),
                 work_area(send_windows_to).unwrap_or_else(|| monitor_rect(send_windows_to)),
             ),
             send_windows_to.gdi_name.clone(),
+            area,
         )))
     }
 
@@ -215,7 +285,11 @@ impl Guarding {
             }
             (problem, title) => placement::notice(problem, title),
         };
-        let _ = self.reports.send(honest(report));
+        let report = match (report, &self.pointer_problem) {
+            (GuardReport::Clear, Some(pointer)) => GuardReport::Notice(pointer.clone()),
+            (report, _) => report,
+        };
+        let _ = self.reports.send(report);
         (self.wake)();
     }
 }
@@ -234,7 +308,7 @@ struct Running {
     helper: Helper,
 }
 
-/// The window guard on X11, Plasma, GNOME, sway and Hyprland; on Linux the pointer guard is not built yet.
+/// The window guard and pointer guard on X11, Plasma, GNOME, sway and Hyprland.
 pub struct WindowGuard {
     desktop: Desktop,
     list_monitors: ListMonitors,
@@ -393,13 +467,44 @@ mod tests {
     }
 
     #[test]
-    fn with_nothing_else_to_say_the_status_line_says_the_pointer_guard_is_missing() {
+    fn a_pointer_guard_problem_is_said_when_the_window_guard_has_nothing_to_say() {
+        let (mut guarding, reports) = guarding(None);
+        guarding.follow_displays(work_area);
+        assert_eq!(reports.try_iter().last(), Some(GuardReport::Clear));
+        guarding.pointer_problem(Some("no warp".into()));
         assert_eq!(
-            honest(GuardReport::Clear),
-            GuardReport::Notice("The pointer guard does not work on Linux yet.".into())
+            reports.try_iter().last(),
+            Some(GuardReport::Notice("no warp".into()))
         );
-        let problem = GuardReport::Notice("problem".into());
-        assert_eq!(honest(problem.clone()), problem);
+        let _ = guarding.check(3, "Stubborn", on_card(), false, Instant::now());
+        guarding.give_up(3);
+        assert!(matches!(
+            reports.try_iter().last(),
+            Some(GuardReport::Notice(notice)) if notice.contains("Stubborn")
+        ));
+        guarding.forget(3);
+        assert_eq!(
+            reports.try_iter().last(),
+            Some(GuardReport::Notice("no warp".into()))
+        );
+        guarding.pointer_problem(None);
+        assert_eq!(reports.try_iter().last(), Some(GuardReport::Clear));
+    }
+
+    #[test]
+    fn the_pointer_goes_back_off_the_card_display() {
+        let (mut guarding, _reports) = guarding(None);
+        assert_eq!(guarding.place_pointer((2500, 300)), None);
+        guarding.follow_displays(work_area);
+        // Before any off-card position: the middle of the "send windows to" work area.
+        assert_eq!(guarding.place_pointer((2500, 300)), Some((960, 518)));
+        assert_eq!(guarding.place_pointer((1900, 300)), None);
+        assert_eq!(guarding.place_pointer((1920, 300)), Some((1900, 300)));
+        let area = guarding.pointer_area().unwrap();
+        assert_eq!(area.output, "card");
+        assert_eq!(area.card_display, rect(1920, 0, 3840, 1080));
+        assert_eq!(area.target((1925, 300)), Some((1919, 300)));
+        assert_eq!(area.origin(), (0, 0));
     }
 
     #[test]
@@ -422,10 +527,7 @@ mod tests {
             Placement::Stay
         );
         guarding.follow_displays(work_area);
-        assert_eq!(
-            reports.try_iter().last(),
-            Some(GuardReport::Notice(NO_POINTER_GUARD.into()))
-        );
+        assert_eq!(reports.try_iter().last(), Some(GuardReport::Clear));
         assert_eq!(
             guarding.check(1, "Kate", on_card(), false, now),
             Placement::MoveTo(rect(100, 100, 500, 400))
@@ -547,10 +649,7 @@ mod tests {
             Placement::Stay
         );
         guarding.movable_again(4);
-        assert_eq!(
-            reports.try_iter().last(),
-            Some(GuardReport::Notice(NO_POINTER_GUARD.into()))
-        );
+        assert_eq!(reports.try_iter().last(), Some(GuardReport::Clear));
         assert!(matches!(
             guarding.check(4, "Game", on_card(), false, Instant::now()),
             Placement::MoveTo(_)
@@ -590,9 +689,6 @@ mod tests {
             ))
         );
         guarding.forget(7);
-        assert_eq!(
-            reports.try_iter().last(),
-            Some(GuardReport::Notice(NO_POINTER_GUARD.into()))
-        );
+        assert_eq!(reports.try_iter().last(), Some(GuardReport::Clear));
     }
 }

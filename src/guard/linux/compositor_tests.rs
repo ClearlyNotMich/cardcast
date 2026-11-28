@@ -8,7 +8,7 @@ use super::super::{Guard, GuardReport, Monitor};
 use super::compositor::{self, Compositor, Events};
 use super::gnome::{Gnome, MIRROR_APP_ID};
 use super::sway::{self, Sway};
-use super::window_guard::{Guarding, NO_POINTER_GUARD, WindowGuard, monitor_rect};
+use super::window_guard::{Guarding, WindowGuard, monitor_rect};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -182,10 +182,7 @@ fn desktop_sway_guard_returns_windows_without_taking_focus() {
         mostly_on(frame(id), primary)
     });
     assert_eq!(sway_focused(), focused, "the guard changed the focus");
-    assert_eq!(
-        guard.take_report(),
-        Some(GuardReport::Notice(NO_POINTER_GUARD.into()))
-    );
+    assert_eq!(guard.take_report(), Some(GuardReport::Clear));
 }
 
 /// `CARDCAST_SWAY_START` (CI): a shell command that starts another headless sway in this runtime
@@ -225,7 +222,7 @@ fn desktop_sway_guard_follows_a_sway_restart() {
         }
         status.clone()
     };
-    let guarding = Some(GuardReport::Notice(NO_POINTER_GUARD.into()));
+    let guarding = Some(GuardReport::Clear);
     let waiting = Some(GuardReport::Notice(sway::WAITING_FOR_SWAY.into()));
     wait_for("the guard to start", || latest() == guarding);
 
@@ -285,7 +282,7 @@ fn desktop_gnome_extension_returns_windows_and_keeps_the_focus_off_the_mirror() 
     let mut guard = WindowGuard::new(Desktop::GnomeWayland, super::monitors, || {});
     guard.update(true, Some(&card.device_path), None);
     wait_for("the guard to start", || {
-        guard.take_report() == Some(GuardReport::Notice(NO_POINTER_GUARD.into()))
+        guard.take_report() == Some(GuardReport::Clear)
     });
 
     let (width, height) = (size.right - size.left, size.bottom - size.top);
@@ -436,7 +433,7 @@ fn desktop_gnome_guard_follows_the_extension_turned_off_and_on() {
         }
         status.clone()
     };
-    let guarding = Some(GuardReport::Notice(NO_POINTER_GUARD.into()));
+    let guarding = Some(GuardReport::Clear);
     let waiting = Some(GuardReport::Notice(super::gnome::needs_extension()));
     wait_for("the guard to start", || latest() == guarding);
     gnome_extension("DisableExtension");
@@ -445,4 +442,85 @@ fn desktop_gnome_guard_follows_the_extension_turned_off_and_on() {
     });
     gnome_extension("EnableExtension");
     wait_for("the guard to be back", || latest() == guarding);
+}
+
+/// `CARDCAST_GUARD_DESKTOP=sway` (CI): the pointer pushed onto the card display with a virtual mouse
+/// comes back just across its edge, on the primary monitor (`seat - cursor set`), as a probe
+/// overlay there sees. Skips otherwise.
+#[test]
+fn desktop_sway_pointer_guard_puts_the_pointer_back() {
+    if std::env::var("CARDCAST_GUARD_DESKTOP").as_deref() != Ok("sway") {
+        return;
+    }
+    let monitors = super::monitors().unwrap();
+    let card = monitors.iter().find(|m| !m.primary).unwrap();
+    let primary = monitors.iter().find(|m| m.primary).unwrap();
+    let (card_rect, primary_rect) = (monitor_rect(card), monitor_rect(primary));
+    assert_eq!(
+        card_rect.left, primary_rect.right,
+        "the card display is not right of the primary monitor"
+    );
+    let (_probe, probed) = super::catcher::probe(primary);
+    let mouse = super::catcher::VirtualPointer::new();
+    let desktop = (
+        u32::try_from(card_rect.right - primary_rect.left).unwrap(),
+        u32::try_from(card_rect.bottom.max(primary_rect.bottom) - primary_rect.top).unwrap(),
+    );
+    let origin = (primary_rect.left, primary_rect.top);
+    let mut guard = WindowGuard::new(Desktop::Sway, super::monitors, || {});
+    guard.update(true, Some(&card.device_path), None);
+
+    let pushed = (card_rect.left + 100, card_rect.top + 100);
+    let back = (primary_rect.right - 1, pushed.1);
+    // Pushed again until the guard has started, every half second.
+    let (mut pushes, mut status) = (0, None);
+    wait_for("the pointer to come back from the card display", || {
+        if pushes % 25 == 0 {
+            mouse.move_to(pushed, origin, desktop);
+        }
+        pushes += 1;
+        if let Some(report) = guard.take_report() {
+            eprintln!("status: {report:?}");
+            status = Some(report);
+        }
+        *probed.lock().unwrap() == Some(back)
+    });
+    eprintln!("pushed to {pushed:?}, put back at {back:?}");
+    assert_eq!(status, Some(GuardReport::Clear));
+}
+
+/// `CARDCAST_GUARD_DESKTOP=gnome` (CI): the pointer pushed onto the card display comes back just
+/// across its edge, on the primary monitor, through the extension. Skips otherwise.
+#[test]
+fn desktop_gnome_pointer_guard_puts_the_pointer_back() {
+    if std::env::var("CARDCAST_GUARD_DESKTOP").as_deref() != Ok("gnome") {
+        return;
+    }
+    let (card, primary) = card_and_primary();
+    let card_rect = monitor_rect(&card);
+    assert_eq!(
+        card_rect.left, primary.right,
+        "the card display is not right of the primary monitor"
+    );
+    let gnome = Gnome::connect(Events::unheard()).unwrap();
+    let mut guard = WindowGuard::new(Desktop::GnomeWayland, super::monitors, || {});
+    guard.update(true, Some(&card.device_path), None);
+
+    let pushed = (card_rect.left + 100, card_rect.top + 100);
+    let back = (primary.right - 1, pushed.1);
+    // Pushed again until the guard has started, every half second.
+    let (mut pushes, mut status) = (0, None);
+    wait_for("the pointer to come back from the card display", || {
+        if pushes % 25 == 0 {
+            gnome.call::<_, ()>("WarpPointer", &pushed).unwrap();
+        }
+        pushes += 1;
+        if let Some(report) = guard.take_report() {
+            eprintln!("status: {report:?}");
+            status = Some(report);
+        }
+        gnome.call::<_, (i32, i32)>("Pointer", &()).unwrap() == back
+    });
+    eprintln!("pushed to {pushed:?}, put back at {back:?}");
+    assert_eq!(status, Some(GuardReport::Clear));
 }
