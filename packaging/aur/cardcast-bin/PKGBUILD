@@ -1,6 +1,6 @@
 # Maintainer: ClearlyNotMich <ClearlyNotMich at users dot noreply dot github dot com>
 pkgname=cardcast-bin
-pkgver=0.2.1
+pkgver=0.2.2
 pkgrel=1
 pkgdesc="Mirror a monitor onto a capture card's display for two-PC streaming, and keep windows off it"
 arch=('x86_64')
