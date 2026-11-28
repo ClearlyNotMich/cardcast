@@ -10,6 +10,7 @@ use std::error::Error;
 use std::num::NonZeroU32;
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
+use std::time::Duration;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_output::{self, WlOutput};
@@ -30,6 +31,7 @@ use wgpu::rwh::{
     XcbWindowHandle,
 };
 use x11rb::connection::Connection as _;
+use x11rb::protocol::randr::{ConnectionExt as _, ModeFlag, ModeInfo};
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{ClipOrdering, ConnectionExt as _, CreateWindowAux, WindowClass};
 use x11rb::xcb_ffi::XCBConnection;
@@ -340,6 +342,8 @@ pub struct X11Window {
     screen: i32,
     window: NonZeroU32,
     size: (u32, u32),
+    /// One refresh of the card display, exact from its RandR mode.
+    pub refresh: Duration,
 }
 
 // SAFETY: the raw pointer is the XCB connection `connection` owns, which XCB lets any thread use;
@@ -383,9 +387,25 @@ impl X11Window {
                 &[],
             )?
             .check()?;
+        // The card display's CRTC: monitors never overlap, so its top-left names it.
+        let resources = connection
+            .randr_get_screen_resources_current(root)?
+            .reply()?;
+        let mut mode = ModeInfo::default();
+        for crtc in &resources.crtcs {
+            let crtc = connection
+                .randr_get_crtc_info(*crtc, resources.config_timestamp)?
+                .reply()?;
+            if (i32::from(crtc.x), i32::from(crtc.y)) == (card_display.left, card_display.top)
+                && let Some(found) = resources.modes.iter().find(|m| m.id == crtc.mode)
+            {
+                mode = *found;
+            }
+        }
         let connection_pointer =
             NonNull::new(connection.get_raw_xcb_connection()).ok_or("no XCB connection")?;
         Ok(Self {
+            refresh: refresh_period(&mode),
             connection_pointer,
             screen: i32::try_from(screen)?,
             window: NonZeroU32::new(window).ok_or("no window")?,
@@ -397,6 +417,27 @@ impl X11Window {
     fn show(&self) -> Result<(), Box<dyn Error>> {
         self.connection.map_window(self.window.get())?.check()?;
         Ok(())
+    }
+}
+
+/// One refresh of `mode`: htotal × vtotal dots at the dot clock, with half the lines when
+/// interlaced (a field) and twice when doublescanned: RandR's `MODEINFO` and its `Interlace` and
+/// `DoubleScan` flags, read as xrandr's `mode_refresh` does (docs/linux-capture.md, [9] and [10]).
+/// Rounded down to the nanosecond, so the cap never runs slower than the card display. A mode
+/// without timings counts as 60 Hz.
+pub fn refresh_period(mode: &ModeInfo) -> Duration {
+    // In half-lines, so an interlaced field's half line stays exact.
+    let mut half_lines = u128::from(mode.vtotal) * 2;
+    if mode.mode_flags.contains(ModeFlag::DOUBLE_SCAN) {
+        half_lines *= 2;
+    }
+    if mode.mode_flags.contains(ModeFlag::INTERLACE) {
+        half_lines /= 2;
+    }
+    let half_dots = u128::from(mode.htotal) * half_lines;
+    match (half_dots * 1_000_000_000).checked_div(u128::from(mode.dot_clock) * 2) {
+        Some(nanos) if nanos > 0 => Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)),
+        _ => Duration::from_secs(1) / 60,
     }
 }
 
