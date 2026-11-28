@@ -13,8 +13,10 @@ eframe = "0.37"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 wayland-protocols-plasma = { version = "0.3", features = ["client"] }
-x11rb = { version = "0.13", features = ["randr"] }
+x11rb = { version = "0.13", features = ["randr", "shm", "xfixes"] }
 zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+# Mirror capture (#42): PipeWire streams from the ScreenCast portal. MIT.
+pipewire = { version = "0.10", features = ["v0_3_65"] }
 # libc (MIT OR Apache-2.0, the version eframe already pulls in): ending `pw-loopback` with cardcast
 # (section 3) and the i2c-dev ioctl for DDC/CI (section 7). serde_json (MIT OR Apache-2.0): the sink
 # list from `pw-dump`.

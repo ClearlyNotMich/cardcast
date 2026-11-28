@@ -8,6 +8,15 @@
 
 #[cfg(windows)]
 mod capture;
+#[cfg(target_os = "linux")]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the Linux mirror present (#43) draws its pictures"
+    )
+)]
+pub mod linux;
 #[cfg_attr(
     not(windows),
     allow(
@@ -40,6 +49,102 @@ pub trait Mirror {
     fn presents(&self) -> Option<u64> {
         None
     }
+}
+
+/// What the mirror window draws once per refresh: the captured source monitor (`capture::Desktop`
+/// on Windows; on Linux the portal's PipeWire stream, or MIT-SHM on X11, from `linux::capture`).
+#[cfg_attr(
+    all(target_os = "linux", not(test)),
+    allow(dead_code, reason = "the Linux mirror present (#43) takes the frames")
+)]
+pub trait Picture {
+    /// Size of the newest picture in pixels, for the aspect fit.
+    fn size(&self) -> (u32, u32);
+    /// Draws the newest picture into `fit` on `target`, the swap chain's back buffer;
+    /// the rest of the back buffer is already black.
+    #[cfg(windows)]
+    fn draw(
+        &mut self,
+        context: &windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext1,
+        target: &windows::Win32::Graphics::Direct3D11::ID3D11RenderTargetView,
+        fit: Fit,
+    ) -> windows::core::Result<()>;
+    /// The newest picture since the last call, if a new one came; an error once the capture ended
+    /// (for example the source monitor was unplugged), saying whether a fresh start can fix it.
+    #[cfg(target_os = "linux")]
+    fn take_frame(&mut self) -> Result<Option<Frame>, Ended>;
+}
+
+/// One captured picture of the source monitor, as the Linux capture hands it to the present.
+#[cfg(target_os = "linux")]
+#[cfg_attr(
+    all(target_os = "linux", not(test)),
+    allow(dead_code, reason = "the Linux mirror present (#43) takes the frames")
+)]
+#[derive(Debug)]
+pub struct Frame {
+    pub width: u32,
+    pub height: u32,
+    /// The DRM fourcc of its pixels: [`linux::XRGB8888`] and its kin.
+    pub fourcc: u32,
+    pub pixels: Pixels,
+    /// Gives the capture's buffer back when the frame is dropped; a copy holds none.
+    #[allow(dead_code, reason = "never read: dropping it gives the buffer back")]
+    pub release: Release,
+}
+
+/// Gives a [`Frame`]'s buffer back to the capture once, when dropped. The capture has only a few
+/// buffers, so the present drops a frame as soon as it no longer reads its pixels.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+pub struct Release(Option<Box<dyn FnOnce() + Send>>);
+
+#[cfg(target_os = "linux")]
+impl Release {
+    pub fn new(give_back: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(give_back)))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Some(give_back) = self.0.take() {
+            give_back();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for Release {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(if self.0.is_some() {
+            "Release(held)"
+        } else {
+            "Release(none)"
+        })
+    }
+}
+
+/// Where a [`Frame`]'s pixels are.
+#[cfg(target_os = "linux")]
+#[allow(
+    dead_code,
+    reason = "the Linux mirror present (#43) reads them; the tests read only memory frames"
+)]
+#[derive(Debug)]
+pub enum Pixels {
+    /// A copy in memory, `stride` bytes per row: PipeWire's shared-memory fallback, or MIT-SHM on X11.
+    Memory { bytes: Vec<u8>, stride: u32 },
+    /// One plane the compositor rendered on the graphics card, to import there without a copy
+    /// (`docs/linux-capture.md`). The compositor doesn't draw into it again until the frame (its
+    /// [`Release`]) is dropped, so keep the frame while the present reads the plane, no longer.
+    DmaBuf {
+        fd: std::os::fd::OwnedFd,
+        offset: u32,
+        stride: u32,
+        modifier: u64,
+    },
 }
 
 /// What the settings window does after the mirror failed to start or ended on its own, with the status text.

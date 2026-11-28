@@ -107,9 +107,44 @@ pub fn new_relay(wake: impl Fn() + Send + 'static) -> Box<dyn Relay> {
     Box::new(linux::PipeWireRelay::new(wake))
 }
 
-/// What the status line keeps saying while the relay is not built for this platform (#36): it is
-/// built for both.
-pub const NOT_BUILT: Option<&str> = None;
+/// Lists playback devices on a thread of its own, so a hung PipeWire can't freeze the settings
+/// window; the list arrives through `take`.
+pub struct DeviceLister {
+    list: fn() -> Result<Vec<AudioDevice>, String>,
+    sender: std::sync::mpsc::Sender<Result<Vec<AudioDevice>, String>>,
+    lists: std::sync::mpsc::Receiver<Result<Vec<AudioDevice>, String>>,
+    wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+}
+
+impl DeviceLister {
+    /// `list` lists the devices ([`playback_devices`]); `wake` asks the settings window to
+    /// repaint when a list is waiting.
+    pub fn new(
+        list: fn() -> Result<Vec<AudioDevice>, String>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let (sender, lists) = std::sync::mpsc::channel();
+        Self {
+            list,
+            sender,
+            lists,
+            wake: std::sync::Arc::new(wake),
+        }
+    }
+
+    pub fn list(&self) {
+        let (list, sender, wake) = (self.list, self.sender.clone(), self.wake.clone());
+        std::thread::spawn(move || {
+            let _ = sender.send(list());
+            wake();
+        });
+    }
+
+    /// The latest list, if one arrived.
+    pub fn take(&self) -> Option<Result<Vec<AudioDevice>, String>> {
+        self.lists.try_iter().last()
+    }
+}
 
 /// A playback device on the sender, as shown in the audio source dropdown.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -6,7 +6,8 @@
 # with llvmpipe and the tests maximise the Wayland window too.
 set -e
 cd "$(dirname "$0")/../.."
-pacman -Syu --noconfirm --needed base-devel rust kwin xorg-xwayland foot ttf-dejavu
+# libpipewire and clang build the pipewire crate (#42).
+pacman -Syu --noconfirm --needed base-devel rust clang pipewire kwin xorg-xwayland foot ttf-dejavu
 # The container lacks CAP_SYS_NICE, so kwin_wayland's file capability would stop it starting.
 setcap -r /usr/bin/kwin_wayland
 cargo test --no-run

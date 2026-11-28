@@ -81,6 +81,14 @@ cardcast records what the audio source plays and plays it again on the sound out
 
 To choose which programs go to the capture card, use Windows' own per-app sound settings (Settings > System > Sound > Volume mixer): send those programs to the audio source. cardcast has no per-app settings.
 
+On Linux the sound goes through PipeWire, which needs PipeWire 0.3.44 or newer with its command-line tools (`pw-dump`, `pw-loopback`) and WirePlumber 0.4.12 or newer running:
+
+- Arch and CachyOS: `pipewire-audio` and `wireplumber`
+- Debian and Ubuntu: `pipewire-bin` and `wireplumber`
+- Fedora: `pipewire-utils` and `wireplumber`
+
+With an older PipeWire or WirePlumber, cardcast does not start the audio, because the sound could play back into the audio source; the status line says which one to update.
+
 ## Switching a monitor's input
 
 cardcast can switch a monitor's input over DDC/CI, as the monitor's own buttons do, for example to show the receiver on the AW2523HF and switch back.

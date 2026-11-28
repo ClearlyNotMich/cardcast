@@ -388,6 +388,9 @@ pub struct Settings {
     pub guard_enabled: bool,
     /// The settings cog's one toggle (SPEC section 11); while off, nothing is sent over DDC/CI.
     pub input_switching: bool,
+    /// The Linux screen-sharing portal's `restore_token`, which restores the shared source monitor
+    /// without its dialog (`mirror::linux::capture`); single-use, so each start replaces it.
+    pub restore_token: Option<String>,
 }
 
 impl Default for Settings {
@@ -402,6 +405,7 @@ impl Default for Settings {
             card_display_connector: None,
             guard_enabled: true,
             input_switching: false,
+            restore_token: None,
         }
     }
 }
@@ -468,6 +472,7 @@ impl Settings {
             ("send_windows_to", &self.send_windows_to),
             ("audio_source", &self.audio_source),
             ("card_display_connector", &self.card_display_connector),
+            ("restore_token", &self.restore_token),
         ] {
             if let Some(value) = value {
                 text.push_str(&format!("{key}={value}\n"));
@@ -490,6 +495,7 @@ impl Settings {
                 "send_windows_to" => settings.send_windows_to = value,
                 "audio_source" => settings.audio_source = value,
                 "card_display_connector" => settings.card_display_connector = value,
+                "restore_token" => settings.restore_token = value,
                 "sound_output" => {
                     settings.sound_output = SoundOutput::from_text(value.as_deref().unwrap_or(""));
                 }
@@ -537,6 +543,7 @@ mod tests {
             card_display_connector: Some(r"\\?\PCI#VEN_8086#3&1&0#{guid} target 4353".into()),
             guard_enabled: true,
             input_switching: true,
+            restore_token: Some("5d0b8a35-6f4c-4d0e-9a3e-1b2c3d4e5f60".into()),
         };
         assert_eq!(Settings::from_text(&saved.to_text()), saved);
     }

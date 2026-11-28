@@ -41,6 +41,7 @@ struct SettingsWindow {
     settings: Settings,
     monitors: Vec<Monitor>,
     playback_devices: Vec<AudioDevice>,
+    device_lister: audio::DeviceLister,
     /// The sound output dialog is open with this choice, not yet saved.
     choosing_sound_output: Option<SoundOutput>,
     status: StatusLine,
@@ -77,10 +78,6 @@ impl SettingsWindow {
             status.other = Some(error);
             Vec::new()
         });
-        let playback_devices = audio::playback_devices().unwrap_or_else(|error| {
-            status.other = Some(error);
-            Vec::new()
-        });
         let mut settings = Settings::load();
         let cleared = settings.clear_role_clashes();
         let mut settings = settings.with_defaults(&monitors);
@@ -92,6 +89,7 @@ impl SettingsWindow {
         }
         status.other = settings::notices(status.other, cleared);
         let relay_context = context.clone();
+        let lister_context = context.clone();
         let mirror_context = context.clone();
         let guard_context = context.clone();
         let input_context = context.clone();
@@ -112,7 +110,10 @@ impl SettingsWindow {
         Self {
             settings,
             monitors,
-            playback_devices,
+            playback_devices: Vec::new(),
+            device_lister: audio::DeviceLister::new(audio::playback_devices, move || {
+                lister_context.request_repaint()
+            }),
             choosing_sound_output: None,
             status,
             restart_at: Instant::now(),
@@ -137,6 +138,7 @@ impl SettingsWindow {
 
     /// Starts the mirror from saved settings; the window minimises once it runs.
     fn launch(&mut self, context: &egui::Context) {
+        self.device_lister.list();
         self.follow_input_switching(None, false);
         if settings::starts_on_launch(&self.settings) {
             // A problem found while loading outlives the start, which clears the status line's.
@@ -269,6 +271,9 @@ impl SettingsWindow {
         if let Some(report) = self.guard.take_report() {
             self.status.follow_guard(report);
         }
+        if let Some(devices) = self.device_lister.take() {
+            self.take_playback_devices(devices);
+        }
         match self.relay.take_report() {
             Some(RelayReport::Failing(problem)) => {
                 self.status.audio = Some(problem);
@@ -363,7 +368,7 @@ impl SettingsWindow {
     /// Re-reads the monitors after a display change and follows the source monitor and card display.
     fn follow_displays(&mut self) {
         // A card display's sound output comes and goes with it.
-        self.take_playback_devices(audio::playback_devices());
+        self.device_lister.list();
         match guard::monitors() {
             Ok(monitors) => self.follow_monitors(monitors),
             Err(error) => self.status.other = Some(error),
@@ -499,9 +504,10 @@ impl SettingsWindow {
         }
     }
 
-    /// Opens the sound output dialog with the saved choice, on a fresh list of playback devices.
+    /// Opens the sound output dialog with the saved choice; a fresh list of playback devices
+    /// follows.
     fn choose_sound_output(&mut self) {
-        self.take_playback_devices(audio::playback_devices());
+        self.device_lister.list();
         self.choosing_sound_output = Some(self.settings.sound_output.clone());
     }
 
@@ -625,11 +631,7 @@ impl SettingsWindow {
 
 /// The parts not built for this platform yet (#36): a lasting notice that Start and Stop don't clear.
 fn not_built_yet() -> Option<String> {
-    let parts: Vec<&str> = [mirror::NOT_BUILT, audio::NOT_BUILT]
-        .into_iter()
-        .flatten()
-        .collect();
-    (!parts.is_empty()).then(|| parts.join(" | "))
+    mirror::NOT_BUILT.map(str::to_owned)
 }
 
 fn update_guard(guard: &mut dyn Guard, settings: &Settings) {
@@ -852,6 +854,7 @@ mod tests {
             },
             monitors: vec![monitor("source", true), monitor("card", false)],
             playback_devices: Vec::new(),
+            device_lister: audio::DeviceLister::new(|| Ok(Vec::new()), || {}),
             choosing_sound_output: None,
             status: StatusLine::new(Status::Stopped),
             restart_at: Instant::now(),
@@ -1000,6 +1003,7 @@ mod tests {
             },
             monitors,
             playback_devices: Vec::new(),
+            device_lister: audio::DeviceLister::new(|| Ok(Vec::new()), || {}),
             choosing_sound_output: None,
             status: StatusLine::new(Status::Stopped),
             restart_at: Instant::now(),
@@ -1204,6 +1208,61 @@ mod tests {
             Some(first.device_path.as_str()),
             "the guard guards another card display than the mirror shows on"
         );
+    }
+
+    /// Held by `sound_output_dialog_opens_while_the_playback_devices_are_listed`; the listing waits on it.
+    static LISTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn listed_after_the_lock() -> Result<Vec<AudioDevice>, String> {
+        let _wait = LISTING.lock();
+        Ok(vec![AudioDevice {
+            id: "speakers".into(),
+            name: "Speakers".into(),
+            description: "Speakers".into(),
+            container_id: String::new(),
+        }])
+    }
+
+    #[test]
+    fn launch_lists_the_playback_devices_off_the_ui_thread() {
+        let mut window = window("card");
+        let (woken_sender, woken) = std::sync::mpsc::channel();
+        let woken_sender = std::sync::Mutex::new(woken_sender);
+        window.device_lister = audio::DeviceLister::new(listed_after_the_lock, move || {
+            let _ = woken_sender.lock().map(|sender| sender.send(()));
+        });
+        let listing = LISTING.lock().unwrap();
+        window.launch(&egui::Context::default());
+        assert!(
+            window.playback_devices.is_empty(),
+            "a hung PipeWire would block here"
+        );
+        drop(listing);
+        woken.recv_timeout(Duration::from_secs(10)).unwrap();
+        window.follow_reports();
+        assert_eq!(window.playback_devices.len(), 1);
+    }
+
+    #[test]
+    fn sound_output_dialog_opens_while_the_playback_devices_are_listed() {
+        let mut window = window("card");
+        let (woken_sender, woken) = std::sync::mpsc::channel();
+        let woken_sender = std::sync::Mutex::new(woken_sender);
+        window.device_lister = audio::DeviceLister::new(listed_after_the_lock, move || {
+            let _ = woken_sender.lock().map(|sender| sender.send(()));
+        });
+        let listing = LISTING.lock().unwrap();
+        window.choose_sound_output();
+        assert!(
+            window.choosing_sound_output.is_some(),
+            "a hung PipeWire would block here"
+        );
+        window.follow_reports();
+        assert!(window.playback_devices.is_empty());
+        drop(listing);
+        woken.recv_timeout(Duration::from_secs(10)).unwrap();
+        window.follow_reports();
+        assert_eq!(window.playback_devices.len(), 1);
     }
 
     #[test]

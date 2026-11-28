@@ -1,5 +1,13 @@
 [
   {
+    "id": 0,
+    "type": "PipeWire:Interface:Core",
+    "info": {
+      "version": "1.6.12",
+      "name": "pipewire-0"
+    }
+  },
+  {
     "id": 43,
     "type": "PipeWire:Interface:Device",
     "info": {
