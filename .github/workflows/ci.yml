@@ -88,7 +88,7 @@ jobs:
       # The window guard (#48) over sway's IPC: headless sway with two outputs and foot windows,
       # the pointer guard (#49) against a virtual mouse, then sway killed and started again under a
       # running guard.
-      - if: runner.os == 'Linux'
+      - if: ${{ !cancelled() && runner.os == 'Linux' }}
         name: Window guard and pointer guard on headless sway
         env:
           WLR_BACKENDS: headless
@@ -114,7 +114,7 @@ jobs:
       # GNOME Shell with two virtual monitors and cardcast's extension
       # (packaging/linux/usr/share/gnome-shell/extensions/), then the extension turned off and on
       # under a running guard.
-      - if: runner.os == 'Linux'
+      - if: ${{ !cancelled() && runner.os == 'Linux' }}
         name: Window guard, pointer guard and mirror window on headless GNOME Shell
         env:
           CARDCAST_GUARD_DESKTOP: gnome
