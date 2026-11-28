@@ -12,7 +12,7 @@
   <img src="docs/media/hero.png" width="560" alt="The cardcast settings window while the mirror runs: the live layout shows four monitors, and dots travel from the source monitor to the card display">
 </p>
 
-cardcast is a small Windows program for streaming with two PCs and a capture card. It runs on the sender, the PC the game runs on. The receiver needs no cardcast software: OBS on the receiver adds the capture card as a video source.
+cardcast is a small program for Windows and Linux (X11, KDE Plasma, GNOME, sway and Hyprland) for streaming with two PCs and a capture card. It runs on the sender, the PC the game runs on. The receiver needs no cardcast software: OBS on the receiver adds the capture card as a video source.
 
 ```mermaid
 flowchart LR
@@ -31,9 +31,9 @@ flowchart LR
 
 ## Get started in 3 steps
 
-1. **Download** `cardcast-v0.1.0.exe` from the [latest release](https://github.com/ClearlyNotMich/cardcast/releases/latest). There is no installer. It is unsigned, so SmartScreen asks first: **More info → Run anyway**.
-2. **Plug in** the capture card: its HDMI input into the sender's graphics card, its USB side into the receiver. In Windows Display settings, set the card display to **Extend these displays**, never Duplicate.
-3. **Run** `cardcast.exe` (not as administrator). Click a monitor in the live layout to make it the source monitor or the card display, and press **Start**. On the receiver, add the capture card as a video source in OBS.
+1. **Download** `cardcast-v<version>.exe` from the [latest release](https://github.com/ClearlyNotMich/cardcast/releases/latest). There is no installer. It is unsigned, so SmartScreen asks first: **More info → Run anyway**. On Linux, install the AUR package `cardcast-bin` (`yay -S cardcast-bin`, or any AUR helper), or take `cardcast-v<version>-linux-x86_64.tar.gz` from the latest release (see **Linux** below).
+2. **Plug in** the capture card: its HDMI input into the sender's graphics card, its USB side into the receiver. In Windows Display settings, set the card display to **Extend these displays**, never Duplicate. On Linux, make it a separate output in your desktop's display settings, never mirrored.
+3. **Run** `cardcast.exe` (not as administrator), or `cardcast` on Linux. Click a monitor in the live layout to make it the source monitor or the card display, and press **Start**. On the receiver, add the capture card as a video source in OBS.
 
 ## What it does
 
@@ -153,6 +153,10 @@ A higher rate costs the sender more: the mirror draws more often, and when the c
 - Changing the SDR content brightness slider in Windows while the mirror runs has no effect until the mirror is restarted.
 - A rotated (portrait) source monitor shows un-rotated in the mirror.
 - Pointer pixels that normally invert the screen are drawn black, so such a pointer can vanish on dark scenes.
+- On Linux, the pointer guard on Plasma uses KWin's fake input, which a later KWin may close.
+- On Hyprland, a fullscreen window on the card display stays there: Hyprland can't take it out of fullscreen without focusing it. The status line names it.
+- On Plasma, sway and Hyprland, a drag that starts off the card display (a button held down) can carry the pointer onto it until the button is let go.
+- On Plasma, sway and Hyprland the pointer guard's transparent layer sits over the mirror on the card display, so the desktop may no longer show the mirror directly (direct scanout) and may spend more work on it. Not yet measured.
 - If the mirror can't start or is interrupted for a reason that can pass (a monitor or graphics card going away, a driver reset, a mode change, a permission prompt), it tries again every second and the status line says why. A failure that can't pass (Windows or the graphics driver too old, a fault in cardcast) stops it with the reason; press Start to try again.
 - The primary monitor is taken to be the one at the top-left corner (0,0) of the Windows desktop. Not yet confirmed on the sender.
 - Automatic finds the card display's sound output by the container ID Windows gives a monitor and its HDMI sound, else by name. Not yet confirmed on the sender; choose the sound output yourself if it picks wrong.
@@ -162,9 +166,11 @@ A higher rate costs the sender more: the mirror draws more often, and when the c
 </details>
 
 <details>
-<summary><b>Linux (in progress, not released)</b></summary>
+<summary><b>Linux</b></summary>
 
-Linux support is being worked on ([#36](https://github.com/ClearlyNotMich/cardcast/issues/36)). No release includes it yet; from the next one on, a release has `cardcast-<version>-linux-x86_64.tar.gz` with its `.sha256`, and Arch users get the AUR package `cardcast-bin`. The tarball holds `cardcast`, `LICENSE`, this README, and under `usr/` the other files at their install paths: the input switching files below, and a `.desktop` file and icon (`sudo cp -r usr/share /usr/local/` puts cardcast in the app menu once `cardcast` is on your `PATH`). Parts not yet built for Linux say "does not work on Linux yet" in the status line. So far:
+cardcast runs on Linux from v0.2.0 on X11, KDE Plasma, GNOME, sway and Hyprland. Each release has `cardcast-v<version>-linux-x86_64.tar.gz` with its `.sha256`, and Arch users get the AUR package `cardcast-bin`. The tarball holds `cardcast`, `LICENSE`, this README, and under `usr/` the other files at their install paths: the i2c udev rule and module file for input switching (below), a `.desktop` file and icon, and the GNOME Shell extension under `usr/share/gnome-shell/extensions/`. The AUR package installs all of them. From the tarball, put `cardcast` on your `PATH` (for example `sudo cp cardcast /usr/local/bin/`); `sudo cp -r usr/share /usr/local/` then puts cardcast in the app menu.
+
+On Wayland the mirror captures the source monitor through your desktop's screen-sharing portal (`xdg-desktop-portal` with your desktop's backend, such as `xdg-desktop-portal-kde`). The first time the mirror starts, the desktop asks which monitor to share: pick the source monitor. The choice is remembered, so later starts and restarts of cardcast don't ask again, unless that monitor is gone. If the shared monitor is not the source monitor (for example after you chose another one) or you cancel, the status line says so; press Start to be asked again. On X11 there is no dialog.
 
 On Linux the sound goes through PipeWire, which needs PipeWire 0.3.44 or newer with its command-line tools (`pw-dump`, `pw-loopback`) and WirePlumber 0.4.12 or newer running:
 
