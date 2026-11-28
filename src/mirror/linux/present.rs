@@ -193,10 +193,8 @@ pub fn join_within<T>(thread: JoinHandle<T>, within: Duration) -> Option<std::th
 
 /// When to present next where the present doesn't wait for the card display's refresh (X11: a
 /// driver without vsync, or a software one): one refresh after the last planned present, or `now`
-/// after a stall, so missed refreshes don't come as a burst. An unknown refresh rate counts as 60 Hz.
-pub fn next_present(planned: Instant, now: Instant, refresh_hz: u32) -> Instant {
-    let refresh_hz = if refresh_hz == 0 { 60 } else { refresh_hz };
-    let period = Duration::from_secs(1) / refresh_hz;
+/// after a stall, so missed refreshes don't come as a burst.
+pub fn next_present(planned: Instant, now: Instant, period: Duration) -> Instant {
     let next = planned + period;
     if next + period < now { now } else { next }
 }
@@ -258,12 +256,15 @@ impl Thread {
         // Shown only once capture works, so a start that keeps failing never covers the card display.
         screen.show()?;
         // On X11 each loop is a full MIT-SHM grab too, so it keeps to the refresh whatever the driver does.
-        let paced = matches!(screen, Screen::X11(_));
+        let paced = match &screen {
+            Screen::X11(window) => Some(window.refresh),
+            Screen::Wayland(_) => None,
+        };
         let mut planned = Instant::now();
         while !self.quit.load(Ordering::Relaxed) {
-            if paced {
+            if let Some(refresh) = paced {
                 let now = Instant::now();
-                planned = next_present(planned, now, card_display.refresh_hz);
+                planned = next_present(planned, now, refresh);
                 std::thread::sleep(planned.saturating_duration_since(now));
             }
             screen.follow()?;

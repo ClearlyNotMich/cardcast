@@ -131,7 +131,9 @@ even after Stop; its picture then has no receiver and is dropped, ending the str
   with "needs the GNOME extension (Linux 9)". The surface shows with the first picture.
 - **Drawing**: `PresentMode::Fifo`, frame latency 1, a black clear, then the picture aspect-fitted
   with `mirror::fit`, each refresh; `presents()` counts the presents. On X11 the loop is also
-  capped at the card display's refresh (`present::next_present`), since a driver without vsync
+  capped at the card display's refresh (`present::next_present`), one period of its RandR mode
+  exactly (`screen::refresh_period`: dot clock / (htotal × vtotal), the lines halved for
+  `Interlace` and doubled for `DoubleScan` [9][10], so 59.94 Hz isn't taken as 59), since a driver without vsync
   (lavapipe measured 200-1000 a second) would otherwise grab with MIT-SHM that often.
 - **Memory frames** are uploaded with `write_texture`.
 - **DMA-BUF frames** are read as wlroots reads a client's DMA-BUF [7]: the device is opened with
@@ -149,7 +151,8 @@ even after Stop; its picture then has no receiver and is dropped, ending the str
   AMD tiled modifier); CI has no graphics card, so it takes the shared-memory path.
 
 **Stop** waits at most a second for the mirror thread; one stuck in the compositor (a Fifo present
-while the card display sleeps) is left to end on its own. Waiting for the layer surface's first
+while the card display sleeps) is left to end on its own; its overlay stays up, showing the last
+picture, until the display wakes, and a Start meanwhile adds a second overlay. Waiting for the layer surface's first
 configure is bounded to 5 seconds.
 
 ## Sources
@@ -169,3 +172,7 @@ configure is bounded to 5 seconds.
 (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`), <https://gitlab.freedesktop.org/wlroots/wlroots>
 [8] Linux, DMA-BUF sharing: "Implicit Fence Poll Support" and `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`,
 <https://docs.kernel.org/driver-api/dma-buf.html>, `include/uapi/linux/dma-buf.h`
+[9] RandR protocol, `MODEINFO` and `MODEFLAG` (`Interlace`, `DoubleScan`),
+<https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/blob/master/randrproto.txt>
+[10] xrandr, `mode_refresh` in `xrandr.c` (the refresh from a mode's timings and flags),
+<https://gitlab.freedesktop.org/xorg/app/xrandr/-/blob/master/xrandr.c>
