@@ -655,6 +655,7 @@ fn desktop_kwin_guard_leaves_cardcasts_overlays_on_the_card_display() {
     let _overlay = super::catcher::Catcher::start(&card.gdi_name, (card.left, card.top), |_| {})
         .unwrap()
         .unwrap();
+    kwin::LAYER_SHELL_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
     let overlay = WaylandWindow::watch(std::process::id(), None, "cardcast's overlay");
     assert!(mostly_on(overlay.frame(), card_rect));
     let mut guard = WindowGuard::new(Desktop::PlasmaWayland, super::monitors, || {});
@@ -669,6 +670,10 @@ fn desktop_kwin_guard_leaves_cardcasts_overlays_on_the_card_display() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(
+        kwin::LAYER_SHELL_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+        "the guard's script no longer recognises KWin's layer-shell surfaces"
+    );
 }
 
 /// Where the X pointer is.
