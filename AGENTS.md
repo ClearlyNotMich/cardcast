@@ -24,6 +24,7 @@ Cardcast mirrors a screen from the sender onto the card display, so a second PC 
 - Check the Windows-only code on Linux before pushing: `cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings` (one-time: `rustup target add x86_64-pc-windows-msvc`).
 - GitHub Actions builds the Windows `.exe` (artifact `cardcast-exe`) and the Linux tarball (artifact `cardcast-linux-x86_64.tar.gz`: the binary, `LICENSE`, `README.md`, `packaging/linux/`) on every push. The owner tests both on the sender.
 - See the settings window: `cargo test snapshot` renders it to `tests/snapshots/*.png` (Linux, lavapipe: `mesa-vulkan-drivers`); `UPDATE_SNAPSHOTS=1 cargo test snapshot` rewrites them after a UI change.
+- README media (`docs/media/`: the animated hero and the stills) come from the same fixtures: `UPDATE_README_MEDIA=1 cargo test readme_media` rewrites them; a plain `cargo test` never does.
 - Keep decisions in plain functions with no platform calls (for example "where does this window go", "which desktop is this"), so they can be unit-tested on Linux.
 
 ## Agent skills

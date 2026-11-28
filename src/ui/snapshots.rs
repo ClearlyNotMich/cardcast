@@ -1,6 +1,7 @@
 //! PNG snapshots of the settings window in its main states, from fake monitors and devices, so
 //! agents and reviewers can see the UI. Rendered with wgpu on a software rasteriser (lavapipe);
-//! `UPDATE_SNAPSHOTS=1 cargo test snapshot` rewrites them in `tests/snapshots/`.
+//! `UPDATE_SNAPSHOTS=1 cargo test snapshot` rewrites them in `tests/snapshots/`, and
+//! `UPDATE_README_MEDIA=1 cargo test readme_media` the README's media in `docs/media/`.
 
 use super::*;
 use crate::mirror::StandInMirror;
@@ -48,14 +49,15 @@ fn monitor(
     }
 }
 
-/// The real sender: a 1440p monitor left of the primary 1440p monitor, the 500 Hz source monitor
-/// right of it, all on the RTX 4080, and the capture card's display on the integrated graphics.
+/// The real sender, as measured on it: a 1440p monitor left of the primary 500 Hz 1440p monitor,
+/// the 360 Hz source monitor right of it, all on the RTX 4080, and the capture card's display on
+/// the integrated graphics.
 fn sender(status: Status) -> SettingsWindow {
     let mut window = super::tests::window("card");
     window.monitors = vec![
         monitor(
             "side",
-            "MSI MAG 272Q X50",
+            "Dell S2417DG",
             (2560, 1440),
             144,
             (-2560, 0),
@@ -63,9 +65,9 @@ fn sender(status: Status) -> SettingsWindow {
         ),
         monitor(
             "primary",
-            "Dell S2417DG",
+            "MSI MAG 272Q X50",
             (2560, 1440),
-            144,
+            500,
             (0, 0),
             RTX_4080,
         ),
@@ -73,7 +75,7 @@ fn sender(status: Status) -> SettingsWindow {
             "source",
             "Dell AW2523HF",
             (1920, 1080),
-            500,
+            360,
             (2560, 180),
             RTX_4080,
         ),
@@ -262,7 +264,7 @@ fn snapshot_role_menu_opens_on_a_monitor_click() {
     harness.snapshot("role_menu");
 }
 
-/// Input switching on: the source monitor (DisplayPort 1, HDMI 1, HDMI 2) and the side monitor
+/// Input switching on: the source monitor (DisplayPort 1, HDMI 1, HDMI 2) and the primary monitor
 /// (DisplayPort 1, HDMI 1) have input lists, the others don't answer DDC/CI.
 fn with_input_lists(mut window: SettingsWindow) -> SettingsWindow {
     window.settings.input_switching = true;
@@ -277,7 +279,7 @@ fn with_input_lists(mut window: SettingsWindow) -> SettingsWindow {
             },
             inputs: match monitor.device_path.as_str() {
                 "source" => Some(vec![0x0F, 0x11, 0x12]),
-                "side" => Some(vec![0x0F, 0x11]),
+                "primary" => Some(vec![0x0F, 0x11]),
                 _ => None,
             },
         })
@@ -368,4 +370,103 @@ fn the_guard_switch_is_read_once_and_its_text_toggles_it() {
     switch.click();
     harness.run();
     assert!(!*harness.state());
+}
+
+/// The README's media in `docs/media/`: an animated hero of the running settings window and three
+/// stills. Only `UPDATE_README_MEDIA=1 cargo test readme_media` writes them.
+#[test]
+fn readme_media() {
+    // One loop is two trips of the dots (1.4 s each); 25 frames a second.
+    const FRAMES: u16 = 70;
+    const FPS: u16 = 25;
+    let write = std::env::var_os("UPDATE_README_MEDIA").is_some();
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/media");
+    let _device = one_device_at_a_time();
+
+    let mut window = sender(Status::Running);
+    window.frame_rate.shown = Some(60.0);
+    let mut live = harness(window);
+    live.run();
+    let mut frames = Vec::new();
+    for frame in 0..FRAMES {
+        live.input_mut().time = Some(f64::from(frame) / f64::from(FPS));
+        live.step();
+        frames.push(live.render().unwrap());
+    }
+    drop(live);
+    // The dots move from frame to frame.
+    assert_ne!(frames[0], frames[1]);
+    if write {
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = std::fs::File::create(dir.join("hero.png")).unwrap();
+        let mut encoder = png::Encoder::new(
+            std::io::BufWriter::new(file),
+            frames[0].width(),
+            frames[0].height(),
+        );
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_compression(png::Compression::High);
+        encoder.set_animated(u32::from(FRAMES), 0).unwrap();
+        encoder.set_frame_delay(1, FPS).unwrap();
+        encoder.set_blend_op(png::BlendOp::Over).unwrap();
+        let mut writer = encoder.write_header().unwrap();
+        let mut previous: Option<&[u8]> = None;
+        for frame in &frames {
+            // Each frame after the first keeps only the pixels that changed; the rest are
+            // transparent, so the frame blends over the one before and compresses to little.
+            let pixels: Vec<u8> = match previous {
+                None => frame.as_raw().clone(),
+                Some(previous) => frame
+                    .as_raw()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(previous.as_chunks::<4>().0)
+                    .flat_map(|(now, then)| if now == then { [0; 4] } else { *now })
+                    .collect(),
+            };
+            writer.write_image_data(&pixels).unwrap();
+            previous = Some(frame.as_raw());
+        }
+        writer.finish().unwrap();
+    }
+
+    let stills: [(&str, SettingsWindow, Option<&str>); 3] = [
+        (
+            "sound_output",
+            {
+                let mut window = sender(Status::Running);
+                window.frame_rate.shown = Some(60.0);
+                window.choosing_sound_output = Some(SoundOutput::Automatic);
+                window
+            },
+            None,
+        ),
+        (
+            "input_menu",
+            {
+                let mut window = with_input_lists(sender(Status::Running));
+                window.frame_rate.shown = Some(60.0);
+                window.current_input = Some(("source".into(), 0x0F));
+                window
+            },
+            Some("Inputs of Dell AW2523HF"),
+        ),
+        (
+            "settings_cog",
+            with_input_lists(sender(Status::Stopped)),
+            Some("Settings"),
+        ),
+    ];
+    for (name, window, click) in stills {
+        let mut harness = harness(window);
+        if let Some(label) = click {
+            harness.get_by_label(label).click();
+        }
+        harness.run();
+        let image = harness.render().unwrap();
+        if write {
+            image.save(dir.join(format!("{name}.png"))).unwrap();
+        }
+    }
 }
