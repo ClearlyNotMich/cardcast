@@ -94,7 +94,7 @@ One guard checkbox switches the window guard and the pointer guard on and off to
 - "Change" opens a dialog with one dropdown (Automatic, the playback devices except the audio source, No audio) and Save / Cancel. When Automatic finds no sound output, the status line says so in plain words and shows a "Choose sound output" button that opens the same dialog. The audio source dropdown never offers the sound output in use.
 - The window repaints on user input or when the mirror or window guard reports a status change. While the mirror starts, runs or restarts, its status indicator and the dots travelling along the live layout's arc animate at most about 30 times a second while the window has focus. Without focus nothing animates, and only a running mirror's frame rate refreshes, once a second; never while minimised.
 - Closing the window quits cardcast. When launched with saved settings that start the mirror successfully, the window starts minimised.
-- On Linux the window runs with the mirror and window guard replaced by stand-ins, so the layout can be checked during development.
+- On Linux the window guard is real on X11 and Plasma; on other desktops, and for parts not built for Linux yet, the status line says so. The stand-in mirror and guard are test-only, for the snapshots.
 
 ## 7. Audio
 

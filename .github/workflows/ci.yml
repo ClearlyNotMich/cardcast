@@ -56,6 +56,29 @@ jobs:
           CARDCAST_EXPECT_PLUGGED='HEADLESS-1 720x1280 480x853+1280+0; HEADLESS-2 1280x720 1280x720+0+0 primary; HEADLESS-3 1920x1080 1920x1080+1760+0' \
             cargo test guard::linux::tests::desktop_hotplug -- --nocapture || failed=1
           exit $failed
+      # The window guard (#47) through EWMH: Xvfb split into two RandR monitors, with openbox.
+      - if: runner.os == 'Linux'
+        name: Window guard on Xvfb with openbox
+        env:
+          CARDCAST_GUARD_DESKTOP: openbox
+        run: |
+          sudo apt-get install -y openbox x11-xserver-utils x11-utils
+          export DISPLAY=:99
+          # -noreset: the X server would drop the monitors once the last client leaves.
+          Xvfb :99 -screen 0 2560x1024x24 -noreset &
+          xvfb=$!
+          # Later steps' xvfb-run takes :99 too, so this X server and its window manager end with the step.
+          trap 'kill $openbox $xvfb 2>/dev/null; wait $xvfb 2>/dev/null' EXIT
+          for _ in $(seq 50); do xprop -root >/dev/null 2>&1 && break; sleep 0.2; done
+          xrandr --setmonitor left 1280/338x1024/270+0+0 screen
+          xrandr --setmonitor right 1280/338x1024/270+1280+0 none
+          xrandr --listmonitors
+          openbox &
+          openbox=$!
+          for _ in $(seq 50); do xprop -root _NET_SUPPORTING_WM_CHECK | grep -q window && break; sleep 0.2; done
+          # openbox names itself before it has finished starting (a window mapped then went unmanaged once).
+          sleep 1
+          cargo test guard_tests -- --nocapture --test-threads=1
       # The mirror capture (#42): a frame of a known colour through MIT-SHM on Xvfb, and through
       # xdg-desktop-portal-wlr and PipeWire on headless sway. -noreset keeps xsetroot's colour.
       - if: runner.os == 'Linux'
@@ -183,6 +206,14 @@ jobs:
           $b = [IO.File]::ReadAllBytes("target\release\cardcast.exe")
           $subsystem = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3c) + 24 + 68)
           if ($subsystem -ne 2) { throw "cardcast.exe subsystem is $subsystem, expected 2 (Windows GUI)" }
+
+  # The window guard's KWin script (#47) on kwin_wayland --virtual in an Arch container; see the script.
+  kwin:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: .github/ci/kwin-guard.sh
 
   # Adds two virtual monitors (docs/research/ci-second-monitor.md) and runs the second_monitor tests.
   # The driver is third-party and its certificate becomes a trusted root, so this job gets no secrets and read-only access.
