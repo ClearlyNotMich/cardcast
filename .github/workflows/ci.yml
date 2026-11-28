@@ -66,11 +66,15 @@ jobs:
           export DISPLAY=:99
           # -noreset: the X server would drop the monitors once the last client leaves.
           Xvfb :99 -screen 0 2560x1024x24 -noreset &
+          xvfb=$!
+          # Later steps' xvfb-run takes :99 too, so this X server and its window manager end with the step.
+          trap 'kill $openbox $xvfb 2>/dev/null; wait $xvfb 2>/dev/null' EXIT
           for _ in $(seq 50); do xprop -root >/dev/null 2>&1 && break; sleep 0.2; done
           xrandr --setmonitor left 1280/338x1024/270+0+0 screen
           xrandr --setmonitor right 1280/338x1024/270+1280+0 none
           xrandr --listmonitors
           openbox &
+          openbox=$!
           for _ in $(seq 50); do xprop -root _NET_SUPPORTING_WM_CHECK | grep -q window && break; sleep 0.2; done
           # openbox names itself before it has finished starting (a window mapped then went unmanaged once).
           sleep 1
