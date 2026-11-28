@@ -34,6 +34,14 @@ function id(window) {
 
 function check(window) {
     if (stopped || window.deleted) return;
+    // Layer-shell surfaces, cardcast's mirror and pointer catcher among them, are pinned to their
+    // output and KWin calls them normal windows; it can't move them to another output, so the guard
+    // leaves them be (#60). KWin 6.8's moveableAcrossScreens is false for every layer-shell window
+    // (LayerShellV1Window::isMovableAcrossScreens) and, unlike isMovable, has no fullscreen check,
+    // so a fullscreen toplevel is still guarded (XdgToplevelWindow::isMovableAcrossScreens):
+    // https://invent.kde.org/plasma/kwin/-/blob/6dd0b8b840864ae393e5c5f25c472e5e798eec99/src/layershellv1window.cpp#L123-126
+    // https://invent.kde.org/plasma/kwin/-/blob/6dd0b8b840864ae393e5c5f25c472e5e798eec99/src/xdgshellwindow.cpp#L424-453
+    if (!window.moveableAcrossScreens) return;
     // A window being dragged or resized is checked when that ends (moveResizedChanged).
     if (window.move || window.resize) return;
     const g = window.frameGeometry;

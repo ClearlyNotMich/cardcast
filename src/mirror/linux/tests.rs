@@ -882,3 +882,15 @@ fn desktop_gnome_mirror_window_is_fullscreen_on_the_card_display_without_the_foc
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// The `wl_output` names of the owner's Plasma desktop (#60), in the order KWin lists them, with
+/// the card display (an Elgato HD60 X) on HDMI-A-2 and the source monitor on DP-3.
+#[test]
+fn the_mirror_goes_on_the_card_displays_output_and_never_another() {
+    use super::screen::card_output;
+    let names = ["DP-1", "HDMI-A-2", "DP-2", "DP-3"].map(|name| Some(name.to_owned()));
+    assert_eq!(card_output(&names, "HDMI-A-2"), Some(1));
+    assert_eq!(card_output(&names, "DP-3"), Some(3));
+    assert_eq!(card_output(&names, "HDMI-A-1"), None);
+    assert_eq!(card_output(&[None, None], "HDMI-A-2"), None);
+}

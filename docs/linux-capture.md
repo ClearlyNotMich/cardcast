@@ -155,6 +155,19 @@ while the card display sleeps) is left to end on its own; its overlay stays up, 
 picture, until the display wakes, and a Start meanwhile adds a second overlay. Waiting for the layer surface's first
 configure is bounded to 5 seconds.
 
+**One Vulkan instance for the process** (`gpu::instance`, #60): the mirror makes its wgpu Vulkan
+instance once and never destroys it; don't destroy it. On the owner's sender (KDE Plasma 6.8
+Wayland, NVIDIA 620.73.04 on an RTX 4080, the card display on a Radeon 610M) each Start made an
+instance and each Stop destroyed it, and the settings window's next paint, on egui-wgpu's own
+Vulkan instance, crashed: `egui_wgpu::winit::Painter::paint_and_update_textures` →
+`wgpu_hal::vulkan::swapchain::native::NativeSwapchain::acquire` →
+`ash::khr::swapchain::Device::acquire_next_image` → `libnvidia-glcore.so.620.73.04` → address 0
+(SIGSEGV, gdb; every first Stop). Keeping the instance alone fixed it (20 Start/Stop cycles with no
+crash). The NVIDIA forum reports the same with 580.196.07 [11]: destroying a Vulkan instance that
+made Wayland WSI queries breaks WSI calls on the instances still alive. The limit: Vulkan drivers (Mesa's
+included) list their graphics cards once per instance and keep that list, so a graphics card added
+after launch (an eGPU) isn't offered to the mirror until cardcast restarts.
+
 ## Sources
 
 [1] xdg-desktop-portal, `org.freedesktop.portal.ScreenCast.xml`,
@@ -176,3 +189,6 @@ configure is bounded to 5 seconds.
 <https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/blob/master/randrproto.txt>
 [10] xrandr, `mode_refresh` in `xrandr.c` (the refresh from a mode's timings and flags),
 <https://gitlab.freedesktop.org/xorg/app/xrandr/-/blob/master/xrandr.c>
+[11] NVIDIA developer forums, "Vulkan Wayland WSI: destroying any WSI-initialized VkInstance
+invalidates WSI queries on surviving instances (580.196.07)",
+<https://forums.developer.nvidia.com/t/388404>

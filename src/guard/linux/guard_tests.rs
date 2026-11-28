@@ -513,13 +513,19 @@ probe.start();
 
 /// A native Wayland window, watched and moved through the probe script; closed on drop.
 struct WaylandWindow {
-    client: std::process::Child,
+    client: Option<std::process::Child>,
     probed: Arc<Mutex<Probed>>,
     _bus: zbus::blocking::Connection,
 }
 
 impl WaylandWindow {
     fn open(program: &str) -> Self {
+        let client = std::process::Command::new(program).spawn().unwrap();
+        Self::watch(client.id(), Some(client), program)
+    }
+
+    /// Watches the windows of process `pid`, `what` in messages; the last one seen is reported.
+    fn watch(pid: u32, client: Option<std::process::Child>, what: &str) -> Self {
         let probed = Arc::new(Mutex::new(Probed::default()));
         let bus = zbus::blocking::connection::Builder::session()
             .unwrap()
@@ -527,10 +533,9 @@ impl WaylandWindow {
             .unwrap()
             .build()
             .unwrap();
-        let client = std::process::Command::new(program).spawn().unwrap();
         let file = std::env::temp_dir().join("cardcast-test-probe.js");
         let script = PROBE_SCRIPT
-            .replace("@PID@", &client.id().to_string())
+            .replace("@PID@", &pid.to_string())
             .replace("@SERVICE@", bus.unique_name().unwrap().as_str());
         std::fs::write(&file, script).unwrap();
         let _ = kwin_scripting("unloadScript", &"cardcast-test-probe");
@@ -545,7 +550,7 @@ impl WaylandWindow {
             probed,
             _bus: bus,
         };
-        wait_for(&format!("{program} to open"), || window.seen().is_some());
+        wait_for(&format!("{what} to open"), || window.seen().is_some());
         // KWin may still be placing the new window; a move before then is lost.
         std::thread::sleep(Duration::from_millis(500));
         window
@@ -570,8 +575,10 @@ impl WaylandWindow {
 
 impl Drop for WaylandWindow {
     fn drop(&mut self) {
-        let _ = self.client.kill();
-        let _ = self.client.wait();
+        if let Some(client) = &mut self.client {
+            let _ = client.kill();
+            let _ = client.wait();
+        }
         let _ = kwin_scripting("unloadScript", &"cardcast-test-probe");
     }
 }
@@ -631,6 +638,37 @@ fn desktop_kwin_guard_returns_a_wayland_window() {
         },
     );
     assert!(!unmaximised, "KWin unmaximised the window on its way");
+}
+
+/// `CARDCAST_GUARD_DESKTOP=kwin` (CI): cardcast's own layer-shell overlay on the card display, as
+/// the mirror and the pointer guard's catcher are, stays there while the guard runs. KWin calls
+/// such a surface a normal window, and the guard used to send it to the "send windows to" monitor,
+/// where the mirror then captured itself (#60).
+#[test]
+fn desktop_kwin_guard_leaves_cardcasts_overlays_on_the_card_display() {
+    if std::env::var("CARDCAST_GUARD_DESKTOP").as_deref() != Ok("kwin") {
+        return;
+    }
+    let monitors = super::monitors().unwrap();
+    let card = monitors.iter().find(|m| !m.primary).unwrap();
+    let card_rect = monitor_rect(card);
+    let _overlay = super::catcher::Catcher::start(&card.gdi_name, (card.left, card.top), |_| {})
+        .unwrap()
+        .unwrap();
+    let overlay = WaylandWindow::watch(std::process::id(), None, "cardcast's overlay");
+    assert!(mostly_on(overlay.frame(), card_rect));
+    let mut guard = WindowGuard::new(Desktop::PlasmaWayland, super::monitors, || {});
+    guard.update(true, Some(&card.device_path), None);
+    // The guard checks every window once it starts, and its own catcher opens there too.
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let frame = overlay.frame();
+        assert!(
+            mostly_on(frame, card_rect),
+            "the guard moved cardcast's overlay to {frame:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Where the X pointer is.
