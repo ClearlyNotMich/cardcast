@@ -1,7 +1,8 @@
 //! The window guard on GNOME, through cardcast's GNOME Shell extension
 //! (`packaging/gnome-extension/`; docs/research/linux-support.md, section 5): only the Shell can
 //! move other programs' windows there. The extension lists and moves the windows on the session
-//! bus and signals each change; the decisions stay here. The same extension keeps the mirror from
+//! bus and signals each change to the connections that called its `Connect`; the decisions stay
+//! here. The same extension keeps the mirror from
 //! taking the focus, so the mirror needs it too.
 
 use super::super::placement::{Placement, Rect, WindowState};
@@ -81,17 +82,40 @@ impl Compositor for Gnome {
             .build();
         let changes = zbus::blocking::MessageIterator::for_match_rule(rule, &connection, None)
             .map_err(|error| error.to_string())?;
+        // The extension turned off or GNOME Shell gone: its name changes owner.
+        let owner = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender("org.freedesktop.DBus")
+            .and_then(|rule| rule.member("NameOwnerChanged"))
+            .and_then(|rule| rule.arg(0, NAME))
+            .map_err(|error| error.to_string())?
+            .build();
+        let owner = zbus::blocking::MessageIterator::for_match_rule(owner, &connection, None)
+            .map_err(|error| error.to_string())?;
         if !extension_running(&connection) {
             return Err("the extension is not running".into());
         }
+        let gnome = Self { connection };
+        gnome.call::<_, ()>("Connect", &())?;
+        let events = std::sync::Arc::new(events);
+        let changed = events.clone();
         std::thread::spawn(move || {
             for _ in changes {
-                if !events.changed() {
+                if !changed.changed() {
                     return;
                 }
             }
         });
-        Ok(Self { connection })
+        std::thread::spawn(move || {
+            if owner
+                .into_iter()
+                .next()
+                .is_some_and(|message| message.is_ok())
+            {
+                events.gone();
+            }
+        });
+        Ok(gnome)
     }
 
     fn windows(&mut self) -> Result<Vec<Window>, String> {

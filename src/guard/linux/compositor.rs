@@ -42,6 +42,10 @@ pub trait Compositor: Sized {
     fn windows(&mut self) -> Result<Vec<Window>, String>;
     /// The output's work area: the output less its panels.
     fn work_area(&mut self, output: &str) -> Option<Rect>;
+    /// Whether `apply` can move `window` without taking the focus; if not, the guard gives up on it.
+    fn moves(_window: &Window) -> bool {
+        true
+    }
     /// Carries out `placement` for `window`; `send_windows_to` names the output to send it to.
     fn apply(&mut self, window: &Window, placement: Placement, send_windows_to: &str);
 }
@@ -222,16 +226,25 @@ impl<C: Compositor> Serving<'_, C> {
                 self.next_id += 1;
                 self.next_id
             });
+            let moves = C::moves(window);
+            if moves {
+                self.guarding.movable_again(id);
+            }
             let placement = self
                 .guarding
                 .check(id, &window.title, window.state, false, now);
-            if matches!(placement, Placement::MoveTo(_) | Placement::Maximise { .. }) {
+            if !matches!(placement, Placement::MoveTo(_) | Placement::Maximise { .. }) {
+                continue;
+            }
+            if moves {
                 let output = self
                     .guarding
                     .send_windows_to_output()
                     .unwrap_or_default()
                     .to_owned();
                 self.compositor.apply(window, placement, &output);
+            } else {
+                self.guarding.give_up_fullscreen(id);
             }
         }
         let closed: Vec<String> = self
@@ -364,6 +377,9 @@ mod tests {
                 }
             })
         }
+        fn moves(window: &Window) -> bool {
+            !window.state.maximised
+        }
         fn work_area(&mut self, output: &str) -> Option<Rect> {
             (output == "DP-1").then(|| rect(0, 30, 1920, 1080))
         }
@@ -390,6 +406,17 @@ mod tests {
     #[test]
     fn a_window_on_the_card_display_is_returned_and_the_compositor_going_away_is_said_and_followed()
     {
+        // One the fake can't move: fullscreen, as on Hyprland.
+        let fullscreen = Window {
+            id: "f".into(),
+            title: "Game".into(),
+            state: WindowState {
+                frame: rect(1920, 0, 3840, 1080),
+                maximised: true,
+                ..WindowState::default()
+            },
+            floating: false,
+        };
         let on_card = Window {
             id: "a".into(),
             title: "Kate".into(),
@@ -401,7 +428,7 @@ mod tests {
         };
         shared(|shared| {
             shared.up = false;
-            shared.windows = vec![on_card.clone()];
+            shared.windows = vec![on_card.clone(), fullscreen];
         });
         let (reports, received) = mpsc::channel();
         let guarding = Guarding::new("HDMI-A-1", None, monitors, reports, Arc::new(|| {}));
@@ -430,12 +457,16 @@ mod tests {
                 "DP-1".into()
             )
         );
-        assert_eq!(
-            status(),
-            Some(GuardReport::Notice(
-                super::super::window_guard::NO_POINTER_GUARD.into()
-            ))
+        let left_alone = GuardReport::Notice(
+            "\"Game\" is fullscreen on the card display; cardcast can't move it without taking focus. Take it out of fullscreen or move it off to guard it again.".into(),
         );
+        wait_for("the fullscreen window to be named", || {
+            status() == Some(left_alone.clone())
+        });
+        assert!(shared(|shared| shared
+            .applied
+            .iter()
+            .all(|(id, ..)| id == "a")));
 
         // It goes away: said, and back on the next connection.
         shared(|shared| {

@@ -3,9 +3,12 @@
 // guard, which decides where each goes. It also keeps cardcast's mirror, a fullscreen window on the
 // card display, from taking the focus: whenever the mirror gets it, it goes straight back.
 //
-// cardcast talks to it on the session bus, as io.github.ClearlyNotMich.cardcast.Shell.
+// cardcast talks to it on the session bus, as io.github.ClearlyNotMich.cardcast.Shell. Only
+// connections that called Connect get the window list and the Changed signal, sent to each alone,
+// so other programs on the bus don't hear of every window.
 
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
@@ -15,6 +18,7 @@ const PATH = '/io/github/ClearlyNotMich/cardcast/Shell';
 const MIRROR = 'io.github.ClearlyNotMich.cardcast.Mirror';
 
 const INTERFACE = `<node><interface name="${NAME}">
+  <method name="Connect"/>
   <method name="Windows"><arg type="a(sssb)" direction="out"/></method>
   <method name="WorkArea"><arg type="s" direction="in"/><arg type="(iiii)" direction="out"/></method>
   <method name="Move">
@@ -54,6 +58,8 @@ const monitorIndex = connector => {
 export default class CardcastExtension extends Extension {
     enable() {
         this._lastFocus = null;
+        // Connected bus names, each with its watch that forgets it when it leaves the bus.
+        this._clients = new Map();
         this._object = Gio.DBusExportedObject.wrapJSObject(INTERFACE, this);
         this._object.export(Gio.DBus.session, PATH);
         this._name = Gio.bus_own_name_on_connection(Gio.DBus.session, NAME,
@@ -79,6 +85,9 @@ export default class CardcastExtension extends Extension {
         global.backend.get_monitor_manager().disconnectObject(this);
         for (const window of this._all())
             window.disconnectObject(this);
+        for (const watch of this._clients.values())
+            Gio.bus_unwatch_name(watch);
+        this._clients = null;
         this._lastFocus = null;
     }
 
@@ -96,7 +105,21 @@ export default class CardcastExtension extends Extension {
     }
 
     _changed() {
-        this._object?.emit_signal('Changed', null);
+        for (const client of this._clients?.keys() ?? [])
+            Gio.DBus.session.emit_signal(client, PATH, NAME, 'Changed', null);
+    }
+
+    // The caller gets the window list and Changed until it leaves the bus.
+    ConnectAsync(_parameters, invocation) {
+        const client = invocation.get_sender();
+        if (!this._clients.has(client)) {
+            this._clients.set(client, Gio.bus_watch_name_on_connection(Gio.DBus.session, client,
+                Gio.BusNameWatcherFlags.NONE, null, () => {
+                    Gio.bus_unwatch_name(this._clients.get(client));
+                    this._clients.delete(client);
+                }));
+        }
+        invocation.return_value(null);
     }
 
     _keepFocusOffMirror() {
@@ -126,8 +149,21 @@ export default class CardcastExtension extends Extension {
     // Each window the guard looks at: its id, "<left> <top> <right> <bottom> <maximised>
     // <minimised> <tool>" (the flags 0 or 1, a fullscreen window counting as maximised), its title,
     // and whether it is cardcast's mirror, which the guard never moves. Utility windows, toolbars
-    // and windows kept off the taskbar (dialogs, desktop icons) count as tools.
-    Windows() {
+    // and windows kept off the taskbar (dialogs, desktop icons) count as tools. Connected callers only.
+    WindowsAsync(_parameters, invocation) {
+        if (!this._clients.has(invocation.get_sender())) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.AccessDenied',
+                'Call Connect first.');
+            return;
+        }
+        try {
+            invocation.return_value(new GLib.Variant('(a(sssb))', [this._windows()]));
+        } catch (error) {
+            invocation.return_dbus_error('org.freedesktop.DBus.Error.Failed', String(error));
+        }
+    }
+
+    _windows() {
         return this._all()
             .filter(window => !window.is_override_redirect() &&
                 GUARDED.includes(window.get_window_type()))

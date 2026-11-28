@@ -10,7 +10,7 @@ use super::gnome::Gnome;
 use super::hyprland::Hyprland;
 use super::sway::Sway;
 use super::{compositor, ewmh, kwin};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
@@ -64,6 +64,8 @@ pub struct Guarding {
     problem: Option<String>,
     history: ReturnHistory,
     titles: HashMap<isize, String>,
+    /// Windows given up on because they are fullscreen and can't be moved without the focus.
+    fullscreen: HashSet<isize>,
     reports: Sender<GuardReport>,
     wake: Wake,
 }
@@ -85,6 +87,7 @@ impl Guarding {
             problem: None,
             history: ReturnHistory::default(),
             titles: HashMap::new(),
+            fullscreen: HashSet::new(),
             reports,
             wake,
         }
@@ -169,6 +172,21 @@ impl Guarding {
         self.report();
     }
 
+    /// Gives up on window `id`, fullscreen on the card display, which the desktop can't move
+    /// without taking the focus (Hyprland), and says so in the status line.
+    pub fn give_up_fullscreen(&mut self, id: isize) {
+        self.fullscreen.insert(id);
+        self.give_up(id);
+    }
+
+    /// Window `id` can be moved again (it left fullscreen): it is guarded again.
+    pub fn movable_again(&mut self, id: isize) {
+        if self.fullscreen.remove(&id) {
+            self.history.forget(id);
+            self.report();
+        }
+    }
+
     /// A helper's own notice for the status line, such as KWin being gone.
     pub fn notice(&self, notice: &str) {
         let _ = self.reports.send(GuardReport::Notice(notice.to_owned()));
@@ -178,20 +196,26 @@ impl Guarding {
     /// Window `id` closed.
     pub fn forget(&mut self, id: isize) {
         self.titles.remove(&id);
+        self.fullscreen.remove(&id);
         if self.history.forget(id) {
             self.report();
         }
     }
 
     fn report(&self) {
-        let title = self
-            .history
-            .latest_given_up()
-            .and_then(|id| self.titles.get(&id));
-        let _ = self.reports.send(honest(placement::notice(
-            self.problem.as_deref(),
-            title.map(String::as_str),
-        )));
+        let latest = self.history.latest_given_up();
+        let title = latest
+            .and_then(|id| self.titles.get(&id))
+            .map(String::as_str);
+        let report = match (self.problem.as_deref(), title) {
+            (None, Some(title)) if latest.is_some_and(|id| self.fullscreen.contains(&id)) => {
+                GuardReport::Notice(format!(
+                    "\"{title}\" is fullscreen on the card display; cardcast can't move it without taking focus. Take it out of fullscreen or move it off to guard it again."
+                ))
+            }
+            (problem, title) => placement::notice(problem, title),
+        };
+        let _ = self.reports.send(honest(report));
         (self.wake)();
     }
 }
@@ -504,6 +528,33 @@ mod tests {
             guarding.check(3, "Stubborn", maximised, false, Instant::now()),
             Placement::Stay
         );
+    }
+
+    #[test]
+    fn a_fullscreen_window_left_alone_is_named_until_it_leaves_fullscreen() {
+        let (mut guarding, reports) = guarding(None);
+        guarding.follow_displays(work_area);
+        let _ = guarding.check(4, "Game", on_card(), false, Instant::now());
+        guarding.give_up_fullscreen(4);
+        assert_eq!(
+            reports.try_iter().last(),
+            Some(GuardReport::Notice(
+                "\"Game\" is fullscreen on the card display; cardcast can't move it without taking focus. Take it out of fullscreen or move it off to guard it again.".into()
+            ))
+        );
+        assert_eq!(
+            guarding.check(4, "Game", on_card(), false, Instant::now()),
+            Placement::Stay
+        );
+        guarding.movable_again(4);
+        assert_eq!(
+            reports.try_iter().last(),
+            Some(GuardReport::Notice(NO_POINTER_GUARD.into()))
+        );
+        assert!(matches!(
+            guarding.check(4, "Game", on_card(), false, Instant::now()),
+            Placement::MoveTo(_)
+        ));
     }
 
     #[test]

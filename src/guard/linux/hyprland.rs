@@ -1,11 +1,13 @@
 //! The window guard on Hyprland, over its IPC sockets (<https://wiki.hypr.land/IPC/>): events on
 //! `.socket2.sock` say when to look, and one request per connection on `.socket.sock` lists the
 //! windows (`j/clients`) and moves them with the `movewindowpixel` and `movetoworkspacesilent`
-//! dispatchers, which leave the focus alone (docs/research/linux-support.md, section 5). Hyprland
-//! freezes while a request socket stays open, so each request has a timeout and is closed at once.
+//! dispatchers, which leave the focus alone (docs/research/linux-support.md, section 5). Hyprland's
+//! fullscreen dispatchers act on the focused window only, so a fullscreen window on the card display
+//! is left there and named in the status line. Hyprland freezes while a request socket stays open,
+//! so each request has a timeout and is closed at once.
 
 use super::super::placement::{Placement, Rect, WindowState};
-use super::compositor::{Compositor, Events, Window, candidates};
+use super::compositor::{Compositor, Events, Window};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -64,15 +66,10 @@ impl Compositor for Hyprland {
     }
 
     fn connect(events: Events) -> Result<Self, String> {
-        let own = directory()?;
-        // A restarted Hyprland has a new signature, so a directory of its own beside this one.
-        let (directory, stream) = candidates(&own, |_| true)
-            .into_iter()
-            .find_map(|directory| {
-                let stream = UnixStream::connect(directory.join(".socket2.sock")).ok()?;
-                Some((directory, stream))
-            })
-            .ok_or_else(|| format!("no Hyprland at {}", own.display()))?;
+        // Only this session's instance: never another one's directory, such as a nested Hyprland.
+        let directory = directory()?;
+        let stream = UnixStream::connect(directory.join(".socket2.sock"))
+            .map_err(|error| format!("no Hyprland at {}: {error}", directory.display()))?;
         let reader = stream.try_clone().map_err(|error| error.to_string())?;
         std::thread::spawn(move || {
             // One `event>>data` line per event; any of them may have moved a window.
@@ -95,6 +92,10 @@ impl Compositor for Hyprland {
 
     fn work_area(&mut self, output: &str) -> Option<Rect> {
         work_area(&json(&self.directory, "j/monitors").ok()?, output)
+    }
+
+    fn moves(window: &Window) -> bool {
+        moves(window)
     }
 
     fn apply(&mut self, window: &Window, placement: Placement, send_windows_to: &str) {
@@ -186,9 +187,15 @@ pub fn work_area(monitors: &Value, output: &str) -> Option<Rect> {
     })
 }
 
+/// Whether the guard can move `window`: not a fullscreen one, which would stay fullscreen on the
+/// workspace it goes to, over the game; leaving fullscreen needs the focus.
+pub fn moves(window: &Window) -> bool {
+    !window.state.maximised
+}
+
 /// The dispatch that carries out `placement`: a floating window moves to its new position, a
-/// tiled or fullscreen one to the active workspace of the "send windows to" monitor, silently
-/// (without following it with the focus).
+/// tiled one to the active workspace of the "send windows to" monitor, silently (without following
+/// it with the focus).
 pub fn dispatch(
     window: &Window,
     placement: Placement,
@@ -196,7 +203,7 @@ pub fn dispatch(
     send_windows_to: &str,
 ) -> Option<String> {
     match placement {
-        Placement::MoveTo(target) if window.floating && !window.state.maximised => Some(format!(
+        Placement::MoveTo(target) if window.floating => Some(format!(
             "dispatch movewindowpixel exact {} {},address:{}",
             target.left, target.top, window.id
         )),
@@ -284,6 +291,13 @@ mod tests {
     }
 
     #[test]
+    fn a_fullscreen_window_is_left_alone() {
+        let found = windows(&serde_json::from_str(CLIENTS).unwrap()).unwrap();
+        assert!(moves(&found[0]) && moves(&found[1]));
+        assert!(!moves(&found[2]));
+    }
+
+    #[test]
     fn floating_windows_move_and_others_go_to_the_monitors_workspace_silently() {
         let monitors: Value = serde_json::from_str(MONITORS).unwrap();
         let found = windows(&serde_json::from_str(CLIENTS).unwrap()).unwrap();
@@ -291,14 +305,6 @@ mod tests {
         assert_eq!(
             dispatch(&found[1], target, &monitors, "DP-1").as_deref(),
             Some("dispatch movewindowpixel exact 100 100,address:0x55d1c0a1b3d0")
-        );
-        let maximise = Placement::Maximise {
-            work_area: rect(0, 30, 1920, 1080),
-            restore: rect(0, 0, 1, 1),
-        };
-        assert_eq!(
-            dispatch(&found[2], maximise, &monitors, "DP-1").as_deref(),
-            Some("dispatch movetoworkspacesilent 1,address:0x55d1c0a1b4e0")
         );
         assert_eq!(
             dispatch(&found[0], target, &monitors, "DP-1").as_deref(),

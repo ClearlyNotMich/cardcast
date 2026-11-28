@@ -18,4 +18,6 @@ The Linux build keeps today's module interfaces (the mirror, guard and audio rel
 
 ## Consequences
 
-The cardcast licence became GPL-3.0-or-later on 2026-11-27 (owner decision, `LICENSE`), and only GPL-compatible crates may be added; the research avoided none it needed. CI grows Linux jobs: Xvfb with openbox for X11, headless sway with xdg-desktop-portal-wlr and PipeWire, and `kwin_wayland --virtual` in an Arch container. GNOME, NVIDIA DMA-BUF import, HDR and the game-load lines stay owner checks. KWin fake-input and Hyprland dispatchers are unstable interfaces, so the guards there may break with compositor updates. Every SPEC section 9 line now needs a Linux column.
+The cardcast licence became GPL-3.0-or-later on 2026-11-27 (owner decision, `LICENSE`), and only GPL-compatible crates may be added; the research avoided none it needed. CI grows Linux jobs: Xvfb with openbox for X11, headless sway with xdg-desktop-portal-wlr and PipeWire, and `kwin_wayland --virtual` in an Arch container. GNOME, NVIDIA DMA-BUF import, HDR and the game-load lines stay owner checks.
+
+Amended 2026-11-28 (#48): CI also runs headless GNOME Shell with cardcast's extension, for the window guard and the mirror's window (not GNOME's capture). The extension hands the focus back after the mirror's window takes it, so the focus is stolen briefly; whether a game on the sender notices that stays an owner check. KWin fake-input and Hyprland dispatchers are unstable interfaces, so the guards there may break with compositor updates. Every SPEC section 9 line now needs a Linux column.

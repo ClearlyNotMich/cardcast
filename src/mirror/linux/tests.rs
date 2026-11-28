@@ -811,6 +811,8 @@ fn desktop_gnome_mirror_window_is_fullscreen_on_the_card_display_without_the_foc
         bus.call_method(Some(NAME), PATH, Some(NAME), method, &())
             .unwrap()
     };
+    // The extension lists the windows only to connections that connected.
+    call("Connect");
     let focus = || -> String { call("Focus").body().deserialize().unwrap() };
     let mirror = || {
         let windows: Vec<(String, String, String, bool)> =
