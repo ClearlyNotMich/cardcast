@@ -8,6 +8,7 @@ use super::screen::Screen;
 use super::{ABGR8888, ARGB8888, XBGR8888, XRGB8888, rows};
 use ash::vk;
 use std::os::fd::{AsFd, OwnedFd};
+use std::sync::OnceLock;
 use wgpu::hal::api::Vulkan;
 
 /// What became of a frame handed to [`Gpu::take`].
@@ -29,7 +30,7 @@ pub struct Gpu {
     /// With DMA-BUF import: the raw device and its queue family, to take each imported plane
     /// over from the compositor (`VK_QUEUE_FAMILY_FOREIGN_EXT`) and give it back.
     foreign: Option<(ash::Device, u32)>,
-    // The surface goes before the device and instance it was made with.
+    // The surface goes before the device it was made with.
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     /// The surface's format without sRGB encoding: the captured bytes are sRGB already.
@@ -41,7 +42,6 @@ pub struct Gpu {
     queue: wgpu::Queue,
     device: wgpu::Device,
     adapter: wgpu::Adapter,
-    _instance: wgpu::Instance,
 }
 
 pub const SHADER: &str = r"
@@ -184,6 +184,19 @@ pub fn foreign_barrier(
     }
 }
 
+/// The mirror's Vulkan instance, made once and never destroyed (#60): destroying a second
+/// `VkInstance` broke the settings window's own Vulkan swapchain on NVIDIA's driver, so its next
+/// paint after Stop jumped to address 0 inside `libnvidia-glcore`.
+fn instance() -> &'static wgpu::Instance {
+    static INSTANCE: OnceLock<wgpu::Instance> = OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        })
+    })
+}
+
 /// Whether the adapter's device has `VK_EXT_queue_family_foreign`, which DMA-BUF import needs to
 /// take planes over from the compositor; without it cardcast asks for shared memory.
 fn has_queue_family_foreign(adapter: &wgpu::Adapter) -> bool {
@@ -244,10 +257,7 @@ fn ready<T>(future: impl Future<Output = T>) -> Option<T> {
 impl Gpu {
     /// A Vulkan device that can present to `screen`, which must outlive it.
     pub fn open(screen: &Screen) -> Result<Self, Ended> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        let instance = instance();
         let (display, window) = screen.handles();
         // SAFETY: the handles are the screen's live display connection and surface; the mirror
         // thread drops this Gpu, and so the surface, before the screen.
@@ -388,7 +398,6 @@ impl Gpu {
             queue,
             device,
             adapter,
-            _instance: instance,
         })
     }
 

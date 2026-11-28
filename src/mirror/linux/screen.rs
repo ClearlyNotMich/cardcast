@@ -187,10 +187,7 @@ impl Wayland {
         queue
             .roundtrip(&mut events)
             .map_err(|error| failed(&error))?;
-        let output = events
-            .names
-            .iter()
-            .position(|name| name.as_deref() == Some(&card_display.gdi_name))
+        let output = card_output(&events.names, &card_display.gdi_name)
             .and_then(|index| outputs.get(index))
             .ok_or_else(|| Ended::Restart("The card display is not connected.".into()))?;
         let surface = compositor.create_surface(&handle, ());
@@ -308,6 +305,14 @@ impl Wayland {
         }
         Ok(())
     }
+}
+
+/// Which of the `wl_output` `names` is the card display's, named `gdi_name` (the `wl_output` name
+/// the monitor list has too); `None` if none is, so the mirror never falls back to another output.
+pub fn card_output(names: &[Option<String>], gdi_name: &str) -> Option<usize> {
+    names
+        .iter()
+        .position(|name| name.as_deref() == Some(gdi_name))
 }
 
 impl Drop for Wayland {

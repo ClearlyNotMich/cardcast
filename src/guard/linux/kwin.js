@@ -34,6 +34,10 @@ function id(window) {
 
 function check(window) {
     if (stopped || window.deleted) return;
+    // Layer-shell surfaces, cardcast's mirror and pointer catcher among them, are pinned to their
+    // output and KWin calls them normal windows; it can't move them to another output, so the guard
+    // leaves them be (#60).
+    if (!window.moveableAcrossScreens) return;
     // A window being dragged or resized is checked when that ends (moveResizedChanged).
     if (window.move || window.resize) return;
     const g = window.frameGeometry;
