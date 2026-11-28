@@ -89,6 +89,7 @@ If you unplug the capture card or the source monitor, the mirror stops and the s
 - If the same window keeps going back to the card display (more than 3 times within a minute), the guard stops moving it and names it in the status line, so it never fights a program. The notice stays until you press **Dismiss guard notice**, or until that window leaves the card display or closes; then the guard watches it again. Turning the guard off and on, or changing the card display or "send windows to", also resets this.
 - If "send windows to" is the card display, or there is no monitor to send windows to, the guard does nothing and says so in the status line.
 - The pointer is checked about 60 times a second. If it is on the card display, it is put back where it was last seen on another monitor.
+- On Linux the window guard works on X11 and on KDE Plasma. On Plasma, cardcast loads a KWin script while the guard is on; it is unloaded when the guard stops, and unloads itself within a second if cardcast quits or crashes. If KWin restarts, the status line says so and the guard comes back by itself. On other desktops, and for the pointer guard, the status line says it does not work there yet.
 
 </details>
 
