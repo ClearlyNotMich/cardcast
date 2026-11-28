@@ -9,6 +9,7 @@
 // connections that called Connect get the window list and the Changed signal, sent to each alone,
 // so other programs on the bus don't hear of every window.
 
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
@@ -56,6 +57,10 @@ const isMirror = window => window.get_wm_class() === MIRROR;
 const isMaximised = window => window.is_maximized
     ? window.is_maximized()
     : window.get_maximized() === Meta.MaximizeFlags.BOTH;
+
+// The seat that moves the pointer: the stage's backend, or before that Clutter's default one.
+const seat = () => (global.stage.get_context?.()?.get_backend() ?? Clutter.get_default_backend())
+    .get_default_seat();
 
 const monitorIndex = connector => {
     const index = global.backend.get_monitor_manager().get_monitor_for_connector(connector);
@@ -178,7 +183,7 @@ export default class CardcastExtension extends Extension {
     WarpPointerAsync([x, y], invocation) {
         if (!this._connected(invocation))
             return;
-        global.backend.get_default_seat().warp_pointer(x, y);
+        seat().warp_pointer(x, y);
         invocation.return_value(null);
     }
 

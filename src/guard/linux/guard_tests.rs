@@ -381,14 +381,23 @@ fn desktop_kwin_script_never_outlives_cardcast() {
 
 /// `CARDCAST_KWIN_START` (CI): a shell command that starts `kwin_wayland --virtual` on this session
 /// bus, which already runs one. KWin is killed: the status line says the guard waits for it; KWin
-/// is started again: the guard loads its script again and the notice goes. Skips when unset.
+/// is started again: the guard loads its script and starts the pointer guard again, and the notice
+/// goes. Skips when unset.
 #[test]
 fn desktop_kwin_guard_follows_a_kwin_restart() {
     let Ok(start) = std::env::var("CARDCAST_KWIN_START") else {
         return;
     };
     let (sender, reports) = std::sync::mpsc::channel();
-    let guarding = Guarding::new("right", None, xvfb_halves, sender, Arc::new(|| {}));
+    let monitors = super::monitors().unwrap();
+    let card = monitors.iter().find(|m| !m.primary).unwrap();
+    let guarding = Guarding::new(
+        &card.device_path,
+        None,
+        super::monitors,
+        sender,
+        Arc::new(|| {}),
+    );
     let running = kwin::start(guarding);
     let plugin = running.plugin().to_owned();
     let mut status = None;

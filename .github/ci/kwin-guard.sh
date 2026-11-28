@@ -24,9 +24,10 @@ dbus-run-session -- kwin_wayland --virtual --xwayland --output-count 2 --width 1
 cat "$log"
 failed=$(cat "$XDG_RUNTIME_DIR/status" 2>/dev/null || echo 1)
 
-# KWin restarts under a running guard: the test is not KWin's child, so it outlives the kill.
-start='kwin_wayland --virtual --output-count 2 --width 1280 --height 1024 > /dev/null 2>&1'
-export CARDCAST_KWIN_START="$start"
+# KWin restarts under a running guard: the test is not KWin's child, so it outlives the kill. The
+# Wayland socket keeps its name, as a desktop's does, so the pointer guard finds the new KWin too.
+start='kwin_wayland --virtual --socket wayland-cardcast --output-count 2 --width 1280 --height 1024 > /dev/null 2>&1'
+export CARDCAST_KWIN_START="$start" WAYLAND_DISPLAY=wayland-cardcast
 dbus-run-session -- sh -c "
   $start &
   for _ in \$(seq 100); do busctl --user status org.kde.KWin > /dev/null 2>&1 && break; sleep 0.1; done
