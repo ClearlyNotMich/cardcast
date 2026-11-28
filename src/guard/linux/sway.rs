@@ -133,8 +133,11 @@ impl Compositor for Sway {
     }
 
     fn apply(&mut self, window: &Window, placement: Placement, send_windows_to: &str) {
-        // Red run (#48): sway's guard moves nothing.
-        let _ = (RUN_COMMAND, command(window, placement, send_windows_to));
+        let _ = request(
+            &mut self.commands,
+            RUN_COMMAND,
+            &command(window, placement, send_windows_to),
+        );
     }
 }
 
