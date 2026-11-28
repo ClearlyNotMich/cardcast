@@ -46,7 +46,7 @@ pub trait Compositor: Sized {
     fn apply(&mut self, window: &Window, placement: Placement, send_windows_to: &str);
 }
 
-enum Message {
+pub(super) enum Message {
     /// News from connection number `.0`.
     Changed(u32),
     Gone(u32),
@@ -68,6 +68,17 @@ impl Events {
             sender: mpsc::channel().0,
             connection: 0,
         }
+    }
+
+    /// Events the test hears, as connection 0.
+    #[cfg(test)]
+    pub fn listened() -> (Self, Receiver<Message>) {
+        let (sender, received) = mpsc::channel();
+        let events = Self {
+            sender,
+            connection: 0,
+        };
+        (events, received)
     }
 
     /// A window changed; false once the guard thread no longer listens.

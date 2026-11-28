@@ -332,6 +332,84 @@ fn desktop_gnome_extension_returns_windows_and_keeps_the_focus_off_the_mirror() 
     }
 }
 
+/// Turns cardcast's extension on or off.
+fn gnome_extension(method: &str) {
+    let done: bool = zbus::blocking::Connection::session()
+        .unwrap()
+        .call_method(
+            Some("org.gnome.Shell.Extensions"),
+            "/org/gnome/Shell/Extensions",
+            Some("org.gnome.Shell.Extensions"),
+            method,
+            &"cardcast@clearlynotmich.github.io",
+        )
+        .unwrap()
+        .body()
+        .deserialize()
+        .unwrap();
+    assert!(done, "{method} failed");
+}
+
+/// `CARDCAST_GUARD_DESKTOP=gnome` (CI): another process on the session bus gets no window list and
+/// hears no `Changed` while cardcast does, and cardcast hears at once when the extension goes away
+/// (not at its next one-second check). Skips otherwise.
+#[test]
+fn desktop_gnome_extension_serves_only_cardcast_and_says_when_it_goes() {
+    use super::compositor::Message;
+    use super::gnome::{NAME, PATH};
+    if std::env::var("CARDCAST_GUARD_DESKTOP").as_deref() != Ok("gnome") {
+        return;
+    }
+    let (events, messages) = Events::listened();
+    let _gnome = Gnome::connect(events).unwrap();
+    let other = zbus::blocking::Connection::session().unwrap();
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender(NAME)
+        .and_then(|rule| rule.member("Changed"))
+        .unwrap()
+        .build();
+    let changes = zbus::blocking::MessageIterator::for_match_rule(rule, &other, None).unwrap();
+    let (heard, other_heard) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for _ in changes {
+            let _ = heard.send(());
+        }
+    });
+    assert!(
+        other
+            .call_method(Some(NAME), PATH, Some(NAME), "Windows", &())
+            .is_err(),
+        "another process got the window list"
+    );
+
+    let _window = Foot::open("cardcast-changed-test");
+    loop {
+        match messages.recv_timeout(Duration::from_secs(20)) {
+            Ok(Message::Changed(_)) => break,
+            Ok(_) => {}
+            Err(error) => panic!("cardcast heard no Changed: {error}"),
+        }
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        other_heard.try_recv().is_err(),
+        "another process heard Changed"
+    );
+
+    gnome_extension("DisableExtension");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let gone = loop {
+        match messages.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Message::Gone(_)) => break true,
+            Ok(_) => {}
+            Err(_) => break false,
+        }
+    };
+    gnome_extension("EnableExtension");
+    assert!(gone, "cardcast didn't hear the extension go");
+}
+
 /// `CARDCAST_GUARD_DESKTOP=gnome` (CI): the extension is turned off, as GNOME does while the screen
 /// is locked: the status line says the guard needs it; it is turned on again: the guard is back and
 /// the notice goes. Skips otherwise.
@@ -361,26 +439,10 @@ fn desktop_gnome_guard_follows_the_extension_turned_off_and_on() {
     let guarding = Some(GuardReport::Notice(NO_POINTER_GUARD.into()));
     let waiting = Some(GuardReport::Notice(super::gnome::needs_extension()));
     wait_for("the guard to start", || latest() == guarding);
-    let extensions = |method: &str| {
-        let done: bool = zbus::blocking::Connection::session()
-            .unwrap()
-            .call_method(
-                Some("org.gnome.Shell.Extensions"),
-                "/org/gnome/Shell/Extensions",
-                Some("org.gnome.Shell.Extensions"),
-                method,
-                &"cardcast@clearlynotmich.github.io",
-            )
-            .unwrap()
-            .body()
-            .deserialize()
-            .unwrap();
-        assert!(done, "{method} failed");
-    };
-    extensions("DisableExtension");
+    gnome_extension("DisableExtension");
     wait_for("the notice that the extension is off", || {
         latest() == waiting
     });
-    extensions("EnableExtension");
+    gnome_extension("EnableExtension");
     wait_for("the guard to be back", || latest() == guarding);
 }
