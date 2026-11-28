@@ -359,7 +359,11 @@ pub mod second_monitor {
     }
 
     /// A device disabled with `pnputil`, as if unplugged; it is plugged back in on drop.
-    pub struct Unplugged(String);
+    pub struct Unplugged {
+        id: String,
+        /// The monitors' device paths before the unplug, waited for on drop.
+        monitors: Vec<String>,
+    }
 
     impl Unplugged {
         /// Unplugs both virtual monitors by disabling their graphics card.
@@ -378,28 +382,99 @@ pub mod second_monitor {
             Self::device(instance.replace('#', r"\"))
         }
 
+        /// Waits for the device to be Started first: disabling one that is still starting (just
+        /// replugged) makes pnputil answer "System reboot is needed", and the device then refuses
+        /// every later disable until a reboot (issue #57).
         fn device(id: String) -> Self {
             assert!(
-                pnputil("/disable-device", &id),
-                "pnputil /disable-device {id} failed"
+                poll(STARTED_LIMIT, || started(&id)),
+                "{id} did not report Started within {STARTED_LIMIT:?}; status {:x?}",
+                status(&id)
             );
-            Self(id)
+            let monitors = super::monitors()
+                .unwrap_or_else(|error| panic!("{error}"))
+                .into_iter()
+                .map(|monitor| monitor.device_path)
+                .collect();
+            log(&format!("disabling {id}, status {:x?}", status(&id)));
+            assert!(
+                pnputil("/disable-device", &id),
+                "pnputil /disable-device {id} failed; status {:x?}",
+                status(&id)
+            );
+            Self { id, monitors }
+        }
+
+        /// The device is Started again and every monitor seen before the unplug is back.
+        fn plugged_back(&self) -> bool {
+            started(&self.id)
+                && super::monitors().is_ok_and(|now| {
+                    self.monitors
+                        .iter()
+                        .all(|path| now.iter().any(|monitor| monitor.device_path == *path))
+                })
         }
     }
 
     impl Drop for Unplugged {
         /// Never panics: it also runs while a failed test unwinds, and leaves the monitor connected for the next test.
         fn drop(&mut self) {
-            if !pnputil("/enable-device", &self.0) {
-                return;
-            }
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while Instant::now() < deadline
-                && !super::monitors().is_ok_and(|monitors| monitors.len() > 2)
-            {
-                std::thread::sleep(Duration::from_millis(50));
+            if !pnputil("/enable-device", &self.id) {
+                log(&format!("pnputil /enable-device {} failed", self.id));
+            } else if !poll(STARTED_LIMIT, || self.plugged_back()) {
+                log(&format!(
+                    "{} was not Started with its monitors back within {STARTED_LIMIT:?}; status {:x?}",
+                    self.id,
+                    status(&self.id)
+                ));
             }
         }
+    }
+
+    const STARTED_LIMIT: Duration = Duration::from_secs(30);
+
+    /// The device's devnode status flags and problem code, read with `CM_Locate_DevNodeW` and
+    /// `CM_Get_DevNode_Status` (learn.microsoft.com/windows/win32/api/cfgmgr32/nf-cfgmgr32-cm_get_devnode_status);
+    /// `None` while the device is not present.
+    fn status(id: &str) -> Option<(u32, u32)> {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::{
+            CM_DEVNODE_STATUS_FLAGS, CM_Get_DevNode_Status, CM_LOCATE_DEVNODE_NORMAL,
+            CM_Locate_DevNodeW, CM_PROB, CR_SUCCESS,
+        };
+        let id: Vec<u16> = id.encode_utf16().chain([0]).collect();
+        let mut node = 0;
+        // SAFETY: id is NUL-terminated and outlives the call.
+        let located = unsafe {
+            CM_Locate_DevNodeW(
+                &mut node,
+                windows::core::PCWSTR(id.as_ptr()),
+                CM_LOCATE_DEVNODE_NORMAL,
+            )
+        };
+        let (mut flags, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
+        // SAFETY: both outputs are plain integers owned here; node was just located.
+        let read = located == CR_SUCCESS
+            && unsafe { CM_Get_DevNode_Status(&mut flags, &mut problem, node, 0) } == CR_SUCCESS;
+        read.then_some((flags.0, problem.0))
+    }
+
+    /// Started: `DN_STARTED` set and no problem code (`DN_HAS_PROBLEM`, as after a disable).
+    fn started(id: &str) -> bool {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::{DN_HAS_PROBLEM, DN_STARTED};
+        status(id)
+            .is_some_and(|(flags, _)| flags & DN_STARTED.0 != 0 && flags & DN_HAS_PROBLEM.0 == 0)
+    }
+
+    /// Polls until `done` holds; false after `limit`.
+    fn poll(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while !done() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        true
     }
 
     /// A monitor set to another refresh rate at its resolution, as a user does in Windows' advanced
