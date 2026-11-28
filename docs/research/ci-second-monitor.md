@@ -58,9 +58,10 @@ had `DN_NEED_RESTART` (`0x180210b`) and every later disable failed with "Device 
 reboot". Disables at least 1 s after a replug never failed. Likely cause, not proved: the 24.10.27
 driver has one swap-chain worker for all monitors, which each new swap-chain assignment tears
 down (fixed upstream by PR #482 [17], in no release yet), or DWM is still attaching to the new
-outputs; no devnode status shows either. So `Unplugged` (`guard::second_monitor`) waits, before
-a disable and after a replug, until the device is Started, its monitors are back, and Desktop
-Duplication delivers a frame from each.
+outputs; no devnode status shows either. So `Unplugged` (`guard::second_monitor`) waits before a
+disable until the device is Started, and after a replug until it is Started, its monitors are
+back, and Desktop Duplication delivers a frame from each. Duplication is not checked before a
+disable: a running mirror in the test process may hold the only duplication of that output.
 
 ## 3. Desktop Duplication and D3D11 on that monitor
 

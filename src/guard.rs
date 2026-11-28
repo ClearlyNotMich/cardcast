@@ -382,21 +382,24 @@ pub mod second_monitor {
             Self::device(instance.replace('#', r"\"))
         }
 
-        /// Waits for the device and its monitors to be settled first: disabling the virtual
-        /// graphics card just after a replug, while it already reports Started, can make pnputil
-        /// answer "System reboot is needed", after which the device refuses every later disable
-        /// until a reboot (docs/research/ci-second-monitor.md, issue #57).
+        /// Waits for the device to be Started first. Drop waits for more (see `settled`), so a
+        /// disable never comes while a replug is still settling: disabling the virtual graphics
+        /// card then, even while it reports Started, can make pnputil answer "System reboot is
+        /// needed", and the device refuses every later disable until a reboot
+        /// (docs/research/ci-second-monitor.md, issue #57). Duplication is not checked here: a
+        /// running mirror in this process may already duplicate the monitor, and one output allows
+        /// one duplication per process.
         fn device(id: String) -> Self {
-            let monitors: Vec<String> = super::monitors()
+            assert!(
+                poll(SETTLE_LIMIT, || started(&id)),
+                "{id} did not report Started within {SETTLE_LIMIT:?}; status {:x?}",
+                status(&id)
+            );
+            let monitors = super::monitors()
                 .unwrap_or_else(|error| panic!("{error}"))
                 .into_iter()
                 .map(|monitor| monitor.device_path)
                 .collect();
-            assert!(
-                poll(SETTLE_LIMIT, || settled(&id, &monitors)),
-                "{id} and its monitors did not settle within {SETTLE_LIMIT:?}; status {:x?}",
-                status(&id)
-            );
             log(&format!("disabling {id}, status {:x?}", status(&id)));
             assert!(
                 pnputil("/disable-device", &id),
@@ -422,8 +425,9 @@ pub mod second_monitor {
         }
     }
 
-    /// The device reports Started, every monitor in `monitors` (device paths) is connected, and
-    /// Desktop Duplication delivers a frame from each, so the desktop is presented to it.
+    /// After a replug: the device reports Started, every monitor in `monitors` (device paths) is
+    /// connected, and Desktop Duplication delivers a frame from each, so the desktop is presented
+    /// to it. The tests stop their mirror before they replug, so nothing else duplicates these.
     fn settled(id: &str, monitors: &[String]) -> bool {
         started(id)
             && super::monitors().is_ok_and(|now| {
