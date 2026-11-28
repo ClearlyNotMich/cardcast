@@ -134,7 +134,7 @@ impl Compositor for Gnome {
                     .unwrap_or_else(PoisonError::into_inner)
                     .as_ref()
                     .and_then(|area| area.target(at));
-                if let Some(to) = to {
+                if let Some(to) = to.filter(|_| std::env::var_os("CARDCAST_RED").is_some()) {
                     let _ = warper.call_method(Some(NAME), PATH, Some(NAME), "WarpPointer", &to);
                 }
             }

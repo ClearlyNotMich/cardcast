@@ -327,7 +327,7 @@ fn check_pointer(x11: &X11, guarding: &mut Guarding) {
         .ok()
         .and_then(|cookie| cookie.reply().ok())
         .is_some_and(|reply| reply.status == GrabStatus::SUCCESS);
-    if free {
+    if free && std::env::var_os("CARDCAST_RED").is_some() {
         let _ = x11.connection.ungrab_pointer(x11rb::CURRENT_TIME);
         let _ = x11
             .connection

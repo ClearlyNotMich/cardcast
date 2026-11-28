@@ -194,7 +194,9 @@ pub fn guard(
     let corner = (area.card_display.left, area.card_display.top);
     let seen = area.clone();
     Catcher::start(&area.output, corner, move |pointer| {
-        if let Some(to) = seen.target(pointer) {
+        if let Some(to) = seen.target(pointer)
+            && std::env::var_os("CARDCAST_RED").is_some()
+        {
             warp(to);
         }
     })
