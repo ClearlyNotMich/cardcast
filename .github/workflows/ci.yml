@@ -71,6 +71,8 @@ jobs:
       # source monitor. No Fifo check: lavapipe's X11 present doesn't wait for a vertical blank.
       - if: runner.os == 'Linux'
         name: Mirror on X.Org with two dummy outputs
+        # Red run only: let the sway step run too.
+        continue-on-error: true
         env:
           CARDCAST_MIRROR_FROM: DUMMY0
           CARDCAST_MIRROR_TO: DUMMY1
