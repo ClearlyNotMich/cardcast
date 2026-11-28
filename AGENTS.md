@@ -18,6 +18,7 @@ Cardcast mirrors a screen from the sender onto the card display, so a second PC 
 - Code is written on Linux. The Windows mirror, guards and audio relay only run on Windows, so they can't be run here.
 - Building on Linux needs PipeWire's headers and libclang for the `pipewire` crate (Ubuntu: `libpipewire-0.3-dev libclang-dev`; Arch: `pipewire clang`).
 - `cargo build --release` on Linux builds the real Linux cardcast (`target/release/cardcast`; `cargo run` starts it). Parts not yet built for Linux (#36) say "does not work on Linux yet" in the status line; never make one fake success. The stand-in mirror is `cfg(test)` only, for the snapshots.
+- This is the owner's own machine: test compositors and desktops in containers, never on his desktop, and remove every Docker image, volume and `/tmp` folder you create before you finish (files a root container wrote need a container to delete them).
 - Linux code goes in `cfg(target_os = "linux")` modules beside the Windows ones, behind the same traits. `guard::desktop::detect` says which desktop runs (Plasma, GNOME, sway, Hyprland, other Wayland, X11); `match` on it to pick a per-desktop helper.
 - A pre-push hook in `.githooks/` runs these checks (one-time: `git config core.hooksPath .githooks`); its `cargo test` renders the snapshots, so it needs `mesa-vulkan-drivers` too. Never skip it with `--no-verify`.
 - Before every push: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
