@@ -76,6 +76,7 @@ jobs:
         env:
           CARDCAST_MIRROR_FROM: DUMMY0
           CARDCAST_MIRROR_TO: DUMMY1
+          CARDCAST_PAINT_SOURCE: '#cc6633'
           CARDCAST_EXPECT_COLOUR: '#00ff00'
         run: |
           sudo apt-get install -y xserver-xorg-core xserver-xorg-video-dummy

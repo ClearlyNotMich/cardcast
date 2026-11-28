@@ -539,8 +539,7 @@ fn shown_on_output(card_display: &Monitor, x: u32, y: u32) -> [u8; 3] {
     }
 }
 
-/// X11 has no background per output, so the source monitor gets a window of `colour` over it,
-/// open while the returned connection is.
+/// A window of `colour` over the source monitor, open while the returned connection is.
 fn paint_x11_source_monitor(
     source_monitor: &Monitor,
     colour: [u8; 3],
@@ -577,8 +576,9 @@ fn paint_x11_source_monitor(
 /// CI's desktops (headless sway with xdg-desktop-portal-wlr, X.Org with two dummy outputs): the
 /// mirror runs from output `CARDCAST_MIRROR_FROM`, showing `CARDCAST_EXPECT_COLOUR` (`#rrggbb`),
 /// to output `CARDCAST_MIRROR_TO`, which must then show that colour where it showed another, and
-/// count its presents; with `CARDCAST_EXPECT_HZ`, no more than one per refresh at that rate.
-/// Skips when unset.
+/// count its presents; with `CARDCAST_EXPECT_HZ`, no more than one per refresh at that rate. X11
+/// has no background per output, so there the test paints the source monitor
+/// `CARDCAST_PAINT_SOURCE`. Skips when unset.
 #[test]
 fn desktop_mirrors_the_source_monitor_on_the_card_display() {
     use crate::mirror::Mirror;
@@ -590,8 +590,10 @@ fn desktop_mirrors_the_source_monitor_on_the_card_display() {
     ) else {
         return;
     };
-    let expected: [u8; 3] =
-        [1, 3, 5].map(|at| u8::from_str_radix(&colour[at..at + 2], 16).unwrap());
+    let rgb = |colour: &str| -> [u8; 3] {
+        [1, 3, 5].map(|at| u8::from_str_radix(&colour[at..at + 2], 16).unwrap())
+    };
+    let expected = rgb(&colour);
     let monitors = crate::guard::monitors().unwrap();
     let named = |name: &str| {
         monitors
@@ -601,8 +603,9 @@ fn desktop_mirrors_the_source_monitor_on_the_card_display() {
             .clone()
     };
     let (source, card) = (named(&from), named(&to));
-    let _painted = (std::env::var_os("WAYLAND_DISPLAY").is_none())
-        .then(|| paint_x11_source_monitor(&source, expected));
+    let _painted = std::env::var("CARDCAST_PAINT_SOURCE")
+        .ok()
+        .map(|paint| paint_x11_source_monitor(&source, rgb(&paint)));
     // A quarter in from the top-left: the pointer starts in the middle.
     let (x, y) = (card.width / 4, card.height / 4);
     let before = shown_on_output(&card, x, y);
