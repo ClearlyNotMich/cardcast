@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=cardcast
-Comment=Mirror a monitor onto the capture card's display
+Comment=Mirror a monitor onto the card display
 Exec=cardcast
 Icon=cardcast
 Terminal=false

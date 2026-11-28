@@ -2,9 +2,13 @@ name: Release
 
 # A v* tag runs all of CI and, when it is green, attaches the Windows .exe and the Linux tarball,
 # each with a .sha256, to the tag's GitHub release, creating the release if it doesn't exist yet.
+# It never replaces a file the release already has, so a sum the AUR package pins can't change.
+# A manual run (gh workflow run release.yml --ref <branch>) is a dry run: the same files go to a new
+# draft release dry-run-<run id>, which makes no tag; delete it after.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,12 +27,17 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && format('dry-run-{0}', github.run_id) || github.ref_name }}
         run: |
           mv cardcast-exe/cardcast.exe "cardcast-$TAG.exe"
           mv cardcast-linux-x86_64.tar.gz/cardcast-linux-x86_64.tar.gz "cardcast-$TAG-linux-x86_64.tar.gz"
           for file in "cardcast-$TAG.exe" "cardcast-$TAG-linux-x86_64.tar.gz"; do sha256sum "$file" > "$file.sha256"; done
           # A tag like v0.2.0-alpha.1 is a pre-release.
           case "$TAG" in *-*) pre=--prerelease ;; *) pre= ;; esac
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "cardcast $TAG" cardcast-"$TAG"*
+            exit
+          fi
           gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --verify-tag --title "cardcast $TAG" --generate-notes $pre
-          gh release upload "$TAG" --clobber cardcast-"$TAG"*
+          # Without --clobber, gh fails if the release already has a file of the same name.
+          gh release upload "$TAG" cardcast-"$TAG"*

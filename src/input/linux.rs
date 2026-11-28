@@ -26,8 +26,8 @@ const EDID: u8 = 0x50;
 const I2C_SLAVE: libc::Ioctl = 0x0703;
 const I2C_SLAVE_FORCE: libc::Ioctl = 0x0706;
 /// What the status line and command mode say when cardcast can't use the i2c buses at all.
-pub const NO_MODULE: &str = "Load the i2c-dev module: run sudo modprobe i2c-dev, and copy usr/lib/modules-load.d/cardcast-i2c.conf from cardcast's tarball to /etc/modules-load.d/ so it loads at every start.";
-pub const NO_PERMISSION: &str = "No permission for the monitor's i2c bus: install cardcast's udev rule: copy usr/lib/udev/rules.d/60-cardcast-i2c.rules from cardcast's tarball to /etc/udev/rules.d/, then run sudo udevadm control --reload and sudo udevadm trigger, or restart.";
+pub const NO_MODULE: &str = "Load the i2c-dev module: run sudo modprobe i2c-dev. cardcast's package installs the file that loads it at every start; from the tarball, also copy usr/lib/modules-load.d/cardcast-i2c.conf to /etc/modules-load.d/.";
+pub const NO_PERMISSION: &str = "No permission for the monitor's i2c bus: cardcast's package installs its udev rule, so run sudo udevadm control --reload and sudo udevadm trigger, or restart. From the tarball, first copy usr/lib/udev/rules.d/60-cardcast-i2c.rules to /etc/udev/rules.d/.";
 /// DDC/CI 1.1 section 5: retry at least 3 times on no answer.
 const ATTEMPTS: usize = 4;
 /// The longest capabilities string read; real ones are a few hundred bytes.
@@ -494,8 +494,6 @@ mod tests {
             Some(NO_PERMISSION)
         );
         assert!(NO_MODULE.starts_with("Load the i2c-dev module: "));
-        assert!(NO_PERMISSION.starts_with(
-            "No permission for the monitor's i2c bus: install cardcast's udev rule: "
-        ));
+        assert!(NO_PERMISSION.starts_with("No permission for the monitor's i2c bus: "));
     }
 }
