@@ -157,7 +157,7 @@ A higher rate costs the sender more: the mirror draws more often, and when the c
 <details>
 <summary><b>Linux (in progress, not released)</b></summary>
 
-Linux support is being worked on ([#36](https://github.com/ClearlyNotMich/cardcast/issues/36)). No release includes it yet. Parts not yet built for Linux say "does not work on Linux yet" in the status line. So far:
+Linux support is being worked on ([#36](https://github.com/ClearlyNotMich/cardcast/issues/36)). No release includes it yet; from the next one on, a release has `cardcast-<version>-linux-x86_64.tar.gz` with its `.sha256`, and Arch users get the AUR package `cardcast-bin`. The tarball holds `cardcast`, `LICENSE`, this README, and under `usr/` the other files at their install paths: the input switching files below, and a `.desktop` file and icon (`sudo cp -r usr/share /usr/local/` puts cardcast in the app menu once `cardcast` is on your `PATH`). Parts not yet built for Linux say "does not work on Linux yet" in the status line. So far:
 
 On Linux the sound goes through PipeWire, which needs PipeWire 0.3.44 or newer with its command-line tools (`pw-dump`, `pw-loopback`) and WirePlumber 0.4.12 or newer running:
 
@@ -167,11 +167,11 @@ On Linux the sound goes through PipeWire, which needs PipeWire 0.3.44 or newer w
 
 With an older PipeWire or WirePlumber, cardcast does not start the audio, because the sound could play back into the audio source; the status line says which one to update.
 
-The input switch command is `cardcast input <monitor> …`, and it works the same way as on Windows. cardcast talks to the monitor through `/dev/i2c-*`, which needs the `i2c-dev` kernel module and access for your user, no root. The tarball has both files in `packaging/linux/` (the AUR package will install them for you):
+The input switch command is `cardcast input <monitor> …`, and it works the same way as on Windows. cardcast talks to the monitor through `/dev/i2c-*`, which needs the `i2c-dev` kernel module and access for your user, no root. The tarball has both files under `usr/lib/` (the AUR package `cardcast-bin` installs them for you):
 
 ```
-sudo cp packaging/linux/modules-load.d/i2c-dev.conf /etc/modules-load.d/
-sudo cp packaging/linux/udev/rules.d/60-cardcast-i2c.rules /etc/udev/rules.d/
+sudo cp usr/lib/modules-load.d/cardcast-i2c.conf /etc/modules-load.d/
+sudo cp usr/lib/udev/rules.d/60-cardcast-i2c.rules /etc/udev/rules.d/
 sudo modprobe i2c-dev
 sudo udevadm control --reload
 sudo udevadm trigger

@@ -1,6 +1,11 @@
 name: CI
 
-on: [push, pull_request]
+# Tags run it through release.yml instead, which then publishes the release.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
 
 jobs:
   check:
@@ -176,16 +181,18 @@ jobs:
         with:
           name: cardcast-exe
           path: target/release/cardcast.exe
-      # A tarball keeps cardcast's executable bit, which the artifact zip would drop.
+      # A tarball keeps cardcast's executable bit, which the artifact zip would drop. Beside
+      # cardcast, LICENSE and README.md, its usr/ holds the other files at their install paths.
       - if: runner.os == 'Linux'
         run: |
           mkdir cardcast-linux-x86_64
-          cp target/release/cardcast LICENSE README.md cardcast-linux-x86_64/
-          mkdir cardcast-linux-x86_64/packaging && cp -r packaging/linux cardcast-linux-x86_64/packaging/
+          cp -r target/release/cardcast LICENSE README.md packaging/linux/usr cardcast-linux-x86_64/
           tar -czf cardcast-linux-x86_64.tar.gz cardcast-linux-x86_64
           tar -tvzf cardcast-linux-x86_64.tar.gz | grep -q -- '-rwx.* cardcast-linux-x86_64/cardcast$'
-          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/udev/rules.d/60-cardcast-i2c.rules$'
-          tar -tzf cardcast-linux-x86_64.tar.gz | grep -q 'packaging/linux/modules-load.d/i2c-dev.conf$'
+          for file in usr/lib/udev/rules.d/60-cardcast-i2c.rules usr/lib/modules-load.d/cardcast-i2c.conf \
+              usr/share/applications/cardcast.desktop usr/share/icons/hicolor/256x256/apps/cardcast.png; do
+            tar -tzf cardcast-linux-x86_64.tar.gz | grep -qx "cardcast-linux-x86_64/$file"
+          done
       - if: runner.os == 'Linux'
         uses: actions/upload-artifact@v7
         with:
@@ -214,6 +221,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: .github/ci/kwin-guard.sh
+
+  # packaging/aur/cardcast-bin against the tarball the check job built: makepkg and namcap (#45).
+  aur:
+    needs: check
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: cardcast-linux-x86_64.tar.gz
+      - run: .github/ci/aur.sh cardcast-linux-x86_64.tar.gz
 
   # Adds two virtual monitors (docs/research/ci-second-monitor.md) and runs the second_monitor tests.
   # The driver is third-party and its certificate becomes a trusted root, so this job gets no secrets and read-only access.
