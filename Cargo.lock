@@ -618,6 +618,7 @@ dependencies = [
  "egui_kittest",
  "libc",
  "pipewire",
+ "png",
  "serde_json",
  "wayland-client",
  "wayland-protocols",
