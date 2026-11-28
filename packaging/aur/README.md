@@ -38,9 +38,11 @@ with `makepkg` and runs `namcap` in an Arch container against the tarball it jus
    disagree. A PKGBUILD fix with no new release raises `pkgrel` instead ([Publishing][publish]).
 2. Push it, and when CI is green tag that commit `v<version>` and push the tag. The Release
    workflow attaches `cardcast-v<version>-linux-x86_64.tar.gz`. It never replaces a file a release
-   already has, so a fixed build needs a new version. To try the workflow without a tag,
-   `gh workflow run release.yml --ref <branch>` makes a draft release `dry-run-<run id>` with the
-   same files; delete it after with `gh release delete dry-run-<run id>`.
+   already has, so a fixed build needs a new version. To try the workflow without a tag, push to
+   the `release-dry-run` branch (`git push origin HEAD:release-dry-run`), or, once `release.yml` is
+   on the default branch, `gh workflow run release.yml --ref <branch>`: either makes a draft
+   release `dry-run-<run id>` with the same files and no tag. Delete it after with
+   `gh release delete dry-run-<run id>`, and the branch with `git push origin :release-dry-run`.
 3. In the AUR clone, copy in `PKGBUILD` and `.SRCINFO` from this repo, then `updpkgsums` (from
    `pacman-contrib`) downloads the release tarball and writes its sum into `sha256sums_x86_64`; it
    must match the release's `.sha256` file.
