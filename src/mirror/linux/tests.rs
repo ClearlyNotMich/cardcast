@@ -367,8 +367,8 @@ fn desktop_captures_a_frame_of_the_source_monitor() {
 }
 
 #[test]
-fn the_mirror_shows_without_focus_on_each_desktop_and_says_why_not_on_gnome() {
-    use super::present::{NEEDS_GNOME_EXTENSION, Shown, shown_on};
+fn the_mirror_shows_without_focus_on_each_desktop() {
+    use super::present::{Shown, shown_on};
     assert_eq!(shown_on(Some(Desktop::X11)), Ok(Shown::OverrideRedirect));
     for desktop in [
         Desktop::PlasmaWayland,
@@ -378,10 +378,7 @@ fn the_mirror_shows_without_focus_on_each_desktop_and_says_why_not_on_gnome() {
     ] {
         assert_eq!(shown_on(Some(desktop)), Ok(Shown::LayerShell));
     }
-    assert_eq!(
-        shown_on(Some(Desktop::GnomeWayland)),
-        Err(Ended::Stop(NEEDS_GNOME_EXTENSION.into()))
-    );
+    assert_eq!(shown_on(Some(Desktop::GnomeWayland)), Ok(Shown::Fullscreen));
     assert!(matches!(shown_on(None), Err(Ended::Stop(_))));
 }
 
@@ -794,4 +791,94 @@ fn an_imported_plane_is_taken_from_the_compositor_and_given_back_in_general_layo
         )
     );
     assert_eq!(release_stages[0], vk::PipelineStageFlags::TRANSFER);
+}
+
+/// `CARDCAST_GUARD_DESKTOP=gnome` (CI: headless GNOME Shell with two virtual monitors, cardcast's
+/// extension and `foot`): the mirror's window is fullscreen on the card display, and the focus
+/// stays on the window that had it. Skips otherwise.
+#[test]
+fn desktop_gnome_mirror_window_is_fullscreen_on_the_card_display_without_the_focus() {
+    use super::gpu::Gpu;
+    use super::present::Shown;
+    use super::screen::Screen;
+    use crate::guard::gnome::{NAME, PATH};
+    use std::time::{Duration, Instant};
+    if std::env::var("CARDCAST_GUARD_DESKTOP").as_deref() != Ok("gnome") {
+        return;
+    }
+    let bus = zbus::blocking::Connection::session().unwrap();
+    let call = |method: &str| {
+        bus.call_method(Some(NAME), PATH, Some(NAME), method, &())
+            .unwrap()
+    };
+    // The extension lists the windows only to connections that connected.
+    call("Connect");
+    let focus = || -> String { call("Focus").body().deserialize().unwrap() };
+    let mirror = || {
+        let windows: Vec<(String, String, String, bool)> =
+            call("Windows").body().deserialize().unwrap();
+        windows
+            .into_iter()
+            .find_map(|(_, state, _, mirror)| mirror.then_some(state))
+    };
+    let monitors = crate::guard::monitors().unwrap();
+    let card = monitors.iter().find(|m| !m.primary).unwrap();
+    /// Closed on drop, so a failed test leaves no window behind.
+    struct Foot(std::process::Child);
+    impl Drop for Foot {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _focused = Foot(std::process::Command::new("foot").spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while focus().is_empty() {
+        assert!(Instant::now() < deadline, "foot never took the focus");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let before = focus();
+
+    let mut screen = Screen::open(Shown::Fullscreen, card).unwrap();
+    let mut gpu = Gpu::open(&screen).unwrap();
+    screen.show().unwrap();
+    let expected = format!(
+        "{} {} {} {} 1 0 0",
+        card.left,
+        card.top,
+        card.left + i32::try_from(card.layout_size.0).unwrap(),
+        card.top + i32::try_from(card.layout_size.1).unwrap()
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        screen.follow().unwrap();
+        let frame = Frame {
+            width: 4,
+            height: 4,
+            fourcc: XRGB8888,
+            pixels: Pixels::Memory {
+                bytes: vec![0x80; 64],
+                stride: 16,
+            },
+            release: Release::default(),
+        };
+        assert!(matches!(gpu.take(frame), super::gpu::Taken::Yes));
+        gpu.present().unwrap();
+        let shown = mirror();
+        assert_eq!(focus(), before, "the mirror took the focus");
+        if shown.as_deref() == Some(expected.as_str()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the mirror is at {shown:?}, not fullscreen on the card display ({expected})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A while longer: the focus stays where it was.
+    for _ in 0..20 {
+        screen.follow().unwrap();
+        assert_eq!(focus(), before, "the mirror took the focus");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

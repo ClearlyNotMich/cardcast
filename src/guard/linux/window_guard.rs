@@ -1,12 +1,16 @@
-//! The Linux window guard behind [`Guard`]: EWMH on X11 (`ewmh.rs`) and a KWin script on Plasma
-//! (`kwin.rs`), both deciding with `placement.rs` (docs/research/linux-support.md, section 5). What
-//! they share lives here: the monitors, the return history and the status-line reports.
+//! The Linux window guard behind [`Guard`]: EWMH on X11 (`ewmh.rs`), a KWin script on Plasma
+//! (`kwin.rs`), and sway's and Hyprland's IPC and cardcast's GNOME Shell extension
+//! (`compositor.rs`), all deciding with `placement.rs` (docs/research/linux-support.md, section 5).
+//! What they share lives here: the monitors, the return history and the status-line reports.
 
 use super::super::desktop::Desktop;
 use super::super::placement::{self, Placement, Rect, ReturnHistory, WindowState};
 use super::super::{Guard, GuardReport, Monitor};
-use super::{ewmh, kwin};
-use std::collections::HashMap;
+use super::gnome::Gnome;
+use super::hyprland::Hyprland;
+use super::sway::Sway;
+use super::{compositor, ewmh, kwin};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
@@ -60,6 +64,8 @@ pub struct Guarding {
     problem: Option<String>,
     history: ReturnHistory,
     titles: HashMap<isize, String>,
+    /// Windows given up on because they are fullscreen and can't be moved without the focus.
+    fullscreen: HashSet<isize>,
     reports: Sender<GuardReport>,
     wake: Wake,
 }
@@ -81,6 +87,7 @@ impl Guarding {
             problem: None,
             history: ReturnHistory::default(),
             titles: HashMap::new(),
+            fullscreen: HashSet::new(),
             reports,
             wake,
         }
@@ -88,7 +95,7 @@ impl Guarding {
 
     /// At start and after a display change: finds the monitors and reports. `work_area` gives a
     /// monitor's work area from the desktop, else the guard uses the whole monitor.
-    pub fn follow_displays(&mut self, work_area: impl Fn(&Monitor) -> Option<Rect>) {
+    pub fn follow_displays(&mut self, work_area: impl FnMut(&Monitor) -> Option<Rect>) {
         (self.monitors, self.send_to_output, self.problem) = match self.find_monitors(work_area) {
             Ok(Some((monitors, output))) => (Some(monitors), Some(output), None),
             Ok(None) => (None, None, None),
@@ -105,7 +112,7 @@ impl Guarding {
     /// The card display and "send windows to" rectangles, and the latter's output name.
     fn find_monitors(
         &self,
-        work_area: impl Fn(&Monitor) -> Option<Rect>,
+        mut work_area: impl FnMut(&Monitor) -> Option<Rect>,
     ) -> Result<Option<Found>, String> {
         let monitors = (self.list_monitors)()?;
         let Some((card_display, send_windows_to)) = placement::guarded_monitors(
@@ -165,6 +172,21 @@ impl Guarding {
         self.report();
     }
 
+    /// Gives up on window `id`, fullscreen on the card display, which the desktop can't move
+    /// without taking the focus (Hyprland), and says so in the status line.
+    pub fn give_up_fullscreen(&mut self, id: isize) {
+        self.fullscreen.insert(id);
+        self.give_up(id);
+    }
+
+    /// Window `id` can be moved again (it left fullscreen): it is guarded again.
+    pub fn movable_again(&mut self, id: isize) {
+        if self.fullscreen.remove(&id) {
+            self.history.forget(id);
+            self.report();
+        }
+    }
+
     /// A helper's own notice for the status line, such as KWin being gone.
     pub fn notice(&self, notice: &str) {
         let _ = self.reports.send(GuardReport::Notice(notice.to_owned()));
@@ -174,20 +196,26 @@ impl Guarding {
     /// Window `id` closed.
     pub fn forget(&mut self, id: isize) {
         self.titles.remove(&id);
+        self.fullscreen.remove(&id);
         if self.history.forget(id) {
             self.report();
         }
     }
 
     fn report(&self) {
-        let title = self
-            .history
-            .latest_given_up()
-            .and_then(|id| self.titles.get(&id));
-        let _ = self.reports.send(honest(placement::notice(
-            self.problem.as_deref(),
-            title.map(String::as_str),
-        )));
+        let latest = self.history.latest_given_up();
+        let title = latest
+            .and_then(|id| self.titles.get(&id))
+            .map(String::as_str);
+        let report = match (self.problem.as_deref(), title) {
+            (None, Some(title)) if latest.is_some_and(|id| self.fullscreen.contains(&id)) => {
+                GuardReport::Notice(format!(
+                    "\"{title}\" is fullscreen on the card display; cardcast can't move it without taking focus. Take it out of fullscreen or move it off to guard it again."
+                ))
+            }
+            (problem, title) => placement::notice(problem, title),
+        };
+        let _ = self.reports.send(honest(report));
         (self.wake)();
     }
 }
@@ -196,6 +224,8 @@ impl Guarding {
 enum Helper {
     X11(ewmh::Running),
     Kwin(kwin::Running),
+    /// sway, Hyprland or GNOME.
+    Compositor(compositor::Running),
 }
 
 struct Running {
@@ -204,7 +234,7 @@ struct Running {
     helper: Helper,
 }
 
-/// The window guard on X11 or Plasma; on Linux the pointer guard is not built yet.
+/// The window guard on X11, Plasma, GNOME, sway and Hyprland; on Linux the pointer guard is not built yet.
 pub struct WindowGuard {
     desktop: Desktop,
     list_monitors: ListMonitors,
@@ -215,7 +245,7 @@ pub struct WindowGuard {
 }
 
 impl WindowGuard {
-    /// `desktop` is [`Desktop::X11`] or [`Desktop::PlasmaWayland`], the desktops with a helper.
+    /// `desktop` is one with a helper: not [`Desktop::OtherWayland`].
     pub fn new(
         desktop: Desktop,
         list_monitors: ListMonitors,
@@ -266,10 +296,14 @@ impl Guard for WindowGuard {
             self.report_sender.clone(),
             self.wake.clone(),
         );
-        // Both helpers start and stop on their own thread, so the settings window never waits.
+        // Every helper starts and stops on its own thread, so the settings window never waits.
         let helper = match self.desktop {
             Desktop::X11 => Helper::X11(ewmh::start(guarding)),
-            _ => Helper::Kwin(kwin::start(guarding)),
+            Desktop::Sway => Helper::Compositor(compositor::start::<Sway>(guarding)),
+            Desktop::Hyprland => Helper::Compositor(compositor::start::<Hyprland>(guarding)),
+            Desktop::GnomeWayland => Helper::Compositor(compositor::start::<Gnome>(guarding)),
+            // `new_guard` gives other Wayland compositors no window guard.
+            Desktop::PlasmaWayland | Desktop::OtherWayland => Helper::Kwin(kwin::start(guarding)),
         };
         self.running = Some(Running {
             card_display: card_display.to_owned(),
@@ -286,6 +320,7 @@ impl Guard for WindowGuard {
         match self.running.as_ref().map(|running| &running.helper) {
             Some(Helper::X11(helper)) => helper.follow_displays(),
             Some(Helper::Kwin(helper)) => helper.follow_displays(),
+            Some(Helper::Compositor(helper)) => helper.follow_displays(),
             None => {}
         }
     }
@@ -493,6 +528,33 @@ mod tests {
             guarding.check(3, "Stubborn", maximised, false, Instant::now()),
             Placement::Stay
         );
+    }
+
+    #[test]
+    fn a_fullscreen_window_left_alone_is_named_until_it_leaves_fullscreen() {
+        let (mut guarding, reports) = guarding(None);
+        guarding.follow_displays(work_area);
+        let _ = guarding.check(4, "Game", on_card(), false, Instant::now());
+        guarding.give_up_fullscreen(4);
+        assert_eq!(
+            reports.try_iter().last(),
+            Some(GuardReport::Notice(
+                "\"Game\" is fullscreen on the card display; cardcast can't move it without taking focus. Take it out of fullscreen or move it off to guard it again.".into()
+            ))
+        );
+        assert_eq!(
+            guarding.check(4, "Game", on_card(), false, Instant::now()),
+            Placement::Stay
+        );
+        guarding.movable_again(4);
+        assert_eq!(
+            reports.try_iter().last(),
+            Some(GuardReport::Notice(NO_POINTER_GUARD.into()))
+        );
+        assert!(matches!(
+            guarding.check(4, "Game", on_card(), false, Instant::now()),
+            Placement::MoveTo(_)
+        ));
     }
 
     #[test]

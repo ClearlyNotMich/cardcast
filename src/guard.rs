@@ -43,7 +43,7 @@ pub use displays::DisplayWatcher;
 pub(crate) use displays::device_node;
 
 #[cfg(target_os = "linux")]
-pub use linux::{DisplayWatcher, monitors};
+pub use linux::{DisplayWatcher, gnome, monitors};
 
 /// A monitor on the sender, as shown in the settings dropdowns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,15 +104,13 @@ pub fn new_guard(wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
     Box::new(window_guard::WindowGuard::new(wake))
 }
 
-/// The window guard on X11 and Plasma; elsewhere on Linux (#36) it says while it is on that it does
-/// not work there yet.
+/// The window guard on X11, Plasma, GNOME, sway and Hyprland; on other Wayland compositors (#36)
+/// it says while it is on that it does not work there.
 #[cfg(not(windows))]
 pub fn new_guard(wake: impl Fn() + Send + 'static) -> Box<dyn Guard> {
     match desktop::detect(|name| std::env::var(name).ok()) {
-        Some(found @ (desktop::Desktop::X11 | desktop::Desktop::PlasmaWayland)) => {
-            Box::new(linux::WindowGuard::new(found, monitors, wake))
-        }
-        _ => Box::new(NotOnThisDesktopYet::default()),
+        Some(desktop::Desktop::OtherWayland) | None => Box::new(NotOnThisDesktopYet::default()),
+        Some(found) => Box::new(linux::WindowGuard::new(found, monitors, wake)),
     }
 }
 
