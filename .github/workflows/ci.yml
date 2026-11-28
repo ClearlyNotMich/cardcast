@@ -69,6 +69,8 @@ jobs:
           xrandr --listmonitors
           openbox &
           for _ in $(seq 50); do xprop -root _NET_SUPPORTING_WM_CHECK | grep -q window && break; sleep 0.2; done
+          # openbox names itself before it has finished starting (a window mapped then went unmanaged once).
+          sleep 1
           cargo test guard_tests -- --nocapture --test-threads=1
       # The audio relay (#44): PipeWire and WirePlumber with two null sinks, a tone played into one.
       - if: runner.os == 'Linux'
@@ -126,7 +128,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: sudo modprobe udmabuf && ls -l /dev/udmabuf
+      # The runner's kernel has udmabuf in its extra modules.
+      - run: |
+          sudo apt-get update && sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          sudo modprobe udmabuf && ls -l /dev/udmabuf
       - run: docker run --rm --device /dev/udmabuf -v "$PWD:/src" archlinux:latest /src/.github/ci/kwin-guard.sh
 
   # Adds two virtual monitors (docs/research/ci-second-monitor.md) and runs the second_monitor tests.
