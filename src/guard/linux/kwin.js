@@ -51,7 +51,7 @@ function check(window) {
 function apply(window, reply) {
     if (stopped || window.deleted) return;
     const [action, ...words] = reply.split(" ");
-    if (action === "move") {
+    if (action === "move" && window.resourceClass !== "foot") {
         const [left, top, right, bottom] = words.map(Number);
         window.frameGeometry = { x: left, y: top, width: right - left, height: bottom - top };
     } else if (action === "send") {
