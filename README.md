@@ -37,7 +37,7 @@ flowchart LR
 - 🔀 **Input switching**: switch a monitor's input from the live layout, or from a Stream Deck key.
 - Recovers by itself when the capture card is unplugged, the resolution changes, a permission prompt appears or the graphics device is lost.
 
-Terms are defined in [`GLOSSARY.md`](GLOSSARY.md). The full design is in [`SPEC.md`](SPEC.md) and [`docs/adr/`](docs/adr/).
+Terms are defined in [`GLOSSARY.md`](GLOSSARY.md).
 
 <details>
 <summary><b>Setup details</b></summary>
