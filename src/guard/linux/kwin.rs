@@ -115,7 +115,7 @@ fn run(plugin: &str, service: Service, stop: &Receiver<()>) {
     loop {
         let kwin = name_owner(&connection, KWIN);
         if kwin_seen.as_ref() != Some(&kwin) {
-            if kwin.is_some() && kwin_seen.is_none() {
+            if kwin.is_some() {
                 if let Err(error) = load(&connection, &file, &name, plugin, &state) {
                     lock(&state).guarding.notice(&could_not_start(&error));
                 }
