@@ -68,7 +68,8 @@ jobs:
         run: xvfb-run -s '-screen 0 1280x1024x24 -noreset' sh -c 'xsetroot -solid "#cc6633" && cargo test mirror::linux::tests::desktop_captures -- --nocapture'
       # The mirror present (#43) from one output to another on X11, read back with GetImage. Xvfb
       # has one output, so this is X.Org with two of the dummy driver's; the test paints the
-      # source monitor. No Fifo check: lavapipe's X11 present doesn't wait for a vertical blank.
+      # source monitor. lavapipe's X11 present doesn't wait for a vertical blank, so this checks
+      # cardcast's own cap at the card display's refresh.
       - if: runner.os == 'Linux'
         name: Mirror on X.Org with two dummy outputs
         env:
@@ -76,6 +77,7 @@ jobs:
           CARDCAST_MIRROR_TO: DUMMY1
           CARDCAST_PAINT_SOURCE: '#cc6633'
           CARDCAST_EXPECT_COLOUR: '#cc6633'
+          CARDCAST_EXPECT_HZ: 60
         run: |
           sudo apt-get install -y xserver-xorg-core xserver-xorg-video-dummy
           printf 'Section "Device"\n Identifier "dummy"\n Driver "dummy"\n VideoRam 256000\nEndSection\nSection "Screen"\n Identifier "screen"\n Device "dummy"\n DefaultDepth 24\n SubSection "Display"\n  Depth 24\n  Virtual 2048 768\n EndSubSection\nEndSection\n' > "$RUNNER_TEMP/dummy.conf"

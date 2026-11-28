@@ -8,10 +8,12 @@ use super::present::Shown;
 use crate::guard::Monitor;
 use std::error::Error;
 use std::num::NonZeroU32;
+use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_output::{self, WlOutput};
+use wayland_client::protocol::wl_region::WlRegion;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, delegate_noop};
@@ -28,7 +30,8 @@ use wgpu::rwh::{
     XcbWindowHandle,
 };
 use x11rb::connection::Connection as _;
-use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+use x11rb::protocol::shape::{self, ConnectionExt as _};
+use x11rb::protocol::xproto::{ClipOrdering, ConnectionExt as _, CreateWindowAux, WindowClass};
 use x11rb::xcb_ffi::XCBConnection;
 
 pub enum Screen {
@@ -179,11 +182,36 @@ impl Layer {
         // Over panels too, and never the keyboard focus.
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        // Clicks go through to whatever is below; the card display takes no input.
+        let region = compositor.create_region(&handle, ());
+        surface.set_input_region(Some(&region));
+        region.destroy();
         // The first commit has no picture: it asks for the size and shows nothing yet.
         surface.commit();
+        // Bounded, so Stop never waits on a compositor that doesn't answer.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while events.configured.is_none() && !events.closed {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(Ended::Restart(
+                    "The desktop did not place the mirror on the card display.".into(),
+                ));
+            }
+            connection.flush().map_err(|error| failed(&error))?;
+            if let Some(guard) = queue.prepare_read() {
+                let mut ready = libc::pollfd {
+                    fd: guard.connection_fd().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let millis = libc::c_int::try_from(left.as_millis()).unwrap_or(libc::c_int::MAX);
+                // SAFETY: one valid pollfd, for the connection's descriptor, open for the call.
+                if unsafe { libc::poll(&raw mut ready, 1, millis) } > 0 {
+                    guard.read().map_err(|error| failed(&error))?;
+                }
+            }
             queue
-                .blocking_dispatch(&mut events)
+                .dispatch_pending(&mut events)
                 .map_err(|error| failed(&error))?;
         }
         let configured = events
@@ -300,6 +328,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for Events {
 }
 
 delegate_noop!(Events: WlCompositor);
+delegate_noop!(Events: WlRegion);
 delegate_noop!(Events: ignore WlSurface);
 delegate_noop!(Events: ZwlrLayerShellV1);
 delegate_noop!(Events: WpViewporter);
@@ -340,6 +369,18 @@ impl X11Window {
                 &CreateWindowAux::new()
                     .override_redirect(1)
                     .background_pixel(black),
+            )?
+            .check()?;
+        // An empty input shape: clicks go through to whatever is below.
+        connection
+            .shape_rectangles(
+                shape::SO::SET,
+                shape::SK::INPUT,
+                ClipOrdering::UNSORTED,
+                window,
+                0,
+                0,
+                &[],
             )?
             .check()?;
         let connection_pointer =

@@ -341,8 +341,11 @@ fn desktop_captures_a_frame_of_the_source_monitor() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     eprintln!(
-        "frame {}x{} fourcc {:08X}, restore token {:?}",
-        frame.width, frame.height, frame.fourcc, capture.restore_token
+        "frame {}x{} fourcc {:08X}, restore token given: {}",
+        frame.width,
+        frame.height,
+        frame.fourcc,
+        capture.restore_token.is_some()
     );
     // The portal hands a token only for a persistent permission (`persist_mode`).
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
@@ -606,11 +609,17 @@ fn desktop_mirrors_the_source_monitor_on_the_card_display() {
     let _painted = std::env::var("CARDCAST_PAINT_SOURCE")
         .ok()
         .map(|paint| paint_x11_source_monitor(&source, rgb(&paint)));
-    // A quarter in from the top-left: the pointer starts in the middle.
-    let (x, y) = (card.width / 4, card.height / 4);
-    let before = shown_on_output(&card, x, y);
+    // A quarter in from the top-left and from the bottom-right (the pointer starts in the middle):
+    // a mirror of the whole desktop, not just the source monitor, shows the card display's own
+    // old picture at one of them.
+    let points = [
+        (card.width / 4, card.height / 4),
+        (card.width * 3 / 4, card.height * 3 / 4),
+    ];
+    let shown_now = || points.map(|(x, y)| shown_on_output(&card, x, y));
+    let before = shown_now();
     eprintln!("{to} shows {before:02x?} before the mirror");
-    assert_ne!(before, expected, "{to} already shows {colour}");
+    assert!(!before.contains(&expected), "{to} already shows {colour}");
 
     let mut mirror = LinuxMirror::new(|| {}, None);
     mirror.start(&source, &card).unwrap();
@@ -629,18 +638,18 @@ fn desktop_mirrors_the_source_monitor_on_the_card_display() {
     let first = mirror.presents().unwrap();
     std::thread::sleep(Duration::from_secs(2));
     let rate = (mirror.presents().unwrap() - first) as f64 / 2.0;
-    let shown = shown_on_output(&card, x, y);
+    let shown = shown_now();
     eprintln!(
-        "{to} ({} Hz) shows {shown:02x?} with the mirror; {rate:.1} presents a second; restore token saved: {:?}",
+        "{to} ({} Hz) shows {shown:02x?} with the mirror; {rate:.1} presents a second; restore token saved: {}",
         card.refresh_hz,
-        mirror.take_restore_token()
+        matches!(mirror.take_restore_token(), Some(Some(_)))
     );
     assert!(
         mirror.is_running(),
         "the mirror ended: {:?}",
         mirror.take_end()
     );
-    assert_eq!(shown, expected, "{to} does not show {from}'s {colour}");
+    assert_eq!(shown, [expected; 2], "{to} does not show {from}'s {colour}");
     assert!(rate >= 10.0, "{rate:.1} presents a second");
     // Fifo: one present per refresh of the card display, never more.
     if let Ok(refresh) = std::env::var("CARDCAST_EXPECT_HZ") {
@@ -663,4 +672,83 @@ fn the_mirror_shader_is_valid_wgsl() {
     )
     .validate(&module)
     .unwrap();
+}
+
+#[test]
+fn x11_presents_keep_to_the_card_displays_refresh_and_catch_up_without_a_burst() {
+    use super::present::next_present;
+    use std::time::{Duration, Instant};
+    let start = Instant::now();
+    let period = Duration::from_secs(1) / 60;
+    // Steady: one refresh after the last planned present, even if the loop ran early.
+    assert_eq!(next_present(start, start, 60), start + period);
+    assert_eq!(next_present(start, start + period / 2, 60), start + period);
+    // After a stall of several refreshes, the next present is now, not a run of missed ones.
+    let late = start + period * 5;
+    assert_eq!(next_present(start, late, 60), late);
+    // An unknown refresh rate is taken as 60 Hz.
+    assert_eq!(next_present(start, start, 0), start + period);
+}
+
+#[test]
+fn stop_leaves_a_stuck_mirror_thread_behind_instead_of_freezing() {
+    use super::present::join_within;
+    use std::time::{Duration, Instant};
+    let (_release, stuck) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let _ = stuck.recv();
+    });
+    let started = Instant::now();
+    assert!(join_within(thread, Duration::from_millis(100)).is_none());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    let done = std::thread::spawn(|| 7);
+    assert_eq!(
+        join_within(done, Duration::from_secs(5)).map(Result::unwrap),
+        Some(7)
+    );
+}
+
+#[test]
+fn the_dma_buf_sync_file_ioctl_is_dma_buf_ioctl_export_sync_file() {
+    // linux/dma-buf.h: _IOWR(DMA_BUF_BASE 'b', 2, struct dma_buf_export_sync_file), 8 bytes.
+    assert_eq!(super::gpu::DMA_BUF_IOCTL_EXPORT_SYNC_FILE, 0xC008_6202);
+}
+
+#[test]
+fn an_imported_plane_is_taken_from_the_compositor_and_given_back_in_general_layout() {
+    use super::gpu::foreign_barrier;
+    use ash::vk;
+    let (acquire, acquire_stages) = foreign_barrier(vk::Image::null(), 3, true);
+    assert_eq!(
+        (
+            acquire.src_queue_family_index,
+            acquire.dst_queue_family_index
+        ),
+        (vk::QUEUE_FAMILY_FOREIGN_EXT, 3)
+    );
+    assert_eq!(
+        (acquire.old_layout, acquire.new_layout),
+        (
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL
+        )
+    );
+    assert_eq!(acquire.dst_access_mask, vk::AccessFlags::TRANSFER_READ);
+    assert_eq!(acquire_stages[1], vk::PipelineStageFlags::TRANSFER);
+    let (release, release_stages) = foreign_barrier(vk::Image::null(), 3, false);
+    assert_eq!(
+        (
+            release.src_queue_family_index,
+            release.dst_queue_family_index
+        ),
+        (3, vk::QUEUE_FAMILY_FOREIGN_EXT)
+    );
+    assert_eq!(
+        (release.old_layout, release.new_layout),
+        (
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::GENERAL
+        )
+    );
+    assert_eq!(release_stages[0], vk::PipelineStageFlags::TRANSFER);
 }

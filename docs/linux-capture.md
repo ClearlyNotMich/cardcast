@@ -125,15 +125,32 @@ even after Stop; its picture then has no receiver and is dropped, ending the str
 
 - **Surface** (research section 2): a `zwlr_layer_shell_v1` overlay on the card display's
   `wl_output` (matched by name), anchored to all edges, `exclusive_zone` -1, keyboard
-  interactivity none, drawn at the card display's resolution and scaled to its logical size with
-  `wp_viewporter`; on X11 an override-redirect window over its RandR rectangle. On GNOME the start
-  stops with "needs the GNOME extension (Linux 9)". The surface shows with the first picture.
+  interactivity none, an empty input region, drawn at the card display's resolution and scaled to
+  its logical size with `wp_viewporter`; on X11 an override-redirect window over its RandR
+  rectangle with an empty input shape (SHAPE). Clicks go through both. On GNOME the start stops
+  with "needs the GNOME extension (Linux 9)". The surface shows with the first picture.
 - **Drawing**: `PresentMode::Fifo`, frame latency 1, a black clear, then the picture aspect-fitted
-  with `mirror::fit`, each refresh; `presents()` counts the presents. A memory frame is uploaded
-  with `write_texture`. A DMA-BUF frame is imported with wgpu-hal's `texture_from_dmabuf_fd`
-  (single plane, modifiers the device lists with `TRANSFER_SRC` for both BGRA and RGBA), copied
-  into the kept texture, and dropped once the copy finished. A failed import restarts the mirror
-  offering no modifiers, so the stream falls back to shared memory.
+  with `mirror::fit`, each refresh; `presents()` counts the presents. On X11 the loop is also
+  capped at the card display's refresh (`present::next_present`), since a driver without vsync
+  (lavapipe measured 200-1000 a second) would otherwise grab with MIT-SHM that often.
+- **Memory frames** are uploaded with `write_texture`.
+- **DMA-BUF frames** are read as wlroots reads a client's DMA-BUF [7]: the device is opened with
+  `VK_EXT_queue_family_foreign` added (wgpu-hal's `open_with_callback`), else no modifiers are
+  offered. Per frame, cardcast exports the plane's sync file (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`,
+  Linux 6.0 [8]; on older kernels it polls the DMA-BUF itself, whose `POLLIN` waits for its
+  writers [8]) and waits up to 100 ms for it on the CPU (wgpu's submit takes no wait semaphore);
+  then imports it with `texture_from_dmabuf_fd` (single plane, modifiers the device lists with
+  `TRANSFER_SRC` for BGRA and RGBA), records an acquire barrier from `VK_QUEUE_FAMILY_FOREIGN_EXT`
+  in `GENERAL` layout to `TRANSFER_SRC_OPTIMAL` on the raw command buffer (`as_hal_mut`), copies
+  into the kept texture, releases it back to the foreign family in `GENERAL`, waits for the copy
+  (bounded) and drops the frame. wgpu is told the texture starts in `COPY_SRC`, so it never
+  transitions it from `UNDEFINED`. Only a failed import restarts the mirror without modifiers;
+  other failures restart it as they are. Checked locally (headless sway on Vulkan, AMD RADV, an
+  AMD tiled modifier); CI has no graphics card, so it takes the shared-memory path.
+
+**Stop** waits at most a second for the mirror thread; one stuck in the compositor (a Fifo present
+while the card display sleeps) is left to end on its own. Waiting for the layer surface's first
+configure is bounded to 5 seconds.
 
 ## Sources
 
@@ -147,3 +164,8 @@ even after Stop; its picture then has no receiver and is dropped, ending the str
 [5] XFixes protocol, <https://gitlab.freedesktop.org/xorg/proto/xorgproto/-/blob/master/fixesproto.txt>
 [6] xdg-desktop-portal-wlr(5),
 <https://github.com/emersion/xdg-desktop-portal-wlr/blob/master/xdg-desktop-portal-wlr.5.scd>
+[7] wlroots, `render/vulkan/pass.c` (foreign acquire and release barriers),
+`render/vulkan/vulkan.c` (`VK_EXT_queue_family_foreign`), `render/dmabuf_linux.c`
+(`DMA_BUF_IOCTL_EXPORT_SYNC_FILE`), <https://gitlab.freedesktop.org/wlroots/wlroots>
+[8] Linux, DMA-BUF sharing: "Implicit Fence Poll Support" and `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`,
+<https://docs.kernel.org/driver-api/dma-buf.html>, `include/uapi/linux/dma-buf.h`

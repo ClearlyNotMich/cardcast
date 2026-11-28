@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What the status line says on GNOME until cardcast's Shell extension exists (Linux 9): GNOME has
 /// no layer-shell, and a fullscreen window there takes the game's focus.
@@ -124,11 +124,12 @@ impl Mirror for LinuxMirror {
     }
 
     /// Joins the mirror thread; a capture still waiting on the portal's dialog is left to finish
-    /// on its own thread.
+    /// on its own thread. A mirror thread stuck in the compositor (a present while the card display
+    /// sleeps) is left too, and ends on its own once it returns, so Stop never freezes the window.
     fn stop(&mut self) {
         if let Some(running) = self.running.take() {
             running.quit.store(true, Ordering::Relaxed);
-            let _ = running.thread.join();
+            let _ = join_within(running.thread, Duration::from_secs(1));
         }
     }
 
@@ -170,6 +171,28 @@ pub fn take_unsaved(token: &Mutex<Token>) -> Option<Option<String>> {
     std::mem::take(&mut token.unsaved).then(|| token.current.clone())
 }
 
+/// `thread`'s result if it ends `within` that time; otherwise it is left running.
+pub fn join_within<T>(thread: JoinHandle<T>, within: Duration) -> Option<std::thread::Result<T>> {
+    let deadline = Instant::now() + within;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Some(thread.join())
+}
+
+/// When to present next where the present doesn't wait for the card display's refresh (X11: a
+/// driver without vsync, or a software one): one refresh after the last planned present, or `now`
+/// after a stall, so missed refreshes don't come as a burst. An unknown refresh rate counts as 60 Hz.
+pub fn next_present(planned: Instant, now: Instant, refresh_hz: u32) -> Instant {
+    let refresh_hz = if refresh_hz == 0 { 60 } else { refresh_hz };
+    let period = Duration::from_secs(1) / refresh_hz;
+    let next = planned + period;
+    if next + period < now { now } else { next }
+}
+
 /// Wakes the settings window when the mirror thread ends, however it ends (a panic too).
 struct WakeOnEnd(Arc<dyn Fn() + Send + Sync>);
 
@@ -199,8 +222,9 @@ impl Thread {
         let card_display = monitors
             .iter()
             .find(|monitor| monitor.device_path == self.card_display.device_path)
-            .ok_or_else(|| Ended::Restart("The card display is not connected.".into()))?;
-        let mut screen = Screen::open(shown, card_display)?;
+            .ok_or_else(|| Ended::Restart("The card display is not connected.".into()))?
+            .clone();
+        let mut screen = Screen::open(shown, &card_display)?;
         let mut gpu = Gpu::open(&screen)?;
         let modifiers = if self.no_dma_buf.load(Ordering::Relaxed) {
             Vec::new()
@@ -218,7 +242,15 @@ impl Thread {
         };
         // Shown only once capture works, so a start that keeps failing never covers the card display.
         screen.show()?;
+        // On X11 each loop is a full MIT-SHM grab too, so it keeps to the refresh whatever the driver does.
+        let paced = matches!(screen, Screen::X11(_));
+        let mut planned = Instant::now();
         while !self.quit.load(Ordering::Relaxed) {
+            if paced {
+                let now = Instant::now();
+                planned = next_present(planned, now, card_display.refresh_hz);
+                std::thread::sleep(planned.saturating_duration_since(now));
+            }
             screen.follow()?;
             match picture.take_frame()?.map(|frame| gpu.take(frame)) {
                 Some(Taken::NotImported(why)) => {

@@ -7,7 +7,7 @@ use super::super::{Ended, Frame, Pixels, fit};
 use super::screen::Screen;
 use super::{ABGR8888, ARGB8888, XBGR8888, XRGB8888, rows};
 use ash::vk;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use wgpu::hal::api::Vulkan;
 
 /// What became of a frame handed to [`Gpu::take`].
@@ -26,6 +26,9 @@ struct Kept {
 }
 
 pub struct Gpu {
+    /// With DMA-BUF import: the raw device and its queue family, to take each imported plane
+    /// over from the compositor (`VK_QUEUE_FAMILY_FOREIGN_EXT`) and give it back.
+    foreign: Option<(ash::Device, u32)>,
     // The surface goes before the device and instance it was made with.
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -90,6 +93,145 @@ pub fn importable(properties: &[vk::DrmFormatModifierPropertiesEXT]) -> Vec<u64>
         .collect()
 }
 
+/// `DMA_BUF_IOCTL_EXPORT_SYNC_FILE` (linux/dma-buf.h, Linux 6.0): `_IOWR('b', 2, struct
+/// dma_buf_export_sync_file { __u32 flags; __s32 fd; })`.
+pub const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u64 = (3 << 30) | (8 << 16) | ((b'b' as u64) << 8) | 2;
+/// `DMA_BUF_SYNC_READ`: a sync file of the writes a reader must wait for.
+const DMA_BUF_SYNC_READ: u32 = 1;
+
+/// Waits up to a refresh for the writes to the DMA-BUF `fd`: on its exported sync file, or on
+/// older kernels on the DMA-BUF itself, whose `POLLIN` waits for its writers (the kernel's
+/// dma-buf "Implicit Fence Poll Support"). False if they didn't finish in time.
+fn wait_for_writes(fd: std::os::fd::BorrowedFd) -> Result<bool, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    #[repr(C)]
+    struct ExportSyncFile {
+        flags: u32,
+        fd: i32,
+    }
+    let mut export = ExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    // SAFETY: `fd` is an open DMA-BUF and `export` the struct this ioctl takes; on success the
+    // kernel puts a new sync file descriptor in it, owned below.
+    let exported = unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            DMA_BUF_IOCTL_EXPORT_SYNC_FILE as libc::c_ulong,
+            &raw mut export,
+        )
+    } == 0;
+    // SAFETY: on success `export.fd` is a sync file this call owns.
+    let sync_file = exported.then(|| unsafe { OwnedFd::from_raw_fd(export.fd) });
+    let mut waited = libc::pollfd {
+        fd: sync_file
+            .as_ref()
+            .map_or(fd.as_raw_fd(), AsRawFd::as_raw_fd),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd, for a descriptor open for the whole call.
+    match unsafe { libc::poll(&raw mut waited, 1, 100) } {
+        -1 => Err(std::io::Error::last_os_error().to_string()),
+        0 => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+/// The barrier, with its source and destination stages, that takes the image of an imported
+/// DMA-BUF over from the foreign queue family to `family` to copy from (`acquire`), or gives it
+/// back after the copy, as wlroots does (`render/vulkan/pass.c`). The layout outside is `GENERAL`.
+pub fn foreign_barrier(
+    image: vk::Image,
+    family: u32,
+    acquire: bool,
+) -> (vk::ImageMemoryBarrier<'static>, [vk::PipelineStageFlags; 2]) {
+    let barrier = vk::ImageMemoryBarrier::default()
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1),
+        );
+    if acquire {
+        (
+            barrier
+                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .dst_queue_family_index(family)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ),
+            [
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+            ],
+        )
+    } else {
+        (
+            barrier
+                .src_queue_family_index(family)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_READ),
+            [
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            ],
+        )
+    }
+}
+
+/// Whether the adapter's device has `VK_EXT_queue_family_foreign`, which DMA-BUF import needs to
+/// take planes over from the compositor; without it cardcast asks for shared memory.
+fn has_queue_family_foreign(adapter: &wgpu::Adapter) -> bool {
+    // SAFETY: the adapter is Vulkan (the instance has no other backend); only queried here.
+    let Some(adapter) = (unsafe { adapter.as_hal::<Vulkan>() }) else {
+        return false;
+    };
+    // SAFETY: a plain query on the adapter's own physical device.
+    let Ok(extensions) = (unsafe {
+        adapter
+            .shared_instance()
+            .raw_instance()
+            .enumerate_device_extension_properties(adapter.raw_physical_device())
+    }) else {
+        return false;
+    };
+    extensions.iter().any(|extension| {
+        extension.extension_name_as_c_str() == Ok(ash::ext::queue_family_foreign::NAME)
+    })
+}
+
+/// Opens the device as wgpu would, plus `VK_EXT_queue_family_foreign`.
+fn open_with_queue_family_foreign(
+    adapter: &wgpu::Adapter,
+    descriptor: &wgpu::DeviceDescriptor,
+) -> Result<(wgpu::Device, wgpu::Queue), String> {
+    let opened = {
+        // SAFETY: the adapter is Vulkan (the instance has no other backend).
+        let hal = unsafe { adapter.as_hal::<Vulkan>() }.ok_or("not a Vulkan adapter")?;
+        // SAFETY: the callback only adds an extension the device lists (`has_queue_family_foreign`).
+        unsafe {
+            hal.open_with_callback(
+                descriptor.required_features,
+                &descriptor.required_limits,
+                &descriptor.memory_hints,
+                Some(Box::new(|arguments| {
+                    arguments
+                        .extensions
+                        .push(ash::ext::queue_family_foreign::NAME);
+                })),
+            )
+        }
+        .map_err(|error| error.to_string())?
+    };
+    // SAFETY: `opened` came from this adapter, with exactly the descriptor's features.
+    unsafe { adapter.create_device_from_hal(opened, descriptor) }.map_err(|error| error.to_string())
+}
+
 /// The output of a future that is ready at once, as wgpu's native ones are; `None` otherwise.
 fn ready<T>(future: impl Future<Output = T>) -> Option<T> {
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());
@@ -131,18 +273,40 @@ impl Gpu {
                 "The mirror needs Vulkan: install your graphics card's Vulkan driver. ({error})"
             ))
         })?;
-        let (device, queue) = ready(adapter.request_device(&wgpu::DeviceDescriptor {
+        let dma_buf = adapter
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+            && has_queue_family_foreign(&adapter);
+        let descriptor = wgpu::DeviceDescriptor {
             label: Some("cardcast mirror"),
-            required_features: adapter.features() & wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF,
+            required_features: if dma_buf {
+                wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF
+            } else {
+                wgpu::Features::empty()
+            },
             required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
             ..Default::default()
-        }))
-        .ok_or_else(|| Ended::Restart("The graphics card did not answer.".into()))?
-        .map_err(|error| {
+        };
+        let opened = if dma_buf {
+            open_with_queue_family_foreign(&adapter, &descriptor)
+        } else {
+            ready(adapter.request_device(&descriptor))
+                .ok_or_else(|| "the graphics card did not answer".to_owned())
+                .and_then(|opened| opened.map_err(|error| error.to_string()))
+        };
+        let (device, queue) = opened.map_err(|error| {
             Ended::Restart(format!(
                 "Could not start the mirror on the graphics card. ({error})"
             ))
         })?;
+        let foreign = dma_buf
+            .then(|| {
+                // SAFETY: the device is Vulkan (the instance has no other backend); its ash handle
+                // is cloned and used only while `device` lives (it is dropped with this Gpu).
+                let hal = unsafe { device.as_hal::<Vulkan>() }?;
+                Some((hal.raw_device().clone(), hal.queue_family_index()))
+            })
+            .flatten();
         let (width, height) = screen.size();
         let mut config = surface
             .get_default_config(&adapter, width, height)
@@ -213,6 +377,7 @@ impl Gpu {
             ..Default::default()
         });
         Ok(Self {
+            foreign,
             surface,
             config,
             view_format,
@@ -229,11 +394,7 @@ impl Gpu {
 
     /// The DMA-BUF modifiers this device imports in all four formats; none without the extensions.
     pub fn modifiers(&self) -> Vec<u64> {
-        if !self
-            .device
-            .features()
-            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
-        {
+        if self.foreign.is_none() {
             return Vec::new();
         }
         // SAFETY: the adapter is Vulkan (the instance has no other backend); only queried here.
@@ -319,7 +480,7 @@ impl Gpu {
                 modifier,
             } => match self.import(fd, (offset, stride, modifier), extent, format, &texture) {
                 Ok(()) => Taken::Yes,
-                Err(why) => Taken::NotImported(why),
+                Err(taken) => taken,
             },
         }
         // `frame.release` is dropped here, after the copy.
@@ -371,7 +532,10 @@ impl Gpu {
     }
 
     /// Imports the DMA-BUF plane `fd` (`offset`, `stride`, `modifier`) and copies it into
-    /// `texture`, waiting until the copy is done so the capture can have its buffer back.
+    /// `texture`, as wlroots reads a client's DMA-BUF (`render/vulkan/pass.c`): wait for the
+    /// compositor's writes (its sync file), take the plane over from the foreign queue family in
+    /// `GENERAL` layout, copy, give it back, and wait until the copy is done so the capture can
+    /// have its buffer back. `NotImported` only if the graphics card can't import it.
     fn import(
         &self,
         fd: OwnedFd,
@@ -379,7 +543,19 @@ impl Gpu {
         extent: wgpu::Extent3d,
         format: wgpu::TextureFormat,
         texture: &wgpu::Texture,
-    ) -> Result<(), String> {
+    ) -> Result<(), Taken> {
+        let Some((raw_device, family)) = &self.foreign else {
+            return Err(Taken::NotImported("no DMA-BUF import".into()));
+        };
+        let failed = |error: String| {
+            Taken::Failed(Ended::Restart(format!(
+                "The mirror lost the graphics card; restarting it. ({error})"
+            )))
+        };
+        if !wait_for_writes(fd.as_fd()).map_err(failed)? {
+            // The compositor is still drawing it after a refresh: keep the last picture.
+            return Ok(());
+        }
         let hal_descriptor = wgpu::hal::TextureDescriptor {
             label: Some("captured DMA-BUF"),
             size: extent,
@@ -393,10 +569,11 @@ impl Gpu {
         };
         let imported = {
             // SAFETY: the device is Vulkan (the instance has no other backend).
-            let device = unsafe { self.device.as_hal::<Vulkan>() }.ok_or("not a Vulkan device")?;
-            // SAFETY: the device has VULKAN_EXTERNAL_MEMORY_DMA_BUF (`modifiers` offered none
-            // without it), and `fd`, `modifier`, `stride` and `offset` describe the single plane
-            // as PipeWire gave it, in the size and format of `hal_descriptor`.
+            let device = unsafe { self.device.as_hal::<Vulkan>() }
+                .ok_or_else(|| Taken::NotImported("not a Vulkan device".into()))?;
+            // SAFETY: the device has VULKAN_EXTERNAL_MEMORY_DMA_BUF (`foreign` is set only then),
+            // and `fd`, `modifier`, `stride` and `offset` describe the single plane as PipeWire
+            // gave it, in the size and format of `hal_descriptor`.
             unsafe {
                 device.texture_from_dmabuf_fd(
                     fd,
@@ -406,10 +583,10 @@ impl Gpu {
                     offset.into(),
                 )
             }
-            .map_err(|error| error.to_string())?
+            .map_err(|error| Taken::NotImported(error.to_string()))?
         };
-        // SAFETY: `imported` was made on this device from `hal_descriptor`, which this matches; its
-        // memory holds the compositor's picture, in no layout wgpu knows (so UNINITIALIZED).
+        // SAFETY: `imported` was made on this device from `hal_descriptor`, which this matches.
+        // wgpu is told it is ready to copy from: the acquire barrier below puts it there first.
         let imported = unsafe {
             self.device.create_texture_from_hal::<Vulkan>(
                 imported,
@@ -423,21 +600,59 @@ impl Gpu {
                     usage: wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 },
-                wgpu::TextureUses::UNINITIALIZED,
+                wgpu::TextureUses::COPY_SRC,
             )
         };
+        // SAFETY: the texture is Vulkan; its image lives as long as `imported`.
+        let image = unsafe { imported.as_hal::<Vulkan>() }
+            .map(|hal| {
+                // SAFETY: only the handle is read, for barriers recorded while `imported` lives.
+                unsafe { hal.raw_handle() }
+            })
+            .ok_or_else(|| Taken::NotImported("not a Vulkan texture".into()))?;
+        let acquire = self.barrier(raw_device, foreign_barrier(image, *family, true));
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_texture_to_texture(imported.as_image_copy(), texture.as_image_copy(), extent);
-        let submitted = self.queue.submit([encoder.finish()]);
+        let release = self.barrier(raw_device, foreign_barrier(image, *family, false));
+        let submitted = self.queue.submit([acquire, encoder.finish(), release]);
         self.device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(submitted),
-                timeout: None,
+                timeout: Some(std::time::Duration::from_secs(1)),
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| failed(error.to_string()))?;
         Ok(())
+    }
+
+    /// A command buffer with only `barrier` in it, recorded on the raw Vulkan command buffer.
+    fn barrier(
+        &self,
+        raw_device: &ash::Device,
+        (barrier, stages): (vk::ImageMemoryBarrier<'static>, [vk::PipelineStageFlags; 2]),
+    ) -> wgpu::CommandBuffer {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // SAFETY: the encoder is Vulkan and open; only a pipeline barrier on an image that outlives
+        // the submission is recorded, and wgpu is not used on this encoder meanwhile.
+        unsafe {
+            encoder.as_hal_mut::<Vulkan, _, _>(|hal| {
+                if let Some(hal) = hal {
+                    raw_device.cmd_pipeline_barrier(
+                        hal.raw_handle(),
+                        stages[0],
+                        stages[1],
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier],
+                    );
+                }
+            });
+        }
+        encoder.finish()
     }
 
     /// Draws the kept picture, aspect-fitted on black, and presents it at the card display's next
