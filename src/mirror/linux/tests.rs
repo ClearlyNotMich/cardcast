@@ -681,13 +681,56 @@ fn x11_presents_keep_to_the_card_displays_refresh_and_catch_up_without_a_burst()
     let start = Instant::now();
     let period = Duration::from_secs(1) / 60;
     // Steady: one refresh after the last planned present, even if the loop ran early.
-    assert_eq!(next_present(start, start, 60), start + period);
-    assert_eq!(next_present(start, start + period / 2, 60), start + period);
+    assert_eq!(next_present(start, start, period), start + period);
+    assert_eq!(
+        next_present(start, start + period / 2, period),
+        start + period
+    );
     // After a stall of several refreshes, the next present is now, not a run of missed ones.
     let late = start + period * 5;
-    assert_eq!(next_present(start, late, 60), late);
-    // An unknown refresh rate is taken as 60 Hz.
-    assert_eq!(next_present(start, start, 0), start + period);
+    assert_eq!(next_present(start, late, period), late);
+}
+
+#[test]
+fn x11_refresh_period_is_the_exact_mode_timing_and_skips_no_refresh_at_59_94_hz() {
+    use super::present::next_present;
+    use super::screen::refresh_period;
+    use std::time::{Duration, Instant};
+    use x11rb::protocol::randr::{ModeFlag, ModeInfo};
+    // 1920x1080 at 59.94 Hz: 148.35 MHz over 2200 x 1125.
+    let mode = ModeInfo {
+        dot_clock: 148_350_000,
+        htotal: 2200,
+        vtotal: 1125,
+        ..ModeInfo::default()
+    };
+    let period = refresh_period(&mode);
+    // The card display's refreshes, exactly: refresh k is at k * htotal * vtotal / dot_clock seconds.
+    let refresh_ns = |k: u128| k * 2200 * 1125 * 1_000_000_000 / 148_350_000;
+    let start = Instant::now();
+    let mut planned = start;
+    for k in 1..=100_000 {
+        planned = next_present(planned, planned, period);
+        let at = (planned - start).as_nanos();
+        // Each present is ready by its refresh and lands after the one before: none skipped.
+        assert!(at <= refresh_ns(k) && at > refresh_ns(k - 1), "refresh {k}");
+    }
+    // Interlace halves the lines per refresh (a field); doublescan doubles them.
+    let flagged = |mode_flags| refresh_period(&ModeInfo { mode_flags, ..mode });
+    assert_eq!(period, Duration::from_nanos(16_683_518));
+    assert_eq!(
+        flagged(ModeFlag::INTERLACE),
+        Duration::from_nanos(8_341_759)
+    );
+    assert_eq!(
+        flagged(ModeFlag::DOUBLE_SCAN),
+        Duration::from_nanos(33_367_037)
+    );
+    // A mode without timings is taken as 60 Hz.
+    assert_eq!(
+        refresh_period(&ModeInfo::default()),
+        Duration::from_secs(1) / 60
+    );
 }
 
 #[test]
