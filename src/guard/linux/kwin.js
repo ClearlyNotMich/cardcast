@@ -8,9 +8,9 @@ const guard = "@INTERFACE@";
 const path = "/guard";
 let stopped = false;
 let sweep = -1;
+const timer = new QTimer();
+timer.interval = 1000;
 const pending = new Set();
-// Windows unmaximised to see where they restore to, to be maximised again (Guarding::check).
-const remaximising = new Set();
 
 // Checks windows once they have been still for a moment, so a burst of changes is checked once.
 const settle = new QTimer();
@@ -36,34 +36,27 @@ function check(window) {
     if (stopped || window.deleted) return;
     // A window being dragged or resized is checked when that ends (moveResizedChanged).
     if (window.move || window.resize) return;
-    // Not unmaximised yet: its restored frame comes with a later change.
-    if (remaximising.has(window) && window.maximizeMode === 3) return;
     const g = window.frameGeometry;
     const state = [g.x, g.y, g.x + g.width, g.y + g.height]
         .map(Math.round)
         .concat([window.maximizeMode === 3, window.minimized,
-            !(window.normalWindow || window.dialog), remaximising.has(window)].map(Number))
+            !(window.normalWindow || window.dialog)].map(Number))
         .join(" ");
     callDBus(service, path, guard, "Check", id(window), window.caption, state,
         reply => apply(window, reply));
 }
 
-// The reply is "stay", "move <left> <top> <right> <bottom>", "unmaximise" or "maximise <restore>".
+// The reply is "stay", "move <left> <top> <right> <bottom>" or "send <output>"; KWin's own move
+// to another output keeps a maximised window maximised and moves its restore rectangle along.
 function apply(window, reply) {
     if (stopped || window.deleted) return;
-    const [action, left, top, right, bottom] = reply.split(" ").map((word, i) => i ? Number(word) : word);
-    const rect = { x: left, y: top, width: right - left, height: bottom - top };
-    const remaximise = remaximising.delete(window);
+    const [action, ...words] = reply.split(" ");
     if (action === "move") {
-        window.frameGeometry = rect;
-    } else if (action === "unmaximise") {
-        remaximising.add(window);
-        window.setMaximize(false, false);
-    } else if (action === "maximise") {
-        window.frameGeometry = rect;
-        window.setMaximize(true, true);
-    } else if (remaximise) {
-        window.setMaximize(true, true);
+        const [left, top, right, bottom] = words.map(Number);
+        window.frameGeometry = { x: left, y: top, width: right - left, height: bottom - top };
+    } else if (action === "send") {
+        const output = workspace.screens.find(output => output.name === words.join(" "));
+        if (output) workspace.sendClientToScreen(window, output);
     }
 }
 
@@ -108,12 +101,9 @@ function stop() {
 workspace.windowAdded.connect(watch);
 workspace.windowRemoved.connect(window => {
     pending.delete(window);
-    remaximising.delete(window);
     if (!stopped) callDBus(service, path, guard, "Forget", id(window));
 });
 workspace.windowList().forEach(window => watch(window));
-const timer = new QTimer();
-timer.interval = 1000;
 timer.timeout.connect(poll);
 timer.start();
 poll();

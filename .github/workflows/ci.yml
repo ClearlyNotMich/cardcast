@@ -121,29 +121,13 @@ jobs:
           $subsystem = [BitConverter]::ToUInt16($b, [BitConverter]::ToInt32($b, 0x3c) + 24 + 68)
           if ($subsystem -ne 2) { throw "cardcast.exe subsystem is $subsystem, expected 2 (Windows GUI)" }
 
-  # The window guard's KWin script (#47) on kwin_wayland --virtual with two outputs, in Arch, which
-  # has KWin 6 like the sender.
+  # The window guard's KWin script (#47) on kwin_wayland --virtual in an Arch container; see the script.
   kwin:
     runs-on: ubuntu-latest
-    container: archlinux:latest
     steps:
-      - run: pacman -Syu --noconfirm --needed base-devel git rust kwin xorg-xwayland
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --no-run
-      - name: Window guard on kwin_wayland --virtual
-        env:
-          CARDCAST_GUARD_DESKTOP: kwin
-          XDG_CURRENT_DESKTOP: KDE
-          XDG_SESSION_TYPE: wayland
-        run: |
-          # The container lacks CAP_SYS_NICE, so kwin_wayland's file capability would stop it starting.
-          setcap -r /usr/bin/kwin_wayland
-          export XDG_RUNTIME_DIR=$(mktemp -d)
-          printf '#!/bin/sh\ncd %s\ncargo test guard_tests -- --nocapture --test-threads=1\necho $? > status\n' "$PWD" > session.sh
-          chmod +x session.sh
-          dbus-run-session -- kwin_wayland --virtual --xwayland --output-count 2 --width 1280 --height 1024 --exit-with-session "$PWD/session.sh"
-          exit "$(cat status 2>/dev/null || echo 1)"
+      - run: sudo modprobe udmabuf && ls -l /dev/udmabuf
+      - run: docker run --rm --device /dev/udmabuf -v "$PWD:/src" archlinux:latest /src/.github/ci/kwin-guard.sh
 
   # Adds two virtual monitors (docs/research/ci-second-monitor.md) and runs the second_monitor tests.
   # The driver is third-party and its certificate becomes a trusted root, so this job gets no secrets and read-only access.

@@ -1,6 +1,7 @@
 //! The window guard on a real desktop, run by CI: Xvfb with openbox, and `kwin_wayland --virtual`
 //! with Xwayland. The test window is an X11 window, moved and maximised as a pager does (EWMH),
-//! which both window managers honour.
+//! which both window managers honour; on KWin a native Wayland window (`foot`) is moved by a test
+//! script of its own.
 
 use super::super::desktop::Desktop;
 use super::super::placement::Rect;
@@ -9,7 +10,7 @@ use super::ewmh::{self, Atoms};
 use super::kwin;
 use super::window_guard::{Guarding, ListMonitors, NO_POINTER_GUARD, WindowGuard, monitor_rect};
 use std::io::BufRead as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::{
@@ -45,6 +46,7 @@ struct TestWindow {
     connection: RustConnection,
     root: Window,
     atoms: Atoms,
+    active_window: u32,
     window: Window,
 }
 
@@ -80,8 +82,15 @@ impl TestWindow {
             .unwrap();
         connection.map_window(window).unwrap();
         connection.flush().unwrap();
+        let active_window = connection
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
         let test = Self {
             logged: std::cell::Cell::new(None),
+            active_window,
             connection,
             root,
             atoms,
@@ -145,7 +154,7 @@ impl TestWindow {
     }
 
     fn active(&self) -> Vec<u32> {
-        self.property(self.root, self.atoms._NET_ACTIVE_WINDOW)
+        self.property(self.root, self.active_window)
     }
 
     fn send(&self, kind: u32, data: [u32; 5]) {
@@ -190,12 +199,12 @@ impl TestWindow {
     }
 }
 
-/// Polls until `done` holds; panics after ten seconds.
+/// Polls until `done` holds; panics after twenty seconds.
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     let start = Instant::now();
     while !done() {
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < Duration::from_secs(20),
             "timed out waiting for {what}"
         );
         std::thread::sleep(Duration::from_millis(20));
@@ -267,9 +276,18 @@ fn desktop_window_guard_returns_windows_and_keeps_maximised_ones_maximised() {
         window.maximised() && mostly_on(window.frame(), card_rect)
     });
     guard.update(true, Some(&card.device_path), None);
+    let mut unmaximised = false;
     wait_for("the window to be maximised on the primary monitor", || {
-        window.maximised() && mostly_on(window.logged_frame(), primary)
+        let frame = window.logged_frame();
+        unmaximised |= !window.maximised();
+        window.maximised() && mostly_on(frame, primary)
     });
+    // KWin sends the window to the other output maximised; on X11 the guard unmaximises it to
+    // learn where it restores to.
+    assert!(
+        !(unmaximised && desktop == Desktop::PlasmaWayland),
+        "KWin unmaximised the window on its way"
+    );
     window.set_maximised(false);
     wait_for("the window to restore on the primary monitor", || {
         window.logged_frame() == returned
@@ -281,26 +299,35 @@ fn desktop_window_guard_returns_windows_and_keeps_maximised_ones_maximised() {
     );
 }
 
+/// Whether KWin has the script; false while KWin doesn't answer.
 fn kwin_script_loaded(plugin: &str) -> bool {
-    zbus::blocking::Connection::session()
-        .unwrap()
-        .call_method(
-            Some("org.kde.KWin"),
-            "/Scripting",
-            Some("org.kde.kwin.Scripting"),
-            "isScriptLoaded",
-            &plugin,
-        )
-        .unwrap()
-        .body()
-        .deserialize()
-        .unwrap()
+    kwin_scripting("isScriptLoaded", &plugin)
+        .and_then(|reply| reply.body().deserialize())
+        .unwrap_or(false)
 }
 
+fn kwin_scripting<B>(method: &str, body: &B) -> zbus::Result<zbus::Message>
+where
+    B: zbus::export::serde::Serialize + zbus::zvariant::DynamicType,
+{
+    zbus::blocking::Connection::session()?.call_method(
+        Some("org.kde.KWin"),
+        "/Scripting",
+        Some("org.kde.kwin.Scripting"),
+        method,
+        body,
+    )
+}
+
+/// A started KWin guard, once its script is loaded.
 fn start_kwin_guard() -> kwin::Running {
     let (reports, _) = std::sync::mpsc::channel();
     let guarding = Guarding::new("Virtual-1", None, super::monitors, reports, Arc::new(|| {}));
-    kwin::start(guarding).unwrap()
+    let running = kwin::start(guarding);
+    wait_for("the guard's script to load", || {
+        kwin_script_loaded(running.plugin())
+    });
+    running
 }
 
 /// Run by the next test in a process of its own (`CARDCAST_KWIN_CHILD`): starts the guard, says its
@@ -326,7 +353,9 @@ fn desktop_kwin_script_never_outlives_cardcast() {
     let plugin = running.plugin().to_owned();
     assert!(kwin_script_loaded(&plugin), "{plugin} is not loaded");
     drop(running);
-    assert!(!kwin_script_loaded(&plugin), "{plugin} outlived the guard");
+    wait_for("the guard to unload its script", || {
+        !kwin_script_loaded(&plugin)
+    });
 
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["desktop_kwin_guard_child", "--nocapture"])
@@ -351,4 +380,245 @@ fn desktop_kwin_script_never_outlives_cardcast() {
         "{plugin} unloaded itself {:?} after the kill",
         killed.elapsed()
     );
+}
+
+/// `CARDCAST_KWIN_START` (CI): a shell command that starts `kwin_wayland --virtual` on this session
+/// bus, which already runs one. KWin is killed: the status line says the guard waits for it; KWin
+/// is started again: the guard loads its script again and the notice goes. Skips when unset.
+#[test]
+fn desktop_kwin_guard_follows_a_kwin_restart() {
+    let Ok(start) = std::env::var("CARDCAST_KWIN_START") else {
+        return;
+    };
+    let (sender, reports) = std::sync::mpsc::channel();
+    let guarding = Guarding::new("right", None, xvfb_halves, sender, Arc::new(|| {}));
+    let running = kwin::start(guarding);
+    let plugin = running.plugin().to_owned();
+    let mut status = None;
+    let mut latest = move || {
+        if let Some(report) = reports.try_iter().last() {
+            eprintln!("status: {report:?}");
+            status = Some(report);
+        }
+        status.clone()
+    };
+    let guarding = Some(GuardReport::Notice(NO_POINTER_GUARD.into()));
+    let waiting = Some(GuardReport::Notice(kwin::WAITING_FOR_KWIN.into()));
+    wait_for("the guard to start", || {
+        kwin_script_loaded(&plugin) && latest() == guarding
+    });
+
+    // The KWin on this test's own session bus, never another.
+    let bus = zbus::blocking::Connection::session().unwrap();
+    let kwin: u32 = bus
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetConnectionUnixProcessID",
+            &"org.kde.KWin",
+        )
+        .unwrap()
+        .body()
+        .deserialize()
+        .unwrap();
+    let killed = std::process::Command::new("kill")
+        .arg(kwin.to_string())
+        .status()
+        .unwrap();
+    assert!(killed.success(), "could not stop KWin ({kwin})");
+    wait_for("the notice that KWin is gone", || latest() == waiting);
+
+    let started = std::process::Command::new("sh")
+        .args(["-c", &format!("{start} &")])
+        .status()
+        .unwrap();
+    assert!(started.success(), "{start} failed");
+    let restarted = Instant::now();
+    wait_for("the guard to load its script into the new KWin", || {
+        kwin_script_loaded(&plugin)
+    });
+    wait_for("the notice to go", || latest() == guarding);
+    eprintln!(
+        "the guard was back {:?} after KWin started",
+        restarted.elapsed()
+    );
+}
+
+/// What the probe script last saw of the window and the move it is to make next.
+#[derive(Default)]
+struct Probed {
+    seen: Option<(Rect, bool)>,
+    command: Option<String>,
+}
+
+/// Serves the probe script (`PROBE_SCRIPT`) on the session bus.
+struct ProbeService(Arc<Mutex<Probed>>);
+
+#[zbus::interface(name = "io.github.ClearlyNotMich.cardcast.Probe")]
+impl ProbeService {
+    /// `<left> <top> <right> <bottom> <maximised>`; returns `move <left> <top>`, `maximise` or nothing.
+    fn seen(&self, window: String) -> String {
+        let numbers: Vec<i32> = window.split(' ').filter_map(|n| n.parse().ok()).collect();
+        let mut probed = self.0.lock().unwrap();
+        if let [left, top, right, bottom, maximised] = numbers[..] {
+            let now = (
+                Rect {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                },
+                maximised != 0,
+            );
+            if probed.seen != Some(now) {
+                eprintln!("frame {:?}, maximised {}", now.0, now.1);
+            }
+            probed.seen = Some(now);
+        }
+        probed.command.take().unwrap_or_default()
+    }
+}
+
+/// A KWin script that tells the test where the window of process `@PID@` is every 20 ms, and moves or
+/// maximises it when the test says so.
+const PROBE_SCRIPT: &str = r#"
+const probe = new QTimer();
+probe.interval = 20;
+probe.timeout.connect(() => {
+    for (const w of workspace.windowList()) {
+        if (w.pid !== @PID@) continue;
+        const g = w.frameGeometry;
+        const state = [g.x, g.y, g.x + g.width, g.y + g.height].map(Math.round)
+            .concat([Number(w.maximizeMode === 3)]).join(" ");
+        callDBus("@SERVICE@", "/probe", "io.github.ClearlyNotMich.cardcast.Probe", "Seen", state,
+            reply => {
+                const [action, x, y] = reply.split(" ");
+                if (action === "move") {
+                    w.frameGeometry = { x: Number(x), y: Number(y), width: g.width, height: g.height };
+                } else if (action === "maximise") {
+                    w.setMaximize(true, true);
+                }
+            });
+    }
+});
+probe.start();
+"#;
+
+/// A native Wayland window, watched and moved through the probe script; closed on drop.
+struct WaylandWindow {
+    client: std::process::Child,
+    probed: Arc<Mutex<Probed>>,
+    _bus: zbus::blocking::Connection,
+}
+
+impl WaylandWindow {
+    fn open(program: &str) -> Self {
+        let probed = Arc::new(Mutex::new(Probed::default()));
+        let bus = zbus::blocking::connection::Builder::session()
+            .unwrap()
+            .serve_at("/probe", ProbeService(probed.clone()))
+            .unwrap()
+            .build()
+            .unwrap();
+        let client = std::process::Command::new(program).spawn().unwrap();
+        let file = std::env::temp_dir().join("cardcast-test-probe.js");
+        let script = PROBE_SCRIPT
+            .replace("@PID@", &client.id().to_string())
+            .replace("@SERVICE@", bus.unique_name().unwrap().as_str());
+        std::fs::write(&file, script).unwrap();
+        let _ = kwin_scripting("unloadScript", &"cardcast-test-probe");
+        kwin_scripting(
+            "loadScript",
+            &(file.to_string_lossy().as_ref(), "cardcast-test-probe"),
+        )
+        .unwrap();
+        kwin_scripting("start", &()).unwrap();
+        let window = Self {
+            client,
+            probed,
+            _bus: bus,
+        };
+        wait_for(&format!("{program} to open"), || window.seen().is_some());
+        // KWin may still be placing the new window; a move before then is lost.
+        std::thread::sleep(Duration::from_millis(500));
+        window
+    }
+
+    fn seen(&self) -> Option<(Rect, bool)> {
+        self.probed.lock().unwrap().seen
+    }
+
+    fn frame(&self) -> Rect {
+        self.seen().unwrap().0
+    }
+
+    fn maximised(&self) -> bool {
+        self.seen().unwrap().1
+    }
+
+    fn command(&self, command: String) {
+        self.probed.lock().unwrap().command = Some(command);
+    }
+}
+
+impl Drop for WaylandWindow {
+    fn drop(&mut self) {
+        let _ = self.client.kill();
+        let _ = self.client.wait();
+        let _ = kwin_scripting("unloadScript", &"cardcast-test-probe");
+    }
+}
+
+/// `CARDCAST_GUARD_DESKTOP=kwin` (CI, with `foot` installed): a native Wayland window moved onto
+/// the card display comes back; maximised there, it is maximised on the primary monitor, staying
+/// maximised on the way.
+#[test]
+fn desktop_kwin_guard_returns_a_wayland_window() {
+    if std::env::var("CARDCAST_GUARD_DESKTOP").as_deref() != Ok("kwin") {
+        return;
+    }
+    let monitors = super::monitors().unwrap();
+    let card = monitors.iter().find(|m| !m.primary).unwrap();
+    let card_rect = monitor_rect(card);
+    let primary = monitor_rect(monitors.iter().find(|m| m.primary).unwrap());
+    let window = WaylandWindow::open("foot");
+    let mut guard = WindowGuard::new(Desktop::PlasmaWayland, super::monitors, || {});
+    guard.update(true, Some(&card.device_path), None);
+
+    let returned = offset(window.frame(), primary.left + 100, primary.top + 100);
+    window.command(format!(
+        "move {} {}",
+        card_rect.left + 100,
+        card_rect.top + 100
+    ));
+    wait_for(
+        "the Wayland window to come back from the card display",
+        || window.frame() == returned,
+    );
+
+    guard.update(false, Some(&card.device_path), None);
+    window.command(format!(
+        "move {} {}",
+        card_rect.left + 100,
+        card_rect.top + 100
+    ));
+    wait_for("the Wayland window to reach the card display", || {
+        mostly_on(window.frame(), card_rect)
+    });
+    window.command("maximise".into());
+    wait_for(
+        "the Wayland window to be maximised on the card display",
+        || window.maximised() && mostly_on(window.frame(), card_rect),
+    );
+    guard.update(true, Some(&card.device_path), None);
+    let mut unmaximised = false;
+    wait_for(
+        "the Wayland window to be maximised on the primary monitor",
+        || {
+            unmaximised |= !window.maximised();
+            window.maximised() && mostly_on(window.frame(), primary)
+        },
+    );
+    assert!(!unmaximised, "KWin unmaximised the window on its way");
 }

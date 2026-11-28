@@ -5,13 +5,12 @@
 //! has been still for a moment, as on Windows.
 
 use super::super::placement::{Placement, Rect, WindowState};
-use super::window_guard::{Guarding, monitor_rect};
+use super::window_guard::{Guarding, could_not_start, monitor_rect};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::Event;
@@ -23,7 +22,6 @@ use x11rb::rust_connection::RustConnection;
 
 x11rb::atom_manager! {
     pub Atoms: AtomsCookie {
-        _NET_ACTIVE_WINDOW,
         _NET_CLIENT_LIST,
         _NET_CURRENT_DESKTOP,
         _NET_WORKAREA,
@@ -44,6 +42,9 @@ x11rb::atom_manager! {
 /// How long a window must be still before the guard checks it, so a drag is checked once.
 const SETTLE: Duration = Duration::from_millis(50);
 
+/// How long the window manager gets to unmaximise a window before the guard gives up on it.
+const UNMAXIMISE_LIMIT: Duration = Duration::from_secs(2);
+
 enum Message {
     Event(Event),
     FollowDisplays,
@@ -53,7 +54,7 @@ enum Message {
 /// The running guard thread; dropping it stops the thread and its event reader.
 pub struct Running {
     messages: Sender<Message>,
-    thread: Option<JoinHandle<()>>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl Running {
@@ -63,11 +64,10 @@ impl Running {
 }
 
 impl Drop for Running {
+    /// Never waits on the X server; the guard thread moves nothing once `stopped` is set.
     fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
         let _ = self.messages.send(Message::Stop);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
     }
 }
 
@@ -78,17 +78,29 @@ struct X11 {
     atoms: Atoms,
     /// A window of cardcast's own, destroyed to wake the event reader when the guard stops.
     waker: Window,
+    /// Set when the guard stops: from then on nothing moves.
+    stopped: Arc<AtomicBool>,
 }
 
-/// Connects to the X server and starts the guard thread; errors are plain words for the status line.
-pub fn start(guarding: Guarding) -> Result<Running, String> {
-    let x11 = connect().map_err(|error| error.to_string())?;
+/// Starts the guard thread, which connects to the X server; its problems reach the status line
+/// through `guarding`.
+pub fn start(guarding: Guarding) -> Running {
     let (messages, received) = mpsc::channel();
     let stopped = Arc::new(AtomicBool::new(false));
-    {
+    let running = Running {
+        messages: messages.clone(),
+        stopped: stopped.clone(),
+    };
+    std::thread::spawn(move || {
+        let x11 = match connect(stopped) {
+            Ok(x11) => x11,
+            Err(error) => {
+                guarding.notice(&could_not_start(&error.to_string()));
+                return;
+            }
+        };
         let connection = x11.connection.clone();
-        let messages = messages.clone();
-        let stopped = stopped.clone();
+        let stopped = x11.stopped.clone();
         std::thread::spawn(move || {
             while let Ok(event) = connection.wait_for_event() {
                 if stopped.load(Ordering::Relaxed) || messages.send(Message::Event(event)).is_err()
@@ -97,15 +109,12 @@ pub fn start(guarding: Guarding) -> Result<Running, String> {
                 }
             }
         });
-    }
-    let thread = std::thread::spawn(move || run(&x11, guarding, &received, &stopped));
-    Ok(Running {
-        messages,
-        thread: Some(thread),
-    })
+        run(&x11, guarding, &received);
+    });
+    running
 }
 
-fn connect() -> Result<X11, Box<dyn Error>> {
+fn connect(stopped: Arc<AtomicBool>) -> Result<X11, Box<dyn Error>> {
     let (connection, screen) = x11rb::connect(None)?;
     let root = connection
         .setup()
@@ -141,6 +150,7 @@ fn connect() -> Result<X11, Box<dyn Error>> {
         root,
         atoms,
         waker,
+        stopped,
     })
 }
 
@@ -149,15 +159,21 @@ fn connect() -> Result<X11, Box<dyn Error>> {
 struct Windows {
     clients: HashSet<Window>,
     pending: HashMap<Window, Instant>,
-    remaximising: HashSet<Window>,
+    /// With when they were unmaximised.
+    remaximising: HashMap<Window, Instant>,
 }
 
-fn run(x11: &X11, mut guarding: Guarding, messages: &Receiver<Message>, stopped: &AtomicBool) {
+fn run(x11: &X11, mut guarding: Guarding, messages: &Receiver<Message>) {
     let mut windows = Windows::default();
     follow_displays(x11, &mut guarding, &mut windows);
     loop {
         let settled_at = windows.pending.values().min().map(|at| *at + SETTLE);
-        let message = match settled_at {
+        let overdue_at = windows
+            .remaximising
+            .values()
+            .min()
+            .map(|at| *at + UNMAXIMISE_LIMIT);
+        let message = match settled_at.into_iter().chain(overdue_at).min() {
             Some(at) => messages.recv_timeout(at.saturating_duration_since(Instant::now())),
             None => messages.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
@@ -168,10 +184,15 @@ fn run(x11: &X11, mut guarding: Guarding, messages: &Receiver<Message>, stopped:
             Err(RecvTimeoutError::Timeout) => {}
         }
         let now = Instant::now();
+        let overdue = windows
+            .remaximising
+            .iter()
+            .filter(|&(_, &at)| now.duration_since(at) >= UNMAXIMISE_LIMIT);
         let settled: Vec<Window> = windows
             .pending
             .iter()
             .filter(|&(_, &at)| now.duration_since(at) >= SETTLE)
+            .chain(overdue)
             .map(|(&window, _)| window)
             .collect();
         for window in settled {
@@ -179,7 +200,7 @@ fn run(x11: &X11, mut guarding: Guarding, messages: &Receiver<Message>, stopped:
             check(x11, &mut guarding, &mut windows, window, now);
         }
     }
-    stopped.store(true, Ordering::Relaxed);
+    x11.stopped.store(true, Ordering::Relaxed);
     let _ = x11.connection.destroy_window(x11.waker);
     let _ = x11.connection.flush();
 }
@@ -240,19 +261,29 @@ fn id(window: Window) -> isize {
 
 /// Reads the window, decides, and asks the window manager to move it.
 fn check(x11: &X11, guarding: &mut Guarding, windows: &mut Windows, window: Window, now: Instant) {
+    if x11.stopped.load(Ordering::Relaxed) {
+        return;
+    }
     let Some((state, extents, title)) = read_window(x11, window) else {
         return;
     };
-    if state.maximised && windows.remaximising.contains(&window) {
-        // Not unmaximised yet: its restored frame comes with a later event.
+    if state.maximised
+        && let Some(&since) = windows.remaximising.get(&window)
+    {
+        // Not unmaximised yet: its restored frame comes with a later event, unless the window
+        // manager refuses; then it stays on the card display, named in the status line.
+        if now.duration_since(since) >= UNMAXIMISE_LIMIT {
+            windows.remaximising.remove(&window);
+            guarding.give_up(id(window));
+        }
         return;
     }
-    let remaximising = windows.remaximising.remove(&window);
+    let remaximising = windows.remaximising.remove(&window).is_some();
     match guarding.check(id(window), &title, state, remaximising, now) {
         Placement::MoveTo(target) => move_frame(x11, window, target, extents),
         Placement::Maximise { .. } if !remaximising => {
             // The restore rectangle is the window manager's own; unmaximising shows it.
-            windows.remaximising.insert(window);
+            windows.remaximising.insert(window, now);
             set_maximised(x11, window, false);
         }
         Placement::Maximise { restore, .. } => {

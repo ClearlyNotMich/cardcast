@@ -6,14 +6,17 @@
 //! The script never outlives cardcast: the guard unloads it when it stops, and the script polls the
 //! bus every second and unloads itself once cardcast's connection is gone. The bus closes a
 //! process's connection however it ends, a crash or a kill included, and never reuses its name.
+//!
+//! All of it runs on the guard's own thread, which also watches KWin's name on the bus: when KWin
+//! goes away the status line says so, and when it is back the thread loads the script again.
 
 use super::super::placement::{Placement, Rect, WindowState};
-use super::window_guard::Guarding;
+use super::window_guard::{Guarding, could_not_start};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 const INTERFACE: &str = "io.github.ClearlyNotMich.cardcast.WindowGuard";
@@ -21,11 +24,23 @@ const PATH: &str = "/guard";
 const KWIN: &str = "org.kde.KWin";
 const SCRIPT: &str = include_str!("kwin.js");
 
-/// The loaded script and cardcast's connection; dropping it unloads the script.
+/// The status line while KWin is gone, for example restarting after a crash.
+pub const WAITING_FOR_KWIN: &str =
+    "KWin is not running, so the window guard waits for it to start again.";
+
+/// How often the guard thread looks for KWin on the bus.
+const KWIN_CHECK: Duration = Duration::from_secs(1);
+
+/// Guards started in this process, so each script has its own name in KWin.
+static STARTED: AtomicU32 = AtomicU32::new(0);
+
+/// The guard thread; dropping it stops the thread, which then unloads the script.
 pub struct Running {
-    connection: zbus::blocking::Connection,
+    #[cfg(test)]
     plugin: String,
     generation: Arc<AtomicU32>,
+    stopped: Arc<AtomicBool>,
+    stop: Sender<()>,
 }
 
 impl Running {
@@ -42,10 +57,100 @@ impl Running {
 }
 
 impl Drop for Running {
+    /// Never waits: KWin may hang, so the guard thread unloads the script on its own.
     fn drop(&mut self) {
-        // If KWin doesn't answer, the script still unloads itself once this connection closes.
-        let _ = scripting(&self.connection, "unloadScript", &self.plugin);
+        self.stopped.store(true, Ordering::Relaxed);
+        let _ = self.stop.send(());
     }
+}
+
+/// Starts the guard thread; its problems reach the status line through `guarding`.
+pub fn start(guarding: Guarding) -> Running {
+    let plugin = plugin_name(std::process::id(), STARTED.fetch_add(1, Ordering::Relaxed));
+    let (stop, stop_received) = mpsc::channel();
+    let service = Service {
+        state: Arc::new(Mutex::new(State {
+            guarding,
+            seen: None,
+            sweep: 0,
+            ids: HashMap::new(),
+            next_id: 0,
+            polled: None,
+        })),
+        generation: Arc::new(AtomicU32::new(0)),
+        stopped: Arc::new(AtomicBool::new(false)),
+    };
+    let running = Running {
+        #[cfg(test)]
+        plugin: plugin.clone(),
+        generation: service.generation.clone(),
+        stopped: service.stopped.clone(),
+        stop,
+    };
+    std::thread::spawn(move || run(&plugin, service, &stop_received));
+    running
+}
+
+fn run(plugin: &str, service: Service, stop: &Receiver<()>) {
+    let state = service.state.clone();
+    let connection = match zbus::blocking::connection::Builder::session()
+        .and_then(|builder| builder.serve_at(PATH, service))
+        .and_then(zbus::blocking::connection::Builder::build)
+    {
+        Ok(connection) => connection,
+        Err(error) => {
+            lock(&state)
+                .guarding
+                .notice(&could_not_start(&format!("no session bus: {error}")));
+            return;
+        }
+    };
+    let name = connection
+        .unique_name()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    let file = script_file(plugin);
+    // KWin's name on the bus when the guard last looked: a new name is a restarted KWin.
+    let mut kwin_seen: Option<Option<String>> = None;
+    loop {
+        let kwin = name_owner(&connection, KWIN);
+        if kwin_seen.as_ref() != Some(&kwin) {
+            if kwin.is_some() {
+                if let Err(error) = load(&connection, &file, &name, plugin, &state) {
+                    lock(&state).guarding.notice(&could_not_start(&error));
+                }
+            } else {
+                lock(&state).guarding.notice(WAITING_FOR_KWIN);
+            }
+            kwin_seen = Some(kwin);
+        }
+        match stop.recv_timeout(KWIN_CHECK) {
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    // If KWin doesn't answer, the script still unloads itself once this connection closes.
+    let _ = scripting(&connection, "unloadScript", &plugin);
+}
+
+fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The unique name owning `name` on the bus; `None` when nobody does.
+fn name_owner(connection: &zbus::blocking::Connection, name: &str) -> Option<String> {
+    connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "GetNameOwner",
+            &name,
+        )
+        .ok()?
+        .body()
+        .deserialize()
+        .ok()
 }
 
 fn scripting<B>(
@@ -65,55 +170,50 @@ where
     )
 }
 
-/// Serves the guard on the session bus and loads the script into KWin; errors are plain words.
-pub fn start(guarding: Guarding) -> Result<Running, String> {
-    let generation = Arc::new(AtomicU32::new(0));
+/// Writes the script, loads and runs it in KWin, and waits for its first poll.
+fn load(
+    connection: &zbus::blocking::Connection,
+    file: &Path,
+    name: &str,
+    plugin: &str,
+    state: &Mutex<State>,
+) -> Result<(), String> {
     let (polled, first_poll) = mpsc::channel();
-    let service = Service {
-        guarding,
-        generation: generation.clone(),
-        polled: Some(polled),
-        seen: None,
-        sweep: 0,
-        ids: HashMap::new(),
-        next_id: 0,
-    };
-    let connection = zbus::blocking::connection::Builder::session()
-        .and_then(|builder| builder.serve_at(PATH, service))
-        .and_then(zbus::blocking::connection::Builder::build)
-        .map_err(|error| format!("no session bus: {error}"))?;
-    let name = connection
-        .unique_name()
-        .ok_or("no name on the session bus")?
-        .to_string();
-    let running = Running {
-        connection,
-        plugin: plugin_name(&name),
-        generation,
-    };
-    let file = script_file(&running.plugin);
-    std::fs::write(&file, script(&name, &running.plugin))
+    {
+        // A new KWin numbers its windows anew and the script sends the work areas again.
+        let state = &mut *lock(state);
+        state.polled = Some(polled);
+        state.seen = None;
+        for (_, id) in state.ids.drain() {
+            state.guarding.forget(id);
+        }
+    }
+    std::fs::write(file, script(name, plugin))
         .map_err(|error| format!("cannot write {}: {error}", file.display()))?;
-    let loaded = load(&running, &file, &first_poll);
+    let loaded = load_and_run(connection, file, plugin, &first_poll);
     // KWin has read the file once the script runs.
-    let _ = std::fs::remove_file(&file);
-    loaded.map(|()| running)
+    let _ = std::fs::remove_file(file);
+    loaded
 }
 
-/// Loads and runs the script, and waits for its first poll.
-fn load(running: &Running, file: &Path, first_poll: &Receiver<()>) -> Result<(), String> {
+fn load_and_run(
+    connection: &zbus::blocking::Connection,
+    file: &Path,
+    plugin: &str,
+    first_poll: &Receiver<()>,
+) -> Result<(), String> {
     let not_kwin = |error: zbus::Error| format!("KWin is not answering: {error}");
     let id: i32 = scripting(
-        &running.connection,
+        connection,
         "loadScript",
-        &(file.to_string_lossy().as_ref(), running.plugin.as_str()),
+        &(file.to_string_lossy().as_ref(), plugin),
     )
     .and_then(|reply| reply.body().deserialize())
     .map_err(not_kwin)?;
     if id < 0 {
         return Err("KWin did not load the window guard's script".into());
     }
-    let _ = running.connection.call_method(
+    let _ = connection.call_method(
         Some(KWIN),
         format!("/Scripting/Script{id}").as_str(),
         Some("org.kde.kwin.Script"),
@@ -126,7 +226,7 @@ fn load(running: &Running, file: &Path, first_poll: &Receiver<()>) -> Result<(),
     }
     // KWin names a script's D-Bus object by its index, which an older script can still hold; then
     // `run` reached that one. `start` runs every loaded script that isn't running.
-    scripting(&running.connection, "start", &()).map_err(not_kwin)?;
+    scripting(connection, "start", &()).map_err(not_kwin)?;
     if wait() {
         Ok(())
     } else {
@@ -141,12 +241,9 @@ fn script_file(plugin: &str) -> PathBuf {
         .join(format!("{plugin}.js"))
 }
 
-/// The script's name in KWin, unique to this connection (`:1.234` is `cardcast-window-guard-1-234`).
-pub fn plugin_name(unique_name: &str) -> String {
-    format!(
-        "cardcast-window-guard-{}",
-        unique_name.trim_start_matches(':').replace('.', "-")
-    )
+/// The script's name in KWin: cardcast's process id and the guard's number in it.
+pub fn plugin_name(process: u32, guard: u32) -> String {
+    format!("cardcast-window-guard-{process}-{guard}")
 }
 
 /// The script, told cardcast's bus name, its own name in KWin and the guard's interface.
@@ -157,81 +254,89 @@ pub fn script(unique_name: &str, plugin: &str) -> String {
         .replace("@INTERFACE@", INTERFACE)
 }
 
-/// What the script asks cardcast; zbus calls it on its own thread.
-struct Service {
+/// What the script's calls share with the guard thread.
+struct State {
     guarding: Guarding,
-    generation: Arc<AtomicU32>,
-    /// Told on the first poll, so `start` knows the script runs.
-    polled: Option<Sender<()>>,
     /// The display generation and work areas the monitors were last found with.
     seen: Option<(u32, String)>,
     sweep: u32,
     /// KWin's window ids, numbered for the return history.
     ids: HashMap<String, isize>,
     next_id: isize,
+    /// Told on the next poll, while the guard thread waits for a newly loaded script.
+    polled: Option<Sender<()>>,
+}
+
+/// What the script asks cardcast; zbus calls it on its own thread.
+struct Service {
+    state: Arc<Mutex<State>>,
+    generation: Arc<AtomicU32>,
+    /// Set when the guard stops: from then on every window stays.
+    stopped: Arc<AtomicBool>,
 }
 
 #[zbus::interface(name = "io.github.ClearlyNotMich.cardcast.WindowGuard")]
 impl Service {
     /// Every second, with each output's work area (see [`work_areas`]); returns the sweep number,
     /// which changes when the script must check every window again.
-    fn poll(&mut self, work_areas: String) -> u32 {
-        if let Some(polled) = self.polled.take() {
+    fn poll(&self, work_areas: String) -> u32 {
+        let state = &mut *lock(&self.state);
+        if let Some(polled) = state.polled.take() {
             let _ = polled.send(());
         }
         let seen = (self.generation.load(Ordering::Relaxed), work_areas);
-        if self.seen.as_ref() != Some(&seen) {
+        if state.seen.as_ref() != Some(&seen) && !self.stopped.load(Ordering::Relaxed) {
             let areas = self::work_areas(&seen.1);
-            self.guarding
+            state
+                .guarding
                 .follow_displays(|monitor| areas.get(&monitor.gdi_name).copied());
-            self.seen = Some(seen);
-            self.sweep = self.sweep.wrapping_add(1);
+            state.seen = Some(seen);
+            state.sweep = state.sweep.wrapping_add(1);
         }
-        self.sweep
+        state.sweep
     }
 
     /// Where window `id` (KWin's) with title `caption` goes; `window` as [`window_state`] reads it,
     /// the answer as [`answer`] writes it.
-    fn check(&mut self, id: String, caption: String, window: String) -> String {
-        let Some((state, remaximising)) = window_state(&window) else {
+    fn check(&self, id: String, caption: String, window: String) -> String {
+        let Some(window) = window_state(&window) else {
             return "stay".into();
         };
-        let id = *self.ids.entry(id).or_insert_with(|| {
-            self.next_id += 1;
-            self.next_id
+        if self.stopped.load(Ordering::Relaxed) {
+            return "stay".into();
+        }
+        let state = &mut *lock(&self.state);
+        let id = *state.ids.entry(id).or_insert_with(|| {
+            state.next_id += 1;
+            state.next_id
         });
-        let placement = self
+        let placement = state
             .guarding
-            .check(id, &caption, state, remaximising, Instant::now());
-        answer(placement, remaximising)
+            .check(id, &caption, window, false, Instant::now());
+        answer(
+            placement,
+            state.guarding.send_windows_to_output().unwrap_or_default(),
+        )
     }
 
-    fn forget(&mut self, id: String) {
-        if let Some(id) = self.ids.remove(&id) {
-            self.guarding.forget(id);
+    fn forget(&self, id: String) {
+        let state = &mut *lock(&self.state);
+        if let Some(id) = state.ids.remove(&id) {
+            state.guarding.forget(id);
         }
     }
 }
 
-/// The script's window: `<left> <top> <right> <bottom> <maximised> <minimised> <tool>
-/// <remaximising>`, the flags 0 or 1; with whether the guard is maximising it again.
-pub fn window_state(text: &str) -> Option<(WindowState, bool)> {
+/// The script's window: `<left> <top> <right> <bottom> <maximised> <minimised> <tool>`, the flags 0 or 1.
+pub fn window_state(text: &str) -> Option<WindowState> {
     let numbers: Vec<i32> = text
         .split(' ')
         .map(str::parse)
         .collect::<Result<_, _>>()
         .ok()?;
-    let [
-        left,
-        top,
-        right,
-        bottom,
-        maximised,
-        minimised,
-        tool,
-        remaximising,
-    ] = <[i32; 8]>::try_from(numbers).ok()?;
-    let state = WindowState {
+    let [left, top, right, bottom, maximised, minimised, tool] =
+        <[i32; 7]>::try_from(numbers).ok()?;
+    Some(WindowState {
         frame: Rect {
             left,
             top,
@@ -242,18 +347,16 @@ pub fn window_state(text: &str) -> Option<(WindowState, bool)> {
         minimised: minimised != 0,
         tool: tool != 0,
         ..WindowState::default()
-    };
-    Some((state, remaximising != 0))
+    })
 }
 
-/// What the script does: `stay`, `move <rect>`, `unmaximise` to see where the window restores to,
-/// or `maximise <rect>`: move the restored window there and maximise it (see `Guarding::check`).
-pub fn answer(placement: Placement, remaximising: bool) -> String {
-    let rect = |r: Rect| format!("{} {} {} {}", r.left, r.top, r.right, r.bottom);
+/// What the script does: `stay`, `move <rect>`, or `send <output>`: KWin's own move to the
+/// "send windows to" monitor's output, which keeps a maximised window maximised with no flicker
+/// and moves its restore rectangle along (measured on `kwin_wayland --virtual`).
+pub fn answer(placement: Placement, send_windows_to: &str) -> String {
     match placement {
-        Placement::MoveTo(target) => format!("move {}", rect(target)),
-        Placement::Maximise { .. } if !remaximising => "unmaximise".into(),
-        Placement::Maximise { restore, .. } => format!("maximise {}", rect(restore)),
+        Placement::MoveTo(r) => format!("move {} {} {} {}", r.left, r.top, r.right, r.bottom),
+        Placement::Maximise { .. } => format!("send {send_windows_to}"),
         Placement::Stay | Placement::GiveUp | Placement::Handled => "stay".into(),
     }
 }
@@ -294,29 +397,28 @@ mod tests {
 
     #[test]
     fn the_scripts_window_has_a_frame_and_flags() {
-        let (state, remaximising) = window_state("-100 20 700 620 1 0 1 0").unwrap();
+        let state = window_state("-100 20 700 620 1 0 1").unwrap();
         assert_eq!(state.frame, rect(-100, 20, 700, 620));
-        assert!(state.maximised && !state.minimised && state.tool && !remaximising);
-        assert!(window_state("0 0 1 1 0 0 0 1").unwrap().1);
-        assert_eq!(window_state("0 0 1 1 0 0 0"), None);
-        assert_eq!(window_state("0 0 1.5 1 0 0 0 0"), None);
+        assert!(state.maximised && !state.minimised && state.tool);
+        assert_eq!(window_state("0 0 1 1 0 0"), None);
+        assert_eq!(window_state("0 0 1 1 0 0 0 0"), None);
+        assert_eq!(window_state("0 0 1.5 1 0 0 0"), None);
     }
 
     #[test]
-    fn the_script_is_told_to_stay_move_or_unmaximise_then_maximise() {
+    fn the_script_is_told_to_stay_move_or_send_a_maximised_window_to_the_output() {
         let target = rect(100, 100, 500, 400);
-        assert_eq!(answer(Placement::Stay, false), "stay");
-        assert_eq!(answer(Placement::GiveUp, false), "stay");
+        assert_eq!(answer(Placement::Stay, "DP-2"), "stay");
+        assert_eq!(answer(Placement::GiveUp, "DP-2"), "stay");
         assert_eq!(
-            answer(Placement::MoveTo(target), false),
+            answer(Placement::MoveTo(target), "DP-2"),
             "move 100 100 500 400"
         );
         let maximise = Placement::Maximise {
             work_area: rect(0, 0, 1920, 1036),
             restore: target,
         };
-        assert_eq!(answer(maximise, false), "unmaximise");
-        assert_eq!(answer(maximise, true), "maximise 100 100 500 400");
+        assert_eq!(answer(maximise, "DP-2"), "send DP-2");
     }
 
     #[test]
@@ -330,11 +432,11 @@ mod tests {
 
     #[test]
     fn the_script_knows_cardcast_its_own_name_and_the_guard_interface() {
-        let plugin = plugin_name(":1.234");
-        assert_eq!(plugin, "cardcast-window-guard-1-234");
+        let plugin = plugin_name(4321, 2);
+        assert_eq!(plugin, "cardcast-window-guard-4321-2");
         let script = script(":1.234", &plugin);
         assert!(script.contains(r#"const service = ":1.234";"#));
-        assert!(script.contains(r#"const plugin = "cardcast-window-guard-1-234";"#));
+        assert!(script.contains(r#"const plugin = "cardcast-window-guard-4321-2";"#));
         assert!(script.contains(&format!(r#"const guard = "{INTERFACE}";"#)));
         assert!(!script.contains('@'), "a placeholder is left");
         assert_eq!(

@@ -28,6 +28,11 @@ pub fn honest(report: GuardReport) -> GuardReport {
     }
 }
 
+/// The status line when a helper can't start.
+pub fn could_not_start(error: &str) -> String {
+    format!("The window guard could not start ({error}). Untick and tick Guard to try again.")
+}
+
 /// The monitor's rectangle in the desktop's coordinates.
 pub fn monitor_rect(monitor: &Monitor) -> Rect {
     let size = |length: u32| i32::try_from(length).unwrap_or(i32::MAX);
@@ -39,6 +44,9 @@ pub fn monitor_rect(monitor: &Monitor) -> Rect {
     }
 }
 
+/// The card display and "send windows to" rectangles, and the latter's output name.
+type Found = ((Rect, Rect), String);
+
 /// What a guard helper knows on its own thread: the monitors, the return history, and each window's title for the give-up notice.
 pub struct Guarding {
     card_display: String,
@@ -46,6 +54,8 @@ pub struct Guarding {
     list_monitors: ListMonitors,
     /// Card display rectangle and the "send windows to" work area; `None` while there is nothing to guard.
     monitors: Option<(Rect, Rect)>,
+    /// The desktop's name for the "send windows to" monitor's output, while there is something to guard.
+    send_to_output: Option<String>,
     /// Why there is nothing to guard, unless the card display is just unplugged.
     problem: Option<String>,
     history: ReturnHistory,
@@ -67,6 +77,7 @@ impl Guarding {
             send_windows_to: send_windows_to.map(str::to_owned),
             list_monitors,
             monitors: None,
+            send_to_output: None,
             problem: None,
             history: ReturnHistory::default(),
             titles: HashMap::new(),
@@ -78,17 +89,24 @@ impl Guarding {
     /// At start and after a display change: finds the monitors and reports. `work_area` gives a
     /// monitor's work area from the desktop, else the guard uses the whole monitor.
     pub fn follow_displays(&mut self, work_area: impl Fn(&Monitor) -> Option<Rect>) {
-        (self.monitors, self.problem) = match self.find_monitors(work_area) {
-            Ok(monitors) => (monitors, None),
-            Err(problem) => (None, Some(problem)),
+        (self.monitors, self.send_to_output, self.problem) = match self.find_monitors(work_area) {
+            Ok(Some((monitors, output))) => (Some(monitors), Some(output), None),
+            Ok(None) => (None, None, None),
+            Err(problem) => (None, None, Some(problem)),
         };
         self.report();
     }
 
+    /// The desktop's name for the "send windows to" monitor's output (`DP-2`).
+    pub fn send_windows_to_output(&self) -> Option<&str> {
+        self.send_to_output.as_deref()
+    }
+
+    /// The card display and "send windows to" rectangles, and the latter's output name.
     fn find_monitors(
         &self,
         work_area: impl Fn(&Monitor) -> Option<Rect>,
-    ) -> Result<Option<(Rect, Rect)>, String> {
+    ) -> Result<Option<Found>, String> {
         let monitors = (self.list_monitors)()?;
         let Some((card_display, send_windows_to)) = placement::guarded_monitors(
             &monitors,
@@ -99,8 +117,11 @@ impl Guarding {
             return Ok(None);
         };
         Ok(Some((
-            monitor_rect(card_display),
-            work_area(send_windows_to).unwrap_or_else(|| monitor_rect(send_windows_to)),
+            (
+                monitor_rect(card_display),
+                work_area(send_windows_to).unwrap_or_else(|| monitor_rect(send_windows_to)),
+            ),
+            send_windows_to.gdi_name.clone(),
         )))
     }
 
@@ -136,6 +157,18 @@ impl Guarding {
             self.report();
         }
         placement
+    }
+
+    /// Gives up on window `id` at once and names it in the status line.
+    pub fn give_up(&mut self, id: isize) {
+        self.history.give_up(id);
+        self.report();
+    }
+
+    /// A helper's own notice for the status line, such as KWin being gone.
+    pub fn notice(&self, notice: &str) {
+        let _ = self.reports.send(GuardReport::Notice(notice.to_owned()));
+        (self.wake)();
     }
 
     /// Window `id` closed.
@@ -233,22 +266,16 @@ impl Guard for WindowGuard {
             self.report_sender.clone(),
             self.wake.clone(),
         );
+        // Both helpers start and stop on their own thread, so the settings window never waits.
         let helper = match self.desktop {
-            Desktop::X11 => ewmh::start(guarding).map(Helper::X11),
-            _ => kwin::start(guarding).map(Helper::Kwin),
+            Desktop::X11 => Helper::X11(ewmh::start(guarding)),
+            _ => Helper::Kwin(kwin::start(guarding)),
         };
-        match helper {
-            Ok(helper) => {
-                self.running = Some(Running {
-                    card_display: card_display.to_owned(),
-                    send_windows_to: send_windows_to.map(str::to_owned),
-                    helper,
-                });
-            }
-            Err(error) => self.report(GuardReport::Notice(format!(
-                "The window guard could not start ({error}). Untick and tick Guard to try again."
-            ))),
-        }
+        self.running = Some(Running {
+            card_display: card_display.to_owned(),
+            send_windows_to: send_windows_to.map(str::to_owned),
+            helper,
+        });
     }
 
     fn take_report(&mut self) -> Option<GuardReport> {
@@ -443,6 +470,49 @@ mod tests {
                 Placement::Maximise { .. }
             ));
         }
+    }
+
+    #[test]
+    fn a_window_that_will_not_unmaximise_is_given_up_and_named() {
+        let (mut guarding, reports) = guarding(None);
+        guarding.follow_displays(work_area);
+        let maximised = WindowState {
+            frame: rect(1920, 0, 3840, 1080),
+            maximised: true,
+            ..WindowState::default()
+        };
+        let _ = guarding.check(3, "Stubborn", maximised, false, Instant::now());
+        guarding.give_up(3);
+        assert_eq!(
+            reports.try_iter().last(),
+            Some(GuardReport::Notice(
+                "The window guard left \"Stubborn\" on the card display because it keeps going back there. Move it off to guard it again.".into()
+            ))
+        );
+        assert_eq!(
+            guarding.check(3, "Stubborn", maximised, false, Instant::now()),
+            Placement::Stay
+        );
+    }
+
+    #[test]
+    fn the_send_windows_to_monitor_is_named_by_its_output() {
+        let (mut guarding, _reports) = guarding(None);
+        assert_eq!(guarding.send_windows_to_output(), None);
+        guarding.follow_displays(work_area);
+        assert_eq!(guarding.send_windows_to_output(), Some("primary"));
+    }
+
+    #[test]
+    fn a_helper_notice_reaches_the_status_line_as_it_is() {
+        let (guarding, reports) = guarding(None);
+        guarding.notice(kwin::WAITING_FOR_KWIN);
+        assert_eq!(
+            reports.try_iter().last(),
+            Some(GuardReport::Notice(
+                "KWin is not running, so the window guard waits for it to start again.".into()
+            ))
+        );
     }
 
     #[test]
