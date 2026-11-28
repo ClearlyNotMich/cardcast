@@ -126,13 +126,10 @@ jobs:
   # The window guard's KWin script (#47) on kwin_wayland --virtual in an Arch container; see the script.
   kwin:
     runs-on: ubuntu-latest
+    container: archlinux:latest
     steps:
       - uses: actions/checkout@v7
-      # The runner's kernel has udmabuf in its extra modules.
-      - run: |
-          sudo apt-get update && sudo apt-get install -y "linux-modules-extra-$(uname -r)"
-          sudo modprobe udmabuf && ls -l /dev/udmabuf
-      - run: docker run --rm --device /dev/udmabuf -v "$PWD:/src" archlinux:latest /src/.github/ci/kwin-guard.sh
+      - run: .github/ci/kwin-guard.sh
 
   # Adds two virtual monitors (docs/research/ci-second-monitor.md) and runs the second_monitor tests.
   # The driver is third-party and its certificate becomes a trusted root, so this job gets no secrets and read-only access.

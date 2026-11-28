@@ -571,8 +571,9 @@ impl Drop for WaylandWindow {
 }
 
 /// `CARDCAST_GUARD_DESKTOP=kwin` (CI, with `foot` installed): a native Wayland window moved onto
-/// the card display comes back; maximised there, it is maximised on the primary monitor, staying
-/// maximised on the way.
+/// the card display comes back. With `CARDCAST_KWIN_COMPOSITES` (KWin has a render device, so the
+/// window redraws), maximised there, it is maximised on the primary monitor, staying maximised on
+/// the way.
 #[test]
 fn desktop_kwin_guard_returns_a_wayland_window() {
     if std::env::var("CARDCAST_GUARD_DESKTOP").as_deref() != Ok("kwin") {
@@ -597,6 +598,9 @@ fn desktop_kwin_guard_returns_a_wayland_window() {
         || window.frame() == returned,
     );
 
+    if std::env::var_os("CARDCAST_KWIN_COMPOSITES").is_none() {
+        return;
+    }
     guard.update(false, Some(&card.device_path), None);
     window.command(format!(
         "move {} {}",

@@ -1,7 +1,9 @@
 #!/bin/sh
 # The window guard on kwin_wayland --virtual (#47), run by CI in an Arch container, which has
-# KWin 6 like the sender. KWin composites (and so native Wayland windows redraw) only with a render
-# device; /dev/udmabuf from the runner gives it llvmpipe.
+# KWin 6 like the sender. KWin composites only with a render device; without one (the CI runner has
+# no /dev/dri and no udmabuf module) windows still move, but a native Wayland window never redraws,
+# so it can't be maximised. Given /dev/udmabuf (docker run --device /dev/udmabuf) KWin composites
+# with llvmpipe and the tests maximise the Wayland window too.
 set -e
 cd "$(dirname "$0")/../.."
 pacman -Syu --noconfirm --needed base-devel rust kwin xorg-xwayland foot ttf-dejavu
@@ -9,6 +11,7 @@ pacman -Syu --noconfirm --needed base-devel rust kwin xorg-xwayland foot ttf-dej
 setcap -r /usr/bin/kwin_wayland
 cargo test --no-run
 export XDG_RUNTIME_DIR="$(mktemp -d)" XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland
+[ -e /dev/udmabuf ] && export CARDCAST_KWIN_COMPOSITES=1
 log="$XDG_RUNTIME_DIR/test.log"
 
 # The guard's tests, run inside KWin so they get its Wayland and Xwayland displays.
