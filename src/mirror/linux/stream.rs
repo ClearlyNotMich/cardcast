@@ -87,7 +87,7 @@ impl Stream {
             messages,
             thread: Some(thread),
             node,
-            waiting: Some(Instant::now()),
+            waiting: None,
             _source: source,
         };
         match started.recv() {
