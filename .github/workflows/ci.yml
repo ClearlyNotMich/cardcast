@@ -198,7 +198,11 @@ jobs:
           printf '[preferred]\ndefault=wlr\n' > "$XDG_CONFIG_HOME/xdg-desktop-portal/portals.conf"
           printf 'output HEADLESS-1 bg #3366cc solid_color\noutput HEADLESS-2 bg #222222 solid_color\n' > "$XDG_CONFIG_HOME/sway.conf"
           cat > "$RUNNER_TEMP/capture.sh" <<'EOF'
-          pipewire & wireplumber &
+          # WirePlumber started before PipeWire answers exits ("Failed to connect to PipeWire"), and
+          # without it nothing links the stream, so no frame comes (#58).
+          pipewire &
+          for _ in $(seq 50); do wpctl status >/dev/null 2>&1 && break; sleep 0.2; done
+          wireplumber &
           sway -c "$XDG_CONFIG_HOME/sway.conf" &
           for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.2; done
           export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
@@ -222,8 +226,9 @@ jobs:
           export XDG_RUNTIME_DIR=$(mktemp -d)
           dbus-run-session -- sh -ec '
             pipewire & pipewire=$!
-            wireplumber & wireplumber=$!
+            # WirePlumber exits if PipeWire does not answer yet (#58).
             for _ in $(seq 50); do wpctl status >/dev/null 2>&1 && break; sleep 0.2; done
+            wireplumber & wireplumber=$!
             for sink in source card; do
               pw-cli create-node adapter "{ factory.name=support.null-audio-sink node.name=cardcast-$sink node.nick=\"cardcast $sink\" media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"
             done
