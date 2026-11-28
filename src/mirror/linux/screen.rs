@@ -309,7 +309,7 @@ impl Wayland {
 
 /// Which of the `wl_output` `names` is the card display's, named `gdi_name` (the `wl_output` name
 /// the monitor list has too); `None` if none is, so the mirror never falls back to another output.
-pub fn card_output(names: &[Option<String>], gdi_name: &str) -> Option<usize> {
+pub(super) fn card_output(names: &[Option<String>], gdi_name: &str) -> Option<usize> {
     names
         .iter()
         .position(|name| name.as_deref() == Some(gdi_name))
