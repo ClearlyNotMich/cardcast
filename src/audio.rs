@@ -17,7 +17,7 @@ mod linux;
 )]
 mod pacing;
 #[cfg(target_os = "linux")]
-pub use linux::container_id;
+pub use linux::{container_id, node_linked};
 #[cfg(windows)]
 mod relay;
 #[cfg_attr(

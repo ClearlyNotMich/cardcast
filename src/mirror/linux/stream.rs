@@ -3,7 +3,7 @@
 //! [`Stream`] for the present to take it.
 
 use super::super::{Ended, Frame, Picture, Pixels, Release};
-use super::{fourcc, rows};
+use super::{FIRST_FRAME, fourcc, no_frame, rows};
 use pipewire as pw;
 use pw::spa;
 use pw::spa::param::video::{VideoFlags, VideoFormat, VideoInfoRaw};
@@ -18,6 +18,7 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 /// What the PipeWire thread hands the present.
 #[derive(Debug, Default)]
@@ -52,6 +53,9 @@ pub struct Stream {
     latest: Arc<Mutex<Latest>>,
     messages: pw::channel::Sender<Message>,
     thread: Option<JoinHandle<()>>,
+    /// The portal's node, and since when it has been waited on until the first frame came.
+    node: u32,
+    waiting: Option<Instant>,
     /// Whatever keeps the stream's source alive, such as the portal session; dropped after the thread.
     _source: Box<dyn Send>,
 }
@@ -82,6 +86,8 @@ impl Stream {
             latest,
             messages,
             thread: Some(thread),
+            node,
+            waiting: Some(Instant::now()),
             _source: source,
         };
         match started.recv() {
@@ -107,11 +113,26 @@ impl Drop for Stream {
 
 impl Picture for Stream {
     fn take_frame(&mut self) -> Result<Option<Frame>, Ended> {
-        let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
-        match latest.ended.clone() {
-            Some(ended) => Err(ended),
-            None => Ok(latest.frame.take()),
+        let frame = {
+            let mut latest = self.latest.lock().unwrap_or_else(PoisonError::into_inner);
+            match latest.ended.clone() {
+                Some(ended) => return Err(ended),
+                None => latest.frame.take(),
+            }
+        };
+        if frame.is_some() {
+            self.waiting = None;
+        } else if let Some(since) = self.waiting {
+            // Asked without the lock: pw-dump may take seconds, and the PipeWire thread needs it.
+            let waited = since.elapsed();
+            if let Some(ended) = no_frame(waited, || crate::audio::node_linked(self.node)) {
+                return Err(ended);
+            }
+            if waited >= FIRST_FRAME {
+                self.waiting = Some(Instant::now());
+            }
         }
+        Ok(frame)
     }
 }
 
