@@ -292,6 +292,21 @@ fn loopback_linked(dump: &str, pid: u32, audio_source: &str, output: &str) -> bo
             .any(|(from, to)| ours(from) && *to == &output.0)
 }
 
+/// Whether `dump` shows a link out of node `node`; without WirePlumber nothing links it.
+fn linked_from(dump: &str, node: u32) -> bool {
+    serde_json::from_str::<Vec<Value>>(dump)
+        .unwrap_or_default()
+        .iter()
+        .any(|object| {
+            object["type"] == "PipeWire:Interface:Link" && object["info"]["output-node-id"] == node
+        })
+}
+
+/// Whether PipeWire linked node `node`, `None` if `pw-dump` could not tell.
+pub fn node_linked(node: u32) -> Option<bool> {
+    pw_dump().ok().map(|dump| linked_from(&dump, node))
+}
+
 /// `pw-loopback`'s arguments: record the monitor of the `audio_source` sink and play it on the
 /// `output` sink, both by `node.name`. Neither stream moves to another sink when its own goes, so
 /// the audio source is never played back into the sender's speakers; WirePlumber ends the loopback

@@ -391,6 +391,14 @@ fn the_loopback_is_linked_only_from_the_audio_source_and_to_the_sound_output() {
 }
 
 #[test]
+fn a_node_is_linked_only_by_a_link_out_of_it() {
+    assert!(linked_from(&loopback_dump(&[(10, 31)]), 10));
+    assert!(!linked_from(&loopback_dump(&[(10, 31)]), 31), "linked into");
+    assert!(!linked_from(&loopback_dump(&[]), 10), "no WirePlumber");
+    assert!(!linked_from("not json", 10));
+}
+
+#[test]
 fn a_loopback_whose_cardcast_is_gone_does_not_start() {
     let spawn = |parent: u32| {
         let mut command = Command::new("true");

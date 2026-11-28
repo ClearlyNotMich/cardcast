@@ -95,6 +95,12 @@ Each `process` takes the newest buffer:
 A stream that goes to `Error` or `Unconnected` (for example the monitor was unplugged) makes the
 next `take_frame` return `Ended::Restart`.
 
+WirePlumber links the portal's node to the stream; without it no frame ever comes (#58, #59). So a
+stream with no frame after `FIRST_FRAME` (5 s) asks `pw-dump`, as the audio relay does (#50),
+whether any link leaves the portal's node (`linux::no_frame`): if one does it keeps waiting and asks
+again 5 s later; if none does, or `pw-dump` fails, the mirror stops with a status naming
+WirePlumber.
+
 ## X11: MIT-SHM (`mirror/linux/x11.rs`)
 
 x11rb with its `shm` and `xfixes` features. `ShmCreateSegment` (MIT-SHM 1.2) has the X server make
@@ -114,6 +120,9 @@ hotspot [5], blended into the frame by `linux::draw_pointer`.
   session bus. This takes the shared-memory path; DMA-BUF needs a real graphics card (owner check).
 - Xvfb with `xsetroot -solid '#cc6633'`; `-noreset` stops the server resetting the root window when
   xsetroot disconnects.
+
+Then, on the same sway with WirePlumber killed, `without_wireplumber_the_capture_names_it`
+(`CARDCAST_NO_WIREPLUMBER`) needs that status.
 
 ## The present (`mirror/linux/present.rs`, `screen.rs`, `gpu.rs`, #43)
 

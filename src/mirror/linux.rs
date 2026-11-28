@@ -17,6 +17,11 @@ use super::{Ended, Picture};
 use crate::guard::Monitor;
 use crate::guard::desktop::{self, Desktop};
 use pipewire::spa::param::video::VideoFormat;
+use std::time::Duration;
+
+/// How long a stream may go without a frame before cardcast asks PipeWire why: once linked, the
+/// first frame comes well within a second.
+pub const FIRST_FRAME: Duration = Duration::from_secs(5);
 
 /// DRM fourccs of the 8-bit RGB layouts the capture hands over (`drm_fourcc.h`), little-endian:
 /// XRGB8888 is B, G, R, X bytes in memory.
@@ -144,6 +149,23 @@ fn cannot_tell(source_monitor: &Monitor) -> Ended {
         "cardcast can't tell which monitor the screen-sharing dialog shared, so it doesn't show it. Make the source monitor, {}, the only one of its size, or use a desktop whose portal says where the shared monitor is.",
         source_monitor.name
     ))
+}
+
+/// What ends a stream that has had no frame for `waited`: nothing before [`FIRST_FRAME`] or while
+/// PipeWire links it (`linked`, `None` if `pw-dump` could not tell), as then a frame may still
+/// come; else a status naming WirePlumber, which links the portal's stream (#58).
+pub fn no_frame(waited: Duration, linked: impl FnOnce() -> Option<bool>) -> Option<Ended> {
+    if waited < FIRST_FRAME {
+        return None;
+    }
+    let why = match linked() {
+        Some(true) => return None,
+        Some(false) => "PipeWire did not connect the screen capture, so no picture came.",
+        None => "No picture came from the screen capture, and pw-dump could not say why.",
+    };
+    Some(Ended::Stop(format!(
+        "{why} Is WirePlumber installed and running? Then press Start."
+    )))
 }
 
 /// The DRM fourcc of a PipeWire video format cardcast asks for.

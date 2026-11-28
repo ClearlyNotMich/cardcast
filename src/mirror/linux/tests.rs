@@ -304,6 +304,70 @@ fn rgb_at(frame: &Frame, x: u32, y: u32) -> Option<[u8; 3]> {
     }
 }
 
+#[test]
+fn a_stream_with_no_first_frame_names_wireplumber_unless_it_is_linked() {
+    use std::time::Duration;
+    let late = FIRST_FRAME + Duration::from_millis(1);
+    assert_eq!(
+        no_frame(FIRST_FRAME - Duration::from_millis(1), || panic!(
+            "asked early"
+        )),
+        None
+    );
+    assert_eq!(
+        no_frame(late, || Some(true)),
+        None,
+        "linked: a frame may still come"
+    );
+    assert_eq!(
+        no_frame(late, || Some(false)),
+        Some(Ended::Stop(
+            "PipeWire did not connect the screen capture, so no picture came. Is WirePlumber installed and running? Then press Start.".into()
+        ))
+    );
+    assert_eq!(
+        no_frame(late, || None),
+        Some(Ended::Stop(
+            "No picture came from the screen capture, and pw-dump could not say why. Is WirePlumber installed and running? Then press Start.".into()
+        ))
+    );
+}
+
+/// CI (`CARDCAST_NO_WIREPLUMBER`): headless sway and its portal with WirePlumber stopped, so
+/// nothing links the stream and the capture must say so. Skips when unset.
+#[test]
+fn without_wireplumber_the_capture_names_it() {
+    if std::env::var_os("CARDCAST_NO_WIREPLUMBER").is_none() {
+        return;
+    }
+    let output = std::env::var("CARDCAST_CAPTURE").unwrap();
+    let monitors = crate::guard::monitors().unwrap();
+    let source = monitors
+        .iter()
+        .find(|monitor| monitor.gdi_name == output)
+        .unwrap_or_else(|| panic!("no output {output} in {monitors:#?}"));
+    let mut picture = capture(source, &monitors, None, &[])
+        .picture
+        .unwrap_or_else(|ended| panic!("{ended:?}"));
+    let deadline = std::time::Instant::now() + FIRST_FRAME * 4;
+    let ended = loop {
+        match picture.take_frame() {
+            Err(ended) => break ended,
+            Ok(frame) => assert!(frame.is_none(), "a frame came without WirePlumber"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the capture said nothing"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    eprintln!("{ended:?}");
+    assert!(
+        matches!(&ended, Ended::Stop(text) if text.contains("WirePlumber")),
+        "{ended:?}"
+    );
+}
+
 /// CI's desktops (headless sway with xdg-desktop-portal-wlr, Xvfb): `CARDCAST_CAPTURE` names the
 /// output to capture and `CARDCAST_EXPECT_COLOUR` (`#rrggbb`) the colour it shows; a frame's pixel
 /// a quarter in from its top-left must have it (X servers start the pointer in the middle). Skips

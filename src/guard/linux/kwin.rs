@@ -38,6 +38,11 @@ pub const WAITING_FOR_KWIN: &str =
 /// How often the guard thread looks for KWin on the bus.
 const KWIN_CHECK: Duration = Duration::from_secs(1);
 
+/// Set once the script reports a layer-shell surface, so the KWin CI job sees the script still
+/// recognises KWin's layer-shell class.
+#[cfg(test)]
+pub static LAYER_SHELL_SEEN: AtomicBool = AtomicBool::new(false);
+
 /// Guards started in this process, so each script has its own name in KWin.
 static STARTED: AtomicU32 = AtomicU32::new(0);
 
@@ -318,12 +323,14 @@ impl Service {
         state.sweep
     }
 
-    /// Where window `id` (KWin's) with title `caption` goes; `window` as [`window_state`] reads it,
+    /// Where window `id` (KWin's) with title `caption` goes; `window` as [`script_window`] reads it,
     /// the answer as [`answer`] writes it.
     fn check(&self, id: String, caption: String, window: String) -> String {
-        let Some(window) = window_state(&window) else {
+        let Some(window) = script_window(&window) else {
             return "stay".into();
         };
+        #[cfg(test)]
+        LAYER_SHELL_SEEN.fetch_or(window.mirror, Ordering::Relaxed);
         if self.stopped.load(Ordering::Relaxed) {
             return "stay".into();
         }
@@ -368,7 +375,18 @@ fn pointer_guard(
     }
 }
 
-/// The script's window: `<left> <top> <right> <bottom> <maximised> <minimised> <tool>`, the flags 0 or 1.
+/// The script's window: [`window_state`] then `<layer shell>`, 0 or 1. A layer-shell surface stays
+/// where it is, as the mirror does.
+pub fn script_window(text: &str) -> Option<WindowState> {
+    let (state, layer_shell) = text.rsplit_once(' ')?;
+    Some(WindowState {
+        mirror: layer_shell.parse::<u8>().ok()? != 0,
+        ..window_state(state)?
+    })
+}
+
+/// A window as the KWin script and the GNOME extension write it:
+/// `<left> <top> <right> <bottom> <maximised> <minimised> <tool>`, the flags 0 or 1.
 pub fn window_state(text: &str) -> Option<WindowState> {
     let numbers: Vec<i32> = text
         .split(' ')
@@ -425,6 +443,7 @@ pub fn work_areas(text: &str) -> HashMap<String, Rect> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::placement::place;
     use super::*;
 
     fn rect(left: i32, top: i32, right: i32, bottom: i32) -> Rect {
@@ -438,12 +457,29 @@ mod tests {
 
     #[test]
     fn the_scripts_window_has_a_frame_and_flags() {
-        let state = window_state("-100 20 700 620 1 0 1").unwrap();
+        let state = script_window("-100 20 700 620 1 0 1 0").unwrap();
         assert_eq!(state.frame, rect(-100, 20, 700, 620));
-        assert!(state.maximised && !state.minimised && state.tool);
-        assert_eq!(window_state("0 0 1 1 0 0"), None);
-        assert_eq!(window_state("0 0 1 1 0 0 0 0"), None);
-        assert_eq!(window_state("0 0 1.5 1 0 0 0"), None);
+        assert!(state.maximised && !state.minimised && state.tool && !state.mirror);
+        assert_eq!(script_window("0 0 1 1 0 0 0"), None);
+        assert_eq!(script_window("0 0 1 1 0 0 0 0 0"), None);
+        assert_eq!(script_window("0 0 1.5 1 0 0 0 0"), None);
+        assert_eq!(script_window("0 0 1 1 0 0 0 x"), None);
+    }
+
+    /// The mirror and the pointer catcher are layer-shell surfaces; a normal window is guarded
+    /// whatever KWin's options say (#61).
+    #[test]
+    fn a_layer_shell_surface_stays_and_nothing_else_does() {
+        let card = rect(1920, 0, 3840, 1080);
+        let target = rect(0, 0, 1920, 1080);
+        let on_card = |layer_shell| script_window(&format!("1920 0 2720 600 0 0 0 {layer_shell}"));
+        let surface = on_card(1).unwrap();
+        assert!(surface.mirror);
+        assert_eq!(place(&surface, card, target), Placement::Stay);
+        assert!(matches!(
+            place(&on_card(0).unwrap(), card, target),
+            Placement::MoveTo(_)
+        ));
     }
 
     #[test]

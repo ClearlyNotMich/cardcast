@@ -202,7 +202,7 @@ jobs:
           # without it nothing links the stream, so no frame comes (#58).
           pipewire &
           for _ in $(seq 50); do wpctl status >/dev/null 2>&1 && break; sleep 0.2; done
-          wireplumber &
+          wireplumber & wireplumber=$!
           sway -c "$XDG_CONFIG_HOME/sway.conf" &
           for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock >/dev/null 2>&1 && break; sleep 0.2; done
           export SWAYSOCK=$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)
@@ -215,6 +215,9 @@ jobs:
           # wlroots' headless outputs refresh at 60 Hz.
           CARDCAST_MIRROR_FROM=HEADLESS-1 CARDCAST_MIRROR_TO=HEADLESS-2 CARDCAST_EXPECT_HZ=60 \
             cargo test mirror::linux::tests::desktop_mirrors -- --nocapture || failed=1
+          # Without WirePlumber nothing links the stream; the status must say so (#59).
+          kill $wireplumber
+          CARDCAST_NO_WIREPLUMBER=1 cargo test mirror::linux::tests::without_wireplumber -- --nocapture || failed=1
           exit $failed
           EOF
           dbus-run-session -- bash "$RUNNER_TEMP/capture.sh"
