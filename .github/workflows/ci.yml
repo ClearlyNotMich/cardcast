@@ -71,13 +71,11 @@ jobs:
       # source monitor. No Fifo check: lavapipe's X11 present doesn't wait for a vertical blank.
       - if: runner.os == 'Linux'
         name: Mirror on X.Org with two dummy outputs
-        # Red run only: let the sway step run too.
-        continue-on-error: true
         env:
           CARDCAST_MIRROR_FROM: DUMMY0
           CARDCAST_MIRROR_TO: DUMMY1
           CARDCAST_PAINT_SOURCE: '#cc6633'
-          CARDCAST_EXPECT_COLOUR: '#00ff00'
+          CARDCAST_EXPECT_COLOUR: '#cc6633'
         run: |
           sudo apt-get install -y xserver-xorg-core xserver-xorg-video-dummy
           printf 'Section "Device"\n Identifier "dummy"\n Driver "dummy"\n VideoRam 256000\nEndSection\nSection "Screen"\n Identifier "screen"\n Device "dummy"\n DefaultDepth 24\n SubSection "Display"\n  Depth 24\n  Virtual 2048 768\n EndSubSection\nEndSection\n' > "$RUNNER_TEMP/dummy.conf"
@@ -118,7 +116,7 @@ jobs:
           failed=0
           cargo test mirror::linux::tests::desktop_captures -- --nocapture || failed=1
           # wlroots' headless outputs refresh at 60 Hz.
-          CARDCAST_MIRROR_FROM=HEADLESS-1 CARDCAST_MIRROR_TO=HEADLESS-2 CARDCAST_EXPECT_HZ=60 CARDCAST_EXPECT_COLOUR='#00ff00' \
+          CARDCAST_MIRROR_FROM=HEADLESS-1 CARDCAST_MIRROR_TO=HEADLESS-2 CARDCAST_EXPECT_HZ=60 \
             cargo test mirror::linux::tests::desktop_mirrors -- --nocapture || failed=1
           exit $failed
           EOF
